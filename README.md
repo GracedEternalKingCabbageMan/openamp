@@ -4,7 +4,7 @@ Open-source issuer-governed assets for the Sequentia network: a self-hostable eq
 
 This is testnet software. Everything here runs against the Sequentia public testnet (parent chain: Bitcoin testnet4); there is no mainnet.
 
-Design document: [`doc/sequentia/openamp-design.md`](https://github.com/GracedEternalKingCabbageMan/Sequentia/blob/claude/sequentia-bitcoin-sidechain-w6xady/doc/sequentia/openamp-design.md) in the node repository. Frozen format specifications live under [`spec/`](spec/).
+Design document: [`doc/sequentia/openamp-design.md`](https://github.com/GracedEternalKingCabbageMan/Sequentia/blob/HEAD/doc/sequentia/openamp-design.md) in the node repository. Frozen format specifications live under [`spec/`](spec/).
 
 ## Status
 
