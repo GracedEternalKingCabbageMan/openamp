@@ -1,6 +1,8 @@
 # OpenAMP contract format v1
 
-STATUS: frozen with M0 (2026-07-08). Fields marked M1+ are reserved and not yet interpreted by any implementation.
+STATUS: frozen with M0 (2026-07-08). Fields marked "reserved" are written but not yet consumed by any implementation.
+
+Historical note: the public-testnet demo asset BONDX was issued before this freeze; its on-chain contract carries a legacy `"tier": "A"` field and omits `confidential`. Verification of any contract is over its exact committed bytes, so pre-freeze contracts verify as-is.
 
 The contract is the machine-readable issuance document of an OpenAMP asset. Its hash is committed into the asset's issuance entropy, so the asset ID itself proves which policy key and which terms govern the asset. Verification needs no registry and no consensus state.
 
@@ -29,18 +31,18 @@ The contract is the machine-readable issuance document of an OpenAMP asset. Its 
 Field rules:
 
 - `openamp.version`: this specification's version, `1`.
-- `openamp.type`: `"restricted"` (enclave-enforced) or `"tracked"` (reporting only, no on-chain restriction).
+- `openamp.type`: `"restricted"` (enclave-enforced) or `"tracked"` (reporting only, no on-chain restriction; reserved, `openampd` currently issues only `"restricted"`).
 - `openamp.policy_pubkey`: the asset-wide policy key `K_policy`, 32-byte x-only, lowercase hex. This key must co-sign every transfer. It is a FROST threshold key (the group public key); on-chain it is always one point.
 - `openamp.clawback`: whether the enclave tree contains the clawback leaf (default `true`). Committed here so holders accept the terms at purchase time; it cannot be retrofitted.
 - `openamp.burn_allowed`: whether `OP_RETURN` burns of the asset are permitted.
 - `openamp.confidential`: whether the asset is issued and held blinded (opt-in; the policy server holds the blinding keys, outside observers see nothing). Committed at issuance.
-- `openamp.policy_endpoints` (M1+): base URLs of the policy server API.
+- `openamp.policy_endpoints` (reserved): base URLs of the policy server API. `openampd` writes it when the issuer supplies an endpoint at issuance; no implementation consumes it yet.
 - `openamp.terms_hash` (optional): sha256 of the legal terms document.
 - Top-level `name`, `ticker`, `precision`, `version`, `issuer_pubkey` follow the Sequentia asset-registry conventions (`precision` mirrors the on-chain issuance denomination).
 
 ## 2. Canonicalization and hashing
 
-- Canonical form: UTF-8 JSON with lexicographically sorted keys and no insignificant whitespace (separators `,` and `:`). This is Python's `json.dumps(contract, sort_keys=True, separators=(",", ":"))`.
+- Canonical form: UTF-8 JSON with lexicographically sorted keys and no insignificant whitespace (separators `,` and `:`). This is Python's `json.dumps(contract, sort_keys=True, separators=(",", ":"))`; Go's `encoding/json.Marshal` over maps produces the same bytes (`canonicalJSON` in `openampd/internal/server/issue.go`).
 - `contract_digest = sha256(canonical_bytes)` (single SHA256, raw 32 bytes).
 - RPC/display form (as passed to `issueasset`/`rawissueasset` `contract_hash` and as shown by node RPCs): the digest hex **byte-reversed**, matching the Liquid asset-registry convention and the node's uint256 display order.
 
@@ -54,7 +56,7 @@ asset   = M(entropy, 0x00 * 32)
 token   = M(entropy, 0x01 || 0x00 * 31)     # reissuance token, explicit issuance
 ```
 
-All values in internal byte order; display hex is reversed. A verifier holding the contract JSON recomputes this chain and compares against the asset ID it observes on-chain. If they match, `openamp.policy_pubkey` provably governs the asset. The reference implementation (pure python, no node code) is `derive_issuance_ids` in the M0 proof.
+All values in internal byte order; display hex is reversed. A verifier holding the contract JSON recomputes this chain and compares against the asset ID it observes on-chain. If they match, `openamp.policy_pubkey` provably governs the asset. Reference implementations: `derive_issuance_ids` in the M0 proof ([`test/functional/feature_openamp_m0.py`](https://github.com/GracedEternalKingCabbageMan/Sequentia/blob/claude/sequentia-bitcoin-sidechain-w6xady/test/functional/feature_openamp_m0.py) in the node repository, pure Python, no node code) and `DeriveIssuanceIDs` in [`openampd/internal/fastmerkle`](../openampd/internal/fastmerkle/fastmerkle.go) (Go, golden-vectored against the former).
 
 ## 4. Enclave outputs
 
