@@ -1,0 +1,27 @@
+[Unit]
+Description=OpenAMP policy server (Sequentia testnet)
+After=network.target
+# Assumes the testnet node is already up (its own unit/committee runtime).
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/sequentia/openamp
+# Secrets (RPC auth, issuer token) live only on the box in this env file,
+# never in git. See deploy/DEPLOY.md for its contents.
+EnvironmentFile=/root/sequentia/openampd.env
+ExecStart=/root/sequentia/openamp/openampd/openampd \
+  -listen 127.0.0.1:8722 \
+  -datadir /root/sequentia/openampd-data \
+  -rpc ${OPENAMPD_RPC} \
+  -rpcauth ${OPENAMPD_RPCAUTH} \
+  -rpcwallet ${OPENAMPD_WALLET} \
+  -issuertoken ${OPENAMPD_ISSUER_TOKEN} \
+  -feeasset ${OPENAMPD_FEE_ASSET} \
+  -feesats 1000 \
+  -demoissuer
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
