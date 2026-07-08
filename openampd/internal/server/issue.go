@@ -83,9 +83,9 @@ func (s *Server) handleIssue(w http.ResponseWriter, r *http.Request) {
 			"version":       1,
 			"type":          "restricted",
 			"policy_pubkey": hex.EncodeToString(policyX[:]),
-			"tier":          "A",
 			"clawback":      clawback,
 			"burn_allowed":  req.BurnAllowed,
+			"confidential":  false, // transparent for now; opt-in confidential is M5
 		},
 	}
 	if req.TermsHash != "" {
@@ -126,7 +126,7 @@ func (s *Server) handleIssue(w http.ResponseWriter, r *http.Request) {
 		ID: assetDisplay, Ticker: req.Ticker, Name: req.Name, Precision: req.Precision,
 		Contract: canonical, ContractHash: displayHash(digest),
 		PolicyPub: hex.EncodeToString(policyX[:]), IssuerPub: hex.EncodeToString(issuerX[:]),
-		IssuerAID: req.IssuerAID, Tier: "A", Clawback: clawback, BurnAllowed: req.BurnAllowed,
+		IssuerAID: req.IssuerAID, Clawback: clawback, BurnAllowed: req.BurnAllowed,
 		Rules: req.Rules,
 	}
 	holderTree, err := s.treeFor(holder, asset)

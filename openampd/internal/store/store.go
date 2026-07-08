@@ -57,7 +57,6 @@ type Asset struct {
 	PolicyPub    string          `json:"policy_pub"`
 	IssuerPub    string          `json:"issuer_pub"`
 	IssuerAID    string          `json:"issuer_aid"`
-	Tier         string          `json:"tier"`
 	Clawback     bool            `json:"clawback"`
 	BurnAllowed  bool            `json:"burn_allowed"`
 	IssueTxid    string          `json:"issue_txid"`

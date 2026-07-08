@@ -177,7 +177,7 @@ func CheckSigPair(a, b [32]byte) []byte {
 	return s
 }
 
-// EnclaveTree builds the Tier A enclave for a holder: transfer leaf
+// EnclaveTree builds the enclave for a holder: transfer leaf
 // (user+policy) and, when clawback is enabled, the clawback leaf
 // (issuer+policy). Spec: openamp contract-v1 §4.
 func EnclaveTree(userX, policyX [32]byte, issuerX *[32]byte) (*TapTree, error) {

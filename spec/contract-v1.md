@@ -17,9 +17,9 @@ The contract is the machine-readable issuance document of an OpenAMP asset. Its 
     "version": 1,
     "type": "restricted",
     "policy_pubkey": "<32-byte x-only hex>",
-    "tier": "A",
     "clawback": true,
     "burn_allowed": true,
+    "confidential": false,
     "policy_endpoints": ["https://amp.example-issuer.com"],
     "terms_hash": "<sha256 hex>"
   }
@@ -30,10 +30,10 @@ Field rules:
 
 - `openamp.version`: this specification's version, `1`.
 - `openamp.type`: `"restricted"` (enclave-enforced) or `"tracked"` (reporting only, no on-chain restriction).
-- `openamp.policy_pubkey`: the asset-wide policy key `K_policy`, 32-byte x-only, lowercase hex. For restricted assets this key must co-sign every transfer. It may be a threshold (FROST) key; on-chain it is always one point.
-- `openamp.tier`: `"A"` (server-enforced containment) or `"B"` (covenant-enforced containment; leaf spec lands with M2).
+- `openamp.policy_pubkey`: the asset-wide policy key `K_policy`, 32-byte x-only, lowercase hex. This key must co-sign every transfer. It is a FROST threshold key (the group public key); on-chain it is always one point.
 - `openamp.clawback`: whether the enclave tree contains the clawback leaf (default `true`). Committed here so holders accept the terms at purchase time; it cannot be retrofitted.
-- `openamp.burn_allowed`: whether `OP_RETURN` burns of the asset are permitted policy (and, under Tier B, covenant-permitted).
+- `openamp.burn_allowed`: whether `OP_RETURN` burns of the asset are permitted.
+- `openamp.confidential`: whether the asset is issued and held blinded (opt-in; the policy server holds the blinding keys, outside observers see nothing). Committed at issuance.
 - `openamp.policy_endpoints` (M1+): base URLs of the policy server API.
 - `openamp.terms_hash` (optional): sha256 of the legal terms document.
 - Top-level `name`, `ticker`, `precision`, `version`, `issuer_pubkey` follow the Sequentia asset-registry conventions (`precision` mirrors the on-chain issuance denomination).
@@ -56,23 +56,25 @@ token   = M(entropy, 0x01 || 0x00 * 31)     # reissuance token, explicit issuanc
 
 All values in internal byte order; display hex is reversed. A verifier holding the contract JSON recomputes this chain and compares against the asset ID it observes on-chain. If they match, `openamp.policy_pubkey` provably governs the asset. The reference implementation (pure python, no node code) is `derive_issuance_ids` in the M0 proof.
 
-## 4. Tier A enclave outputs
+## 4. Enclave outputs
 
 An enclave output for holder key `K_user` is the taproot output:
 
 - internal key: the BIP341 NUMS point `50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0` (no key-path spend exists),
-- script tree (Elements tagged hashes `TapLeaf/elements`, `TapBranch/elements`, `TapTweak/elements`; leaf version `0xc0`):
+- script tree (Elements tagged hashes `TapLeaf/elements`, `TapBranch/elements`, `TapTweak/elements`; leaf version `0xc4`):
   - transfer leaf: `<K_user> OP_CHECKSIGVERIFY <K_policy> OP_CHECKSIG`
   - clawback leaf (iff `clawback`): `<K_issuer> OP_CHECKSIGVERIFY <K_policy> OP_CHECKSIG`
 
-Witness stack for either leaf, bottom to top: `<policy signature> <user-or-issuer signature> <leaf script> <control block>`. Signatures are BIP340 Schnorr over the Elements taproot sighash (`SIGHASH_DEFAULT`).
+Witness stack for either leaf, bottom to top: `<policy signature> <user-or-issuer signature> <leaf script> <control block>`. Signatures are BIP340 Schnorr over the Elements taproot sighash (`SIGHASH_DEFAULT`). The policy signature is produced by the FROST quorum and verifies under the single x-only `K_policy` (the group public key), so the enclave script is unchanged whether the policy key is a software key or a threshold.
+
+For a confidential asset the enclave output additionally carries a blinding public key in its nonce, and its amount and asset are committed rather than explicit; the taproot scriptPubKey (and hence the script tree) is identical.
 
 Issuance mints directly into enclave outputs. The reissuance token is issuer-held and outside the enclave; issuer tooling must keep custody of it and mint only into enclave outputs.
 
 ## 5. Rule 1 (fees)
 
-A restricted asset never appears in a fee output. The policy server refuses to co-sign any transaction with a fee output (empty `scriptPubKey`) in the asset; Sequentia's default-deny fee-asset whitelist makes such a transaction non-paying at every producer regardless; Tier B additionally makes it invalid by consensus. Fee funding options: sender self-pays in an ordinary asset (no issuer involvement), fee conversion (issuer or registered broker takes a fee-equivalent enclave output of the asset and attaches the real fee, atomically in the same transaction), or sponsorship.
+A restricted asset never appears in a fee output. The policy server refuses to co-sign any transaction with a fee output (empty `scriptPubKey`) in the asset, and Sequentia's default-deny fee-asset whitelist makes such a transaction non-paying at every producer regardless. Fee funding options: sender self-pays in an ordinary asset (no issuer involvement), fee conversion (issuer or registered broker takes a fee-equivalent enclave output of the asset and attaches the real fee, atomically in the same transaction), or sponsorship.
 
-## 6. M1+ reserved
+## 6. Reserved
 
-Account IDs (AID), the registration and co-signing REST protocol (PSET round-trip), policy documents (categories, velocity, vesting, holder caps), the transparency log format, and the Tier B covenant leaf are specified with M1/M2.
+The FROST DKG parameters, the confidential-asset blinding-key handshake, and the SeqDEX registered-user settlement format are specified with M5.
