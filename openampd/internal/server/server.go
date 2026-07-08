@@ -9,6 +9,7 @@
 //   POST /v1/transfers/{id}/complete    submit user signatures -> broadcast
 //   POST /v1/cosign                     raw co-sign for self-built transactions
 //   GET  /v1/assets, /v1/assets/{id}    contracts and terms
+//   GET  /v1/log                        transparency log
 //
 // Issuer surface (Bearer token):
 //   POST /v1/issuer/assets              issue a restricted asset
@@ -18,7 +19,6 @@
 //   POST /v1/issuer/clawback            claw back a holder's UTXOs
 //   GET  /v1/issuer/holders             ownership report
 //   POST /v1/issuer/anchor              anchor the transparency log on-chain
-//   GET  /v1/log                        transparency log
 package server
 
 import (
