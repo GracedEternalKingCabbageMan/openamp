@@ -87,6 +87,18 @@ Transfers then go through `POST /v1/transfers` (fee convert/sponsor) or
 returned sighashes; the full API and an end-to-end walkthrough are in the
 top-level [README](../README.md).
 
+## Confidential assets
+
+To issue a `confidential: true` asset (blinded amounts/asset tags on-chain,
+server-held blinding keys), the funding wallet must emit confidential
+addresses, i.e. the node runs with `-blindedaddresses=1` (or the wallet is
+otherwise CT-enabled). openampd derives the enclave blinding keys itself and
+keeps them in a `openampd-watch` node wallet, but the wallet's own fee-change
+and token outputs are blinded by the wallet, so it must be CT-capable. A node
+with `-blindedaddresses=0` can still run every transparent-asset flow; only
+confidential issuance/transfer needs CT addresses. The end-to-end confidential
+flow is proven in `feature_openamp_confidential.py` (node repo).
+
 ## 6. Redeploy
 
 `git pull && go build -o openampd/openampd ./openampd/cmd/openampd && systemctl restart openampd`.
