@@ -81,9 +81,11 @@ curl -s localhost:8722/v1/issuer/assets \
 
 The response returns the asset id, the contract JSON, and its hash. Publish
 the contract to the registry so wallets can verify the asset-to-policy binding
-(§4 of the design doc). Transfers then go through
-`POST /v1/transfers` (fee convert/sponsor) or `POST /v1/cosign` (self-paid),
-each requiring the holder's signature over the returned sighashes.
+(§4 of the [design doc](https://github.com/GracedEternalKingCabbageMan/Sequentia/blob/claude/sequentia-bitcoin-sidechain-w6xady/doc/sequentia/openamp-design.md)).
+Transfers then go through `POST /v1/transfers` (fee convert/sponsor) or
+`POST /v1/cosign` (self-paid), each requiring the holder's signature over the
+returned sighashes; the full API and an end-to-end walkthrough are in the
+top-level [README](../README.md).
 
 ## 6. Redeploy
 
@@ -96,5 +98,6 @@ State (registry, keys, transparency log) persists in
 `-demoissuer` holds the issuer and policy keys server-side so the box can issue
 and co-sign autonomously. That is appropriate ONLY for the testnet demo. A
 production issuer keeps the issuer key offline and runs the policy key behind
-an HSM or FROST threshold (design doc §5, M5); openampd's HSM interface is the
-seam for that.
+a FROST threshold (or MPC/HSM) backend; the `PolicySigner` interface in
+`openampd/internal/server/signer.go` is the seam for that. The threshold
+backend itself is not implemented in this repository yet (design doc §5, M5).
