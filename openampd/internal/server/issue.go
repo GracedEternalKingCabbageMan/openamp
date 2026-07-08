@@ -64,12 +64,18 @@ func (s *Server) handleIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Keys.
-	policyPriv := make([]byte, 32)
+	// Policy key via the signer backend (single key on testnet, FROST group
+	// key in production). The pubkey is needed now to build the contract; the
+	// key is bound to its asset id below once derived.
+	policyX, policyRef, err := s.signer.GeneratePolicyKey()
+	if err != nil {
+		httpErr(w, 500, "policy key: %v", err)
+		return
+	}
+	// Issuer key stays a local key (the issuer's own; production keeps it
+	// offline). Used for the clawback leaf and to authorize issuance.
 	issuerPriv := make([]byte, 32)
-	rand.Read(policyPriv)
 	rand.Read(issuerPriv)
-	policyX := elements.XOnlyFromPriv(policyPriv)
 	issuerX := elements.XOnlyFromPriv(issuerPriv)
 
 	// Contract (canonical: sorted keys, no whitespace; see spec/contract-v1.md).
@@ -196,8 +202,8 @@ func (s *Server) handleIssue(w http.ResponseWriter, r *http.Request) {
 	}
 	asset.IssueTxid = txid
 
-	if err := s.st.SaveKey("policy:"+assetDisplay, hex.EncodeToString(policyPriv)); err != nil {
-		httpErr(w, 500, "%v", err)
+	if err := s.signer.Adopt(policyRef, assetDisplay); err != nil {
+		httpErr(w, 500, "bind policy key: %v", err)
 		return
 	}
 	if err := s.st.SaveKey("issuer:"+assetDisplay, hex.EncodeToString(issuerPriv)); err != nil {
@@ -269,9 +275,8 @@ func (s *Server) handleClawback(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, 500, "%v", err)
 		return
 	}
-	policyPriv, ok1 := keys["policy:"+asset.ID]
 	issuerPriv, ok2 := keys["issuer:"+asset.ID]
-	if !ok1 || !ok2 {
+	if _, hasPolicy := s.signer.PolicyPubKey(asset.ID); !hasPolicy || !ok2 {
 		httpErr(w, 501, "clawback requires both the policy and issuer keys on this server (demo mode)")
 		return
 	}
@@ -349,7 +354,7 @@ func (s *Server) handleClawback(w http.ResponseWriter, r *http.Request) {
 			httpErr(w, 500, "%v", err)
 			return
 		}
-		policySig, err := elements.SignSchnorr(mustHexBytes(policyPriv), sh)
+		policySig, err := s.signer.SignPolicy(asset.ID, sh)
 		if err != nil {
 			httpErr(w, 500, "%v", err)
 			return

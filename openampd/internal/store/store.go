@@ -170,11 +170,36 @@ func (s *Store) LoadKeys() (map[string]string, error) {
 func (s *Store) SaveKey(name, privHex string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.mutateKeysLocked(func(keys map[string]string) error {
+		keys[name] = privHex
+		return nil
+	})
+}
+
+// RenameKey moves a stored key from one name to another (used to bind a
+// provisioned policy key to its asset id once issuance derives it).
+func (s *Store) RenameKey(from, to string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.mutateKeysLocked(func(keys map[string]string) error {
+		v, ok := keys[from]
+		if !ok {
+			return fmt.Errorf("key %q not found", from)
+		}
+		keys[to] = v
+		delete(keys, from)
+		return nil
+	})
+}
+
+func (s *Store) mutateKeysLocked(fn func(map[string]string) error) error {
 	keys, err := s.LoadKeys()
 	if err != nil {
 		return err
 	}
-	keys[name] = privHex
+	if err := fn(keys); err != nil {
+		return err
+	}
 	data, err := json.MarshalIndent(keys, "", " ")
 	if err != nil {
 		return err

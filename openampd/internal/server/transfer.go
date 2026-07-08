@@ -517,14 +517,6 @@ func (s *Server) cosignAndBroadcast(p *pendingTransfer, sender *store.User, user
 	if err := s.checkTransfer(p.tx, p.asset, sender, atomsOut); err != nil {
 		return "", err
 	}
-	keys, err := s.st.LoadKeys()
-	if err != nil {
-		return "", err
-	}
-	policyPriv, ok := keys["policy:"+p.asset.ID]
-	if !ok {
-		return "", fmt.Errorf("policy key unavailable")
-	}
 	senderTree, err := s.treeFor(sender, p.asset)
 	if err != nil {
 		return "", err
@@ -536,7 +528,7 @@ func (s *Server) cosignAndBroadcast(p *pendingTransfer, sender *store.User, user
 	}
 	p.tx.NormalizeWitness()
 	for i, idx := range p.enclave {
-		policySig, err := elements.SignSchnorr(mustHexBytes(policyPriv), p.sighashes[i])
+		policySig, err := s.signer.SignPolicy(p.asset.ID, p.sighashes[i])
 		if err != nil {
 			return "", err
 		}
@@ -625,16 +617,6 @@ func (s *Server) handleCosign(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, 502, "%v", err)
 		return
 	}
-	keys, err := s.st.LoadKeys()
-	if err != nil {
-		httpErr(w, 500, "%v", err)
-		return
-	}
-	policyPriv, ok := keys["policy:"+asset.ID]
-	if !ok {
-		httpErr(w, 500, "policy key unavailable")
-		return
-	}
 	leaf := senderTree.Leaves["transfer"].Script
 	control, _ := senderTree.ControlBlock("transfer")
 	type sigOut struct {
@@ -655,7 +637,7 @@ func (s *Server) handleCosign(w http.ResponseWriter, r *http.Request) {
 			httpErr(w, 500, "sighash: %v", err)
 			return
 		}
-		sig, err := elements.SignSchnorr(mustHexBytes(policyPriv), sh)
+		sig, err := s.signer.SignPolicy(asset.ID, sh)
 		if err != nil {
 			httpErr(w, 500, "%v", err)
 			return

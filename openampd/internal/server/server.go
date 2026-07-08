@@ -50,6 +50,7 @@ type Server struct {
 	st     *store.Store
 	node   *rpc.Client // chain queries
 	wallet *rpc.Client // wallet operations (fee funding, issuance, broadcast)
+	signer PolicySigner // policy-key backend (local key for testnet; FROST/MPC for mainnet)
 
 	mu      sync.Mutex
 	pending map[string]*pendingTransfer
@@ -70,7 +71,8 @@ type pendingTransfer struct {
 }
 
 func New(cfg Config, st *store.Store, node, wallet *rpc.Client) (*Server, error) {
-	s := &Server{cfg: cfg, st: st, node: node, wallet: wallet, pending: map[string]*pendingTransfer{}}
+	s := &Server{cfg: cfg, st: st, node: node, wallet: wallet, pending: map[string]*pendingTransfer{},
+		signer: NewLocalKeySigner(st)}
 	gh, err := node.GetBlockHash(0)
 	if err != nil {
 		return nil, fmt.Errorf("genesis: %w", err)
