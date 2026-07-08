@@ -38,8 +38,18 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	// Scope the wallet client whenever -rpcwallet is passed at all (even ""),
+	// so the demo wallet stays addressable once the blinding watch wallet
+	// loads alongside it and makes unscoped wallet RPCs ambiguous. An empty
+	// name scopes to the node's default wallet via /wallet/.
 	walletURL := *rpcURL
-	if *rpcWallet != "" {
+	rpcWalletSet := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "rpcwallet" {
+			rpcWalletSet = true
+		}
+	})
+	if rpcWalletSet {
 		walletURL = *rpcURL + "/wallet/" + *rpcWallet
 	}
 	wallet, err := rpc.New(walletURL, *rpcAuth)

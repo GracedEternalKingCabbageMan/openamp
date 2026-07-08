@@ -59,6 +59,7 @@ type Asset struct {
 	IssuerAID    string          `json:"issuer_aid"`
 	Clawback     bool            `json:"clawback"`
 	BurnAllowed  bool            `json:"burn_allowed"`
+	Confidential bool            `json:"confidential"`
 	IssueTxid    string          `json:"issue_txid"`
 	Rules        Rules           `json:"rules"`
 }

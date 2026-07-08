@@ -168,6 +168,11 @@ func (c *Client) TestMempoolAccept(hexTx string) (bool, string, error) {
 type SignRawResult struct {
 	Hex      string `json:"hex"`
 	Complete bool   `json:"complete"`
+	Errors   []struct {
+		Txid    string `json:"txid"`
+		Vout    uint32 `json:"vout"`
+		Error   string `json:"error"`
+	} `json:"errors"`
 }
 
 func (c *Client) SignRawTransactionWithWallet(hexTx string) (*SignRawResult, error) {
@@ -202,8 +207,9 @@ func (c *Client) GetNewAddress() (string, error) {
 }
 
 type AddressInfo struct {
-	Unconfidential string `json:"unconfidential"`
-	ScriptPubKey   string `json:"scriptPubKey"`
+	Unconfidential  string `json:"unconfidential"`
+	ScriptPubKey    string `json:"scriptPubKey"`
+	ConfidentialKey string `json:"confidential_key"` // blinding pubkey (hex), if confidential
 }
 
 func (c *Client) GetAddressInfo(addr string) (*AddressInfo, error) {
@@ -238,4 +244,112 @@ func (c *Client) ScanTxOutSet(spks []string) ([]ScanUnspent, error) {
 		return nil, fmt.Errorf("scantxoutset failed")
 	}
 	return res.Unspents, nil
+}
+
+// --- confidential-transaction helpers -------------------------------------
+
+// WalletURL returns this client's base URL with a wallet path appended, for
+// constructing a wallet-scoped client (e.g. the blinding watch wallet).
+func (c *Client) WalletURL(name string) string {
+	base := strings.TrimSuffix(c.url, "/")
+	if i := strings.Index(base, "/wallet/"); i >= 0 {
+		base = base[:i]
+	}
+	return base + "/wallet/" + name
+}
+
+func (c *Client) Auth() string { return c.user + ":" + c.pass }
+
+// CreateWallet creates a node wallet; ignores "already exists" errors.
+func (c *Client) CreateWallet(name string, disablePrivKeys, blank bool) error {
+	err := c.Call(nil, "createwallet", name, disablePrivKeys, blank)
+	if err != nil && (IsRPCError(err, "already exists") || IsRPCError(err, "Database already exists")) {
+		return nil
+	}
+	return err
+}
+
+// LoadWallet loads a wallet on the node; ignores "already loaded".
+func (c *Client) LoadWallet(name string) error {
+	err := c.Call(nil, "loadwallet", name)
+	if err != nil && IsRPCError(err, "already loaded") {
+		return nil
+	}
+	return err
+}
+
+func (c *Client) ImportAddress(scriptOrAddr, label string, rescan bool) error {
+	return c.Call(nil, "importaddress", scriptOrAddr, label, rescan)
+}
+
+func (c *Client) ImportBlindingKey(address, keyHex string) error {
+	return c.Call(nil, "importblindingkey", address, keyHex)
+}
+
+// CreateBlindedAddress turns an unconfidential address into a confidential one
+// by attaching the given blinding public key.
+func (c *Client) CreateBlindedAddress(address, blindingPubKeyHex string) (string, error) {
+	var addr string
+	err := c.Call(&addr, "createblindedaddress", address, blindingPubKeyHex)
+	return addr, err
+}
+
+// AddressForScript returns the (unconfidential) address the node encodes a
+// scriptPubKey as (e.g. bech32m for a v1 taproot program).
+func (c *Client) AddressForScript(scriptHex string) (string, error) {
+	var res struct {
+		Address  string `json:"address"`
+		Segwit   struct {
+			Address string `json:"address"`
+		} `json:"segwit"`
+	}
+	if err := c.Call(&res, "decodescript", scriptHex); err != nil {
+		return "", err
+	}
+	if res.Address != "" {
+		return res.Address, nil
+	}
+	if res.Segwit.Address != "" {
+		return res.Segwit.Address, nil
+	}
+	return "", fmt.Errorf("no address for script")
+}
+
+// RawBlindRawTransaction blinds a raw transaction, given each input's amount,
+// asset, and their blinders (empty/"" blinders for explicit inputs).
+func (c *Client) RawBlindRawTransaction(hexTx string, amountBlinders []string, amounts []float64, assets, assetBlinders []string, ignoreFail bool) (string, error) {
+	var blinded string
+	err := c.Call(&blinded, "rawblindrawtransaction", hexTx, amountBlinders, amounts, assets, assetBlinders, ignoreFail)
+	return blinded, err
+}
+
+// ConfUnspent is a wallet UTXO with unblinded amounts and blinders (present
+// for confidential outputs the wallet can unblind).
+type ConfUnspent struct {
+	TxID          string  `json:"txid"`
+	Vout          uint32  `json:"vout"`
+	Address       string  `json:"address"`
+	ScriptPubKey  string  `json:"scriptPubKey"`
+	Amount        float64 `json:"amount"`
+	Asset         string  `json:"asset"`
+	AmountBlinder string  `json:"amountblinder"`
+	AssetBlinder  string  `json:"assetblinder"`
+	Spendable     bool    `json:"spendable"`
+	Confidential  bool    `json:"confidential"`
+}
+
+// ListUnspentAll returns all UTXOs (minconf 0) this (watch) wallet tracks,
+// with unblinded amounts and blinders for confidential ones.
+func (c *Client) ListUnspentAll() ([]ConfUnspent, error) {
+	var res []ConfUnspent
+	err := c.Call(&res, "listunspent", 0, 9999999, []string{}, true, map[string]any{})
+	return res, err
+}
+
+// GetRawTransactionHex returns a transaction's raw hex (requires -txindex for
+// confirmed txs; mempool txs work without it).
+func (c *Client) GetRawTransactionHex(txid string) (string, error) {
+	var raw string
+	err := c.Call(&raw, "getrawtransaction", txid)
+	return raw, err
 }

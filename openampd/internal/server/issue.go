@@ -26,11 +26,12 @@ func (s *Server) handleIssue(w http.ResponseWriter, r *http.Request) {
 		Atoms       uint64      `json:"atoms"`
 		HolderAID   string      `json:"holder_aid"`
 		IssuerAID   string      `json:"issuer_aid"`
-		Clawback    *bool       `json:"clawback,omitempty"`
-		BurnAllowed bool        `json:"burn_allowed"`
-		Rules       store.Rules `json:"rules"`
-		TermsHash   string      `json:"terms_hash,omitempty"`
-		Endpoint    string      `json:"endpoint,omitempty"`
+		Clawback     *bool       `json:"clawback,omitempty"`
+		BurnAllowed  bool        `json:"burn_allowed"`
+		Confidential bool        `json:"confidential"`
+		Rules        store.Rules `json:"rules"`
+		TermsHash    string      `json:"terms_hash,omitempty"`
+		Endpoint     string      `json:"endpoint,omitempty"`
 	}
 	if err := decodeBody(r, &req); err != nil {
 		httpErr(w, 400, "%v", err)
@@ -91,7 +92,7 @@ func (s *Server) handleIssue(w http.ResponseWriter, r *http.Request) {
 			"policy_pubkey": hex.EncodeToString(policyX[:]),
 			"clawback":      clawback,
 			"burn_allowed":  req.BurnAllowed,
-			"confidential":  false, // transparent for now; opt-in confidential is M5
+			"confidential":  req.Confidential,
 		},
 	}
 	if req.TermsHash != "" {
@@ -115,7 +116,7 @@ func (s *Server) handleIssue(w http.ResponseWriter, r *http.Request) {
 	}
 	var funding *rpcUnspentLite
 	for _, u := range feeUtxos {
-		if u.Spendable && sats(u.Amount) > s.cfg.FeeSats*3 {
+		if u.Spendable && sats(u.Amount) > s.cfg.FeeSats*3 && s.utxoUnspent(u.TxID, u.Vout) {
 			funding = &rpcUnspentLite{u.TxID, u.Vout, sats(u.Amount)}
 			break
 		}
@@ -133,7 +134,7 @@ func (s *Server) handleIssue(w http.ResponseWriter, r *http.Request) {
 		Contract: canonical, ContractHash: displayHash(digest),
 		PolicyPub: hex.EncodeToString(policyX[:]), IssuerPub: hex.EncodeToString(issuerX[:]),
 		IssuerAID: req.IssuerAID, Clawback: clawback, BurnAllowed: req.BurnAllowed,
-		Rules: req.Rules,
+		Confidential: req.Confidential, Rules: req.Rules,
 	}
 	holderTree, err := s.treeFor(holder, asset)
 	if err != nil {
@@ -165,6 +166,28 @@ func (s *Server) handleIssue(w http.ResponseWriter, r *http.Request) {
 	}
 
 	feeAssetID := elements.MustHex32(s.cfg.FeeAsset)
+	// Output nonces: null for transparent assets; blinding public keys for a
+	// confidential asset (the enclave output blinds to the holder's key, the
+	// wallet token/change outputs blind to the wallet's own keys, giving the
+	// >=2 confidential outputs a blinded transaction needs).
+	holderNonce := elements.NullNonce()
+	tokenNonce := elements.NullNonce()
+	changeNonce := elements.NullNonce()
+	if req.Confidential {
+		holderX := elements.MustHex32(holder.Pubkeys[0])
+		hn, err := s.enclaveConfNonce(assetDisplay, holderX, hex.EncodeToString(holderTree.ScriptPubKey()))
+		if err != nil {
+			httpErr(w, 500, "confidential enclave: %v", err)
+			return
+		}
+		holderNonce = hn
+		if tokenInfo.ConfidentialKey == "" || changeInfo.ConfidentialKey == "" {
+			httpErr(w, 500, "wallet is not confidential (need -blindedaddresses=1 for confidential issuance)")
+			return
+		}
+		tokenNonce = mustHexBytes(tokenInfo.ConfidentialKey)
+		changeNonce = mustHexBytes(changeInfo.ConfidentialKey)
+	}
 	tx := &elements.Tx{Version: 2}
 	tx.In = append(tx.In, &elements.TxIn{
 		Prevout: elements.OutPoint{Hash: internalHash(funding.txid), N: funding.vout},
@@ -177,21 +200,30 @@ func (s *Server) handleIssue(w http.ResponseWriter, r *http.Request) {
 	})
 	tx.Out = append(tx.Out,
 		&elements.TxOut{Asset: elements.ExplicitAssetInternal(assetID), Value: elements.ExplicitValue(req.Atoms),
-			Nonce: elements.NullNonce(), ScriptPubKey: holderTree.ScriptPubKey()},
+			Nonce: holderNonce, ScriptPubKey: holderTree.ScriptPubKey()},
 		&elements.TxOut{Asset: elements.ExplicitAssetInternal(tokenID), Value: elements.ExplicitValue(1_0000_0000),
-			Nonce: elements.NullNonce(), ScriptPubKey: mustHexBytes(tokenInfo.ScriptPubKey)},
+			Nonce: tokenNonce, ScriptPubKey: mustHexBytes(tokenInfo.ScriptPubKey)},
 		&elements.TxOut{Asset: elements.ExplicitAsset(feeAssetID), Value: elements.ExplicitValue(funding.sats - s.cfg.FeeSats),
-			Nonce: elements.NullNonce(), ScriptPubKey: mustHexBytes(changeInfo.ScriptPubKey)},
+			Nonce: changeNonce, ScriptPubKey: mustHexBytes(changeInfo.ScriptPubKey)},
 		&elements.TxOut{Asset: elements.ExplicitAsset(feeAssetID), Value: elements.ExplicitValue(s.cfg.FeeSats),
 			Nonce: elements.NullNonce(), ScriptPubKey: nil},
 	)
+	if req.Confidential {
+		blinded, err := s.blindTx(tx)
+		if err != nil {
+			httpErr(w, 500, "blind issuance: %v", err)
+			return
+		}
+		tx = blinded
+	}
 	signed, err := s.wallet.SignRawTransactionWithWallet(hex.EncodeToString(tx.Serialize()))
 	if err != nil {
 		httpErr(w, 502, "sign: %v", err)
 		return
 	}
 	if !signed.Complete {
-		httpErr(w, 502, "issuance signing incomplete")
+		log.Printf("issuance signing incomplete: errors=%+v", signed.Errors)
+		httpErr(w, 502, "issuance signing incomplete: %+v", signed.Errors)
 		return
 	}
 	txid, err := s.wallet.SendRawTransaction(signed.Hex)

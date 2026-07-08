@@ -59,15 +59,16 @@ type Server struct {
 }
 
 type pendingTransfer struct {
-	tx        *elements.Tx
-	asset     *store.Asset
-	senderAID string
-	atoms     uint64
-	enclave   []int // input indices to co-sign
-	sighashes [][32]byte
-	userPub   [32]byte
-	created   time.Time
-	feeMode   string
+	tx         *elements.Tx // the (possibly blinded) tx that gets signed and broadcast
+	explicitTx *elements.Tx // pre-blind tx with readable amounts/assets for the policy check
+	asset      *store.Asset
+	senderAID  string
+	atoms      uint64
+	enclave    []int // input indices to co-sign
+	sighashes  [][32]byte
+	userPub    [32]byte
+	created    time.Time
+	feeMode    string
 }
 
 func New(cfg Config, st *store.Store, node, wallet *rpc.Client) (*Server, error) {
@@ -233,12 +234,26 @@ func (s *Server) handleAddress(w http.ResponseWriter, r *http.Request) {
 		Address string `json:"address"`
 	}
 	s.node.Call(&addr, "decodescript", hex.EncodeToString(spk))
+	address := addr.Address
+	// For a confidential asset, hand back the blinding (blech32) enclave
+	// address, and make sure the watch wallet tracks it so the server can
+	// unblind receipts. Same one-step ease as any confidential Sequentia asset.
+	if asset.Confidential {
+		priv, pub, err := s.blindingKey(asset.ID, elements.MustHex32(user.Pubkeys[0]))
+		if err == nil {
+			if ca, cerr := s.confidentialEnclaveAddress(hex.EncodeToString(spk), hex.EncodeToString(pub)); cerr == nil {
+				address = ca
+				_ = s.importConfidentialEnclave(hex.EncodeToString(spk), priv, hex.EncodeToString(pub))
+			}
+		}
+	}
 	transferCtl, _ := tree.ControlBlock("transfer")
 	resp := map[string]any{
 		"aid":              aid,
 		"asset":            asset.ID,
 		"script_pubkey":    hex.EncodeToString(spk),
-		"address":          addr.Address,
+		"address":          address,
+		"confidential":     asset.Confidential,
 		"user_pubkey":      user.Pubkeys[0],
 		"transfer_leaf":    hex.EncodeToString(tree.Leaves["transfer"].Script),
 		"transfer_control": hex.EncodeToString(transferCtl),
@@ -395,6 +410,20 @@ type enclaveUTXO struct {
 
 func (s *Server) enclaveUTXOs(tree *elements.TapTree, assetID string) ([]enclaveUTXO, error) {
 	spk := hex.EncodeToString(tree.ScriptPubKey())
+	// Confidential assets are scanned through the watch wallet, which holds the
+	// blinding keys and reports unblinded amounts; scantxoutset would only see
+	// commitments. Transparent assets scan the UTXO set directly.
+	if s.assetConfidential(assetID) {
+		cus, err := s.confidentialUTXOs(spk, assetID)
+		if err != nil {
+			return nil, err
+		}
+		var out []enclaveUTXO
+		for _, u := range cus {
+			out = append(out, enclaveUTXO{txid: u.TxID, vout: u.Vout, atoms: sats(u.Amount), spk: u.ScriptPubKey})
+		}
+		return out, nil
+	}
 	unspents, err := s.node.ScanTxOutSet([]string{spk})
 	if err != nil {
 		return nil, err
@@ -407,6 +436,16 @@ func (s *Server) enclaveUTXOs(tree *elements.TapTree, assetID string) ([]enclave
 		out = append(out, enclaveUTXO{txid: u.TxID, vout: u.Vout, atoms: sats(u.Amount), spk: u.ScriptPubKey})
 	}
 	return out, nil
+}
+
+func (s *Server) assetConfidential(assetID string) bool {
+	var conf bool
+	s.st.View(func(st *store.State) {
+		if a, ok := st.Assets[assetID]; ok {
+			conf = a.Confidential
+		}
+	})
+	return conf
 }
 
 func sats(v float64) uint64 {

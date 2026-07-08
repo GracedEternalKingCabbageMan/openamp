@@ -196,6 +196,25 @@ func (s *Server) holderBalances(asset *store.Asset) (map[string]uint64, error) {
 	if len(spks) == 0 {
 		return balances, nil
 	}
+	// Confidential assets are unblinded through the watch wallet, which reports
+	// the amount per enclave scriptPubKey; scantxoutset would only see
+	// commitments (whose asset never matches the plaintext asset id).
+	if asset.Confidential {
+		w, err := s.watchClient()
+		if err != nil {
+			return nil, err
+		}
+		all, err := w.ListUnspentAll()
+		if err != nil {
+			return nil, err
+		}
+		for _, u := range all {
+			if aid, ok := spkToAID[u.ScriptPubKey]; ok && u.Asset == asset.ID {
+				balances[aid] += sats(u.Amount)
+			}
+		}
+		return balances, nil
+	}
 	unspents, err := s.node.ScanTxOutSet(spks)
 	if err != nil {
 		return nil, err
@@ -210,28 +229,32 @@ func (s *Server) holderBalances(asset *store.Asset) (map[string]uint64, error) {
 }
 
 // spentOutputs resolves every input's prevout from the node (mempool included).
+// spentOutputs resolves each input's prevout to the EXACT on-chain nAsset,
+// nValue and scriptPubKey bytes (commitments for confidential outputs), read
+// from the raw prevout transaction. This is what the taproot sighash commits
+// to, uniformly for explicit and confidential inputs.
 func (s *Server) spentOutputs(tx *elements.Tx) ([]*elements.SpentOutput, error) {
 	spent := make([]*elements.SpentOutput, len(tx.In))
+	cache := map[string]*elements.Tx{}
 	for i, in := range tx.In {
 		txid := displayHash(in.Prevout.Hash)
-		res, err := s.node.GetTxOut(txid, in.Prevout.N, true)
-		if err != nil {
-			return nil, err
+		prev, ok := cache[txid]
+		if !ok {
+			raw, err := s.node.GetRawTransactionHex(txid)
+			if err != nil {
+				return nil, refuse("input %d (%s:%d): %v", i, txid, in.Prevout.N, err)
+			}
+			prev, err = elements.DeserializeTx(mustHexBytes(raw))
+			if err != nil {
+				return nil, fmt.Errorf("decode prevout %s: %w", txid, err)
+			}
+			cache[txid] = prev
 		}
-		if res == nil {
-			return nil, refuse("input %d (%s:%d) is unknown or already spent", i, txid, in.Prevout.N)
+		if int(in.Prevout.N) >= len(prev.Out) {
+			return nil, refuse("input %d: prevout %s:%d out of range", i, txid, in.Prevout.N)
 		}
-		var asset [32]byte
-		copy(asset[:], mustHexBytes(res.Asset))
-		spk, err := hex.DecodeString(res.ScriptPubKey.Hex)
-		if err != nil {
-			return nil, err
-		}
-		spent[i] = &elements.SpentOutput{
-			Asset:        elements.ExplicitAsset(asset),
-			Value:        elements.ExplicitValue(sats(res.Value)),
-			ScriptPubKey: spk,
-		}
+		o := prev.Out[in.Prevout.N]
+		spent[i] = &elements.SpentOutput{Asset: o.Asset, Value: o.Value, ScriptPubKey: o.ScriptPubKey}
 	}
 	return spent, nil
 }
@@ -281,12 +304,12 @@ func (s *Server) handleTransferBuild(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, 404, "%v", err)
 		return
 	}
-	recipTree, _, _, err := s.enclaveFor(req.RecipientAID, req.Asset)
+	recipTree, recipUser, _, err := s.enclaveFor(req.RecipientAID, req.Asset)
 	if err != nil {
 		httpErr(w, 404, "%v", err)
 		return
 	}
-	issuerTree, _, _, err := s.enclaveFor(asset.IssuerAID, req.Asset)
+	issuerTree, issuerUser, _, err := s.enclaveFor(asset.IssuerAID, req.Asset)
 	if err != nil {
 		httpErr(w, 500, "issuer enclave: %v", err)
 		return
@@ -375,31 +398,75 @@ func (s *Server) handleTransferBuild(w http.ResponseWriter, r *http.Request) {
 	}
 	tx.In = append(tx.In, &elements.TxIn{Prevout: elements.OutPoint{Hash: internalHash(feeIn.txid), N: feeIn.vout}})
 
+	// Output nonces: null for transparent assets; per-enclave blinding pubkeys
+	// for a confidential asset (each also registers the recipient's enclave in
+	// the watch wallet so the server can unblind it later).
+	recipNonce, changeNonce, convNonce := elements.NullNonce(), elements.NullNonce(), elements.NullNonce()
+	if asset.Confidential {
+		if recipNonce, err = s.enclaveConfNonce(asset.ID, elements.MustHex32(recipUser.Pubkeys[0]), hex.EncodeToString(recipTree.ScriptPubKey())); err != nil {
+			httpErr(w, 500, "confidential recipient: %v", err)
+			return
+		}
+		if changeNonce, err = s.enclaveConfNonce(asset.ID, elements.MustHex32(sender.Pubkeys[0]), hex.EncodeToString(senderTree.ScriptPubKey())); err != nil {
+			httpErr(w, 500, "confidential change: %v", err)
+			return
+		}
+		if convNonce, err = s.enclaveConfNonce(asset.ID, elements.MustHex32(issuerUser.Pubkeys[0]), hex.EncodeToString(issuerTree.ScriptPubKey())); err != nil {
+			httpErr(w, 500, "confidential conversion: %v", err)
+			return
+		}
+	}
+
 	tx.Out = append(tx.Out, &elements.TxOut{
 		Asset: elements.ExplicitAsset(assetID), Value: elements.ExplicitValue(req.Atoms),
-		Nonce: elements.NullNonce(), ScriptPubKey: recipTree.ScriptPubKey(),
+		Nonce: recipNonce, ScriptPubKey: recipTree.ScriptPubKey(),
 	})
 	if change := total - need; change > 0 {
 		tx.Out = append(tx.Out, &elements.TxOut{
 			Asset: elements.ExplicitAsset(assetID), Value: elements.ExplicitValue(change),
-			Nonce: elements.NullNonce(), ScriptPubKey: senderTree.ScriptPubKey(),
+			Nonce: changeNonce, ScriptPubKey: senderTree.ScriptPubKey(),
 		})
 	}
 	if convertAtoms > 0 {
 		tx.Out = append(tx.Out, &elements.TxOut{
 			Asset: elements.ExplicitAsset(assetID), Value: elements.ExplicitValue(convertAtoms),
-			Nonce: elements.NullNonce(), ScriptPubKey: issuerTree.ScriptPubKey(),
+			Nonce: convNonce, ScriptPubKey: issuerTree.ScriptPubKey(),
 		})
 	}
-	tx.Out = append(tx.Out, &elements.TxOut{
-		Asset: elements.ExplicitAsset(feeAssetID), Value: elements.ExplicitValue(feeIn.sats - s.cfg.FeeSats),
-		Nonce: elements.NullNonce(), ScriptPubKey: mustHexBytes(changeSpk),
-	})
+	// Fee change: a confidential wallet output for a confidential asset (so the
+	// transaction has >=2 confidential outputs and the amount is hidden too),
+	// otherwise a plain wallet output.
+	if asset.Confidential {
+		feeChange, err := s.confWalletOutput(feeIn.sats - s.cfg.FeeSats)
+		if err != nil {
+			httpErr(w, 502, "%v", err)
+			return
+		}
+		tx.Out = append(tx.Out, feeChange)
+	} else {
+		tx.Out = append(tx.Out, &elements.TxOut{
+			Asset: elements.ExplicitAsset(feeAssetID), Value: elements.ExplicitValue(feeIn.sats - s.cfg.FeeSats),
+			Nonce: elements.NullNonce(), ScriptPubKey: mustHexBytes(changeSpk),
+		})
+	}
 	tx.Out = append(tx.Out, &elements.TxOut{
 		Asset: elements.ExplicitAsset(feeAssetID), Value: elements.ExplicitValue(s.cfg.FeeSats),
 		Nonce: elements.NullNonce(), ScriptPubKey: nil,
 	})
 	tx.NormalizeWitness()
+
+	// Keep the pre-blind (explicit) tx for the policy check, which reads
+	// amounts, assets and destinations; blind the copy that gets signed and
+	// broadcast (the sighash commits to the blinded outputs).
+	explicitTx := tx
+	if asset.Confidential {
+		blinded, err := s.blindTx(tx)
+		if err != nil {
+			httpErr(w, 500, "blind transfer: %v", err)
+			return
+		}
+		tx = blinded
+	}
 
 	// Sighashes for the enclave inputs.
 	spent, err := s.spentOutputs(tx)
@@ -433,7 +500,7 @@ func (s *Server) handleTransferBuild(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.pending[id] = &pendingTransfer{
-		tx: tx, asset: asset, senderAID: sender.AID, atoms: req.Atoms + convertAtoms,
+		tx: tx, explicitTx: explicitTx, asset: asset, senderAID: sender.AID, atoms: req.Atoms + convertAtoms,
 		enclave: enclaveIdx, sighashes: sighashes,
 		userPub: elements.MustHex32(sender.Pubkeys[0]), created: time.Now(), feeMode: req.FeeMode,
 	}
@@ -514,7 +581,13 @@ func (s *Server) handleTransferComplete(w http.ResponseWriter, r *http.Request) 
 
 func (s *Server) cosignAndBroadcast(p *pendingTransfer, sender *store.User, userSigs map[int][]byte) (string, error) {
 	atomsOut := map[string]uint64{}
-	if err := s.checkTransfer(p.tx, p.asset, sender, atomsOut); err != nil {
+	// Policy runs on the pre-blind (explicit) tx, which has readable amounts,
+	// assets and destinations; for a transparent asset it is the same tx.
+	policyTx := p.explicitTx
+	if policyTx == nil {
+		policyTx = p.tx
+	}
+	if err := s.checkTransfer(policyTx, p.asset, sender, atomsOut); err != nil {
 		return "", err
 	}
 	senderTree, err := s.treeFor(sender, p.asset)
@@ -575,6 +648,10 @@ func (s *Server) handleCosign(w http.ResponseWriter, r *http.Request) {
 	senderTree, sender, asset, err := s.enclaveFor(req.SenderAID, req.Asset)
 	if err != nil {
 		httpErr(w, 404, "%v", err)
+		return
+	}
+	if asset.Confidential {
+		httpErr(w, 400, "confidential assets must use the hosted transfer flow (POST /v1/transfers); the server blinds the transaction")
 		return
 	}
 	tx, err := elements.DeserializeTx(mustHexBytes(req.Tx))
