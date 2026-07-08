@@ -129,6 +129,16 @@ def main():
     assert verify_schnorr(user_x, sig, det(0x66))
     out["schnorr"] = {"sec": det(1).hex(), "pub": user_x.hex(), "msg": det(0x66).hex(), "sig": sig.hex()}
 
+    # 5. issuance id derivation (cross-check for Go fastmerkle)
+    import feature_openamp_m0 as m0
+    prevout = COutPoint(uint256_from_str(det(0x88)), 7)
+    entropy, asset_i, token_i = m0.derive_issuance_ids(prevout, det(0x99))
+    out["issuance_ids"] = {
+        "prevout_hash_internal": det(0x88).hex(), "vout": 7,
+        "contract_digest": det(0x99).hex(),
+        "entropy": entropy.hex(), "asset": asset_i.hex(), "token": token_i.hex(),
+    }
+
     json.dump(out, sys.stdout, indent=1)
 
 if __name__ == "__main__":

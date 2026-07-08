@@ -9,6 +9,8 @@ package elements
 import (
 	"bytes"
 	"encoding/binary"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -516,4 +518,37 @@ func readWitnessStack(r *bytes.Reader) ([][]byte, error) {
 		stack = append(stack, item)
 	}
 	return stack, nil
+}
+
+// TxID returns the display-order transaction id (hash of the tx without
+// witness data), independent of signature state.
+func (tx *Tx) TxID() string {
+	var w bytes.Buffer
+	binary.Write(&w, binary.LittleEndian, tx.Version)
+	w.WriteByte(0)
+	writeCompactSize(&w, uint64(len(tx.In)))
+	for _, in := range tx.In {
+		serializeTxIn(&w, in)
+	}
+	writeCompactSize(&w, uint64(len(tx.Out)))
+	for _, out := range tx.Out {
+		out.Serialize(&w)
+	}
+	binary.Write(&w, binary.LittleEndian, tx.LockTime)
+	h1 := sha256.Sum256(w.Bytes())
+	h2 := sha256.Sum256(h1[:])
+	var d [32]byte
+	for i := 0; i < 32; i++ {
+		d[i] = h2[31-i]
+	}
+	return hex.EncodeToString(d[:])
+}
+
+// ExplicitAssetInternal encodes an explicit asset commitment from an
+// internal-order (little-endian) asset id.
+func ExplicitAssetInternal(internalID [32]byte) []byte {
+	a := make([]byte, 33)
+	a[0] = 1
+	copy(a[1:], internalID[:])
+	return a
 }
