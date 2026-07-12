@@ -400,6 +400,26 @@ func mustHexBytes(s string) []byte {
 	return b
 }
 
+// addressScriptPubKey resolves an ordinary address to its (unconfidential)
+// scriptPubKey hex. A confidential address is reduced to its unconfidential
+// form first, mirroring the change-address handling in the build path.
+func (s *Server) addressScriptPubKey(addr string) (string, error) {
+	info, err := s.wallet.GetAddressInfo(addr)
+	if err != nil {
+		return "", err
+	}
+	spk := info.ScriptPubKey
+	if info.Unconfidential != "" && info.Unconfidential != addr {
+		if info2, err := s.wallet.GetAddressInfo(info.Unconfidential); err == nil {
+			spk = info2.ScriptPubKey
+		}
+	}
+	if spk == "" {
+		return "", fmt.Errorf("no scriptPubKey for %s", addr)
+	}
+	return spk, nil
+}
+
 // --- hosted transfer build -----------------------------------------------------
 
 func (s *Server) handleTransferBuild(w http.ResponseWriter, r *http.Request) {
@@ -409,6 +429,18 @@ func (s *Server) handleTransferBuild(w http.ResponseWriter, r *http.Request) {
 		RecipientAID string `json:"recipient_aid"`
 		Atoms        uint64 `json:"atoms"`
 		FeeMode      string `json:"fee_mode"` // "convert" | "sponsor"
+		// Payment (OA-4): an optional ordinary-asset (e.g. USDX) leg carried in the
+		// SAME transaction as the restricted transfer, turning delivery-versus-
+		// payment into one atomic tx. from_address is an ordinary address the
+		// caller controls (the escrow's payment coins); to_address is the payee
+		// (the issuer's registered payout address). The caller signs the payment
+		// inputs with its own wallet at /complete. Absent = exactly the M5 flow.
+		Payment *struct {
+			Asset       string `json:"asset"`
+			Atoms       uint64 `json:"atoms"`
+			FromAddress string `json:"from_address"`
+			ToAddress   string `json:"to_address"`
+		} `json:"payment,omitempty"`
 	}
 	if err := decodeBody(r, &req); err != nil {
 		httpErr(w, 400, "%v", err)
@@ -432,6 +464,21 @@ func (s *Server) handleTransferBuild(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		httpErr(w, 500, "issuer enclave: %v", err)
 		return
+	}
+
+	// OA-4 payment leg: only for a transparent restricted asset (the atomic DvP
+	// path keeps the WHOLE tx transparent; a blinded restricted leg cannot carry
+	// an explicit foreign payment output under the transparency rule).
+	if req.Payment != nil {
+		if asset.Confidential {
+			httpErr(w, 400, "an atomic payment leg is only supported for a transparent restricted asset")
+			return
+		}
+		p := req.Payment
+		if p.Asset == "" || p.Atoms == 0 || p.FromAddress == "" || p.ToAddress == "" {
+			httpErr(w, 400, "payment requires asset, atoms, from_address and to_address")
+			return
+		}
 	}
 
 	convertAtoms := uint64(0)
@@ -552,6 +599,60 @@ func (s *Server) handleTransferBuild(w http.ResponseWriter, r *http.Request) {
 			Nonce: convNonce, ScriptPubKey: issuerTree.ScriptPubKey(),
 		})
 	}
+
+	// OA-4 payment leg: the escrow's ordinary payment coins (from_address) in and
+	// the payee's payment output (to_address) out, both explicit, in this same
+	// transaction. The inputs are ordinary (not enclave) coins; the caller signs
+	// them with its own wallet at /complete. Added before the fee output so the
+	// fee output stays last, and after the restricted outputs so the enclave
+	// input indices are unchanged (fully additive for a no-payment request).
+	var paymentIdx []int
+	if req.Payment != nil {
+		p := req.Payment
+		fromSpk, err := s.addressScriptPubKey(p.FromAddress)
+		if err != nil {
+			httpErr(w, 400, "payment from_address: %v", err)
+			return
+		}
+		toSpk, err := s.addressScriptPubKey(p.ToAddress)
+		if err != nil {
+			httpErr(w, 400, "payment to_address: %v", err)
+			return
+		}
+		unspents, err := s.node.ScanTxOutSet([]string{fromSpk})
+		if err != nil {
+			httpErr(w, 502, "payment scan: %v", err)
+			return
+		}
+		var payTotal uint64
+		for _, u := range unspents {
+			if u.Asset != p.Asset {
+				continue
+			}
+			idx := len(tx.In)
+			tx.In = append(tx.In, &elements.TxIn{Prevout: elements.OutPoint{Hash: internalHash(u.TxID), N: u.Vout}})
+			paymentIdx = append(paymentIdx, idx)
+			payTotal += sats(u.Amount)
+			if payTotal >= p.Atoms {
+				break
+			}
+		}
+		if payTotal < p.Atoms {
+			httpErr(w, 409, "insufficient payment balance at from_address: have %d atoms, need %d", payTotal, p.Atoms)
+			return
+		}
+		payAssetID := elements.MustHex32(p.Asset)
+		tx.Out = append(tx.Out, &elements.TxOut{
+			Asset: elements.ExplicitAsset(payAssetID), Value: elements.ExplicitValue(p.Atoms),
+			Nonce: elements.NullNonce(), ScriptPubKey: mustHexBytes(toSpk),
+		})
+		if change := payTotal - p.Atoms; change > 0 {
+			tx.Out = append(tx.Out, &elements.TxOut{
+				Asset: elements.ExplicitAsset(payAssetID), Value: elements.ExplicitValue(change),
+				Nonce: elements.NullNonce(), ScriptPubKey: mustHexBytes(fromSpk),
+			})
+		}
+	}
 	// Fee change: a confidential wallet output for a confidential asset (so the
 	// transaction has >=2 confidential outputs and the amount is hidden too),
 	// otherwise a plain wallet output.
@@ -612,40 +713,139 @@ func (s *Server) handleTransferBuild(w http.ResponseWriter, r *http.Request) {
 	}
 
 	id := newID()
+	pt := &pendingTransfer{
+		tx: tx, explicitTx: explicitTx, asset: asset, senderAID: sender.AID, atoms: req.Atoms + convertAtoms,
+		enclave: enclaveIdx, sighashes: sighashes, paymentInputs: paymentIdx,
+		userPub: elements.MustHex32(sender.Pubkeys[0]), created: time.Now(), feeMode: req.FeeMode,
+	}
 	s.mu.Lock()
-	for k, p := range s.pending { // GC stale
-		if time.Since(p.created) > 15*time.Minute {
+	for k, p := range s.pending { // GC the in-memory fast-path cache
+		if time.Since(p.created) > pendingTTL {
 			delete(s.pending, k)
 		}
 	}
-	s.pending[id] = &pendingTransfer{
-		tx: tx, explicitTx: explicitTx, asset: asset, senderAID: sender.AID, atoms: req.Atoms + convertAtoms,
-		enclave: enclaveIdx, sighashes: sighashes,
-		userPub: elements.MustHex32(sender.Pubkeys[0]), created: time.Now(), feeMode: req.FeeMode,
-	}
+	s.pending[id] = pt
 	s.mu.Unlock()
-
-	httpJSON(w, map[string]any{
-		"id": id, "tx": hex.EncodeToString(tx.Serialize()),
-		"to_sign": signing, "convert_atoms": convertAtoms, "fee_sats": s.cfg.FeeSats,
-	})
-}
-
-func (s *Server) handleTransferComplete(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	var req struct {
-		Sigs map[string]string `json:"sigs"` // input index (decimal string) -> 64-byte schnorr sig hex
-	}
-	if err := decodeBody(r, &req); err != nil {
-		httpErr(w, 400, "%v", err)
+	// Persist the build so the caller's signatures can complete it after a
+	// restart (the multi-party OA-4 case); the store is the durable authority.
+	s.st.GCPendingTransfers(pendingTTL)
+	if err := s.st.PutPendingTransfer(pendingRecord(id, pt)); err != nil {
+		httpErr(w, 500, "persist pending: %v", err)
 		return
 	}
+
+	resp := map[string]any{
+		"id": id, "tx": hex.EncodeToString(tx.Serialize()),
+		"to_sign": signing, "convert_atoms": convertAtoms, "fee_sats": s.cfg.FeeSats,
+	}
+	// Only surface payment_inputs when there is a payment leg, so a no-payment
+	// build's response is identical to M5's.
+	if len(paymentIdx) > 0 {
+		resp["payment_inputs"] = paymentIdx
+	}
+	httpJSON(w, resp)
+}
+
+// pendingRecord serialises an in-memory build into its persisted form.
+func pendingRecord(id string, p *pendingTransfer) *store.PendingTransfer {
+	sh := make([]string, len(p.sighashes))
+	for i := range p.sighashes {
+		sh[i] = hex.EncodeToString(p.sighashes[i][:])
+	}
+	explicitHex := ""
+	if p.explicitTx != nil && p.explicitTx != p.tx {
+		explicitHex = hex.EncodeToString(p.explicitTx.Serialize())
+	}
+	return &store.PendingTransfer{
+		ID: id, TxHex: hex.EncodeToString(p.tx.Serialize()), ExplicitTxHex: explicitHex,
+		AssetID: p.asset.ID, SenderAID: p.senderAID, Atoms: p.atoms,
+		Enclave: p.enclave, Sighashes: sh, UserPub: hex.EncodeToString(p.userPub[:]),
+		FeeMode: p.feeMode, PaymentInputs: p.paymentInputs, Created: p.created,
+	}
+}
+
+// loadPendingRecord rebuilds an in-memory build from its persisted form,
+// re-fetching the asset from the registry. It is the restart-survival path.
+func (s *Server) loadPendingRecord(rec *store.PendingTransfer) (*pendingTransfer, error) {
+	tx, err := elements.DeserializeTx(mustHexBytes(rec.TxHex))
+	if err != nil {
+		return nil, fmt.Errorf("decode pending tx: %w", err)
+	}
+	explicitTx := tx
+	if rec.ExplicitTxHex != "" {
+		explicitTx, err = elements.DeserializeTx(mustHexBytes(rec.ExplicitTxHex))
+		if err != nil {
+			return nil, fmt.Errorf("decode pending explicit tx: %w", err)
+		}
+	}
+	var asset *store.Asset
+	s.st.View(func(st *store.State) {
+		if a, ok := st.Assets[rec.AssetID]; ok {
+			cp := *a
+			asset = &cp
+		}
+	})
+	if asset == nil {
+		return nil, fmt.Errorf("asset %s no longer registered", rec.AssetID)
+	}
+	sighashes := make([][32]byte, len(rec.Sighashes))
+	for i, h := range rec.Sighashes {
+		b := mustHexBytes(h)
+		if len(b) != 32 {
+			return nil, fmt.Errorf("bad stored sighash")
+		}
+		copy(sighashes[i][:], b)
+	}
+	return &pendingTransfer{
+		tx: tx, explicitTx: explicitTx, asset: asset, senderAID: rec.SenderAID, atoms: rec.Atoms,
+		enclave: rec.Enclave, sighashes: sighashes, paymentInputs: rec.PaymentInputs,
+		userPub: elements.MustHex32(rec.UserPub), created: rec.Created, feeMode: rec.FeeMode,
+	}, nil
+}
+
+// takePending consumes a pending build once: it removes the id from both the
+// in-memory cache and the persisted store, returning the reconstructed build.
+// The delete-before-use guarantees a completed or replayed id can never be
+// settled twice (the M5 idempotency invariant, now restart-durable).
+func (s *Server) takePending(id string) (*pendingTransfer, bool) {
 	s.mu.Lock()
 	p, ok := s.pending[id]
 	if ok {
 		delete(s.pending, id)
 	}
 	s.mu.Unlock()
+	if ok {
+		_ = s.st.DeletePendingTransfer(id)
+		return p, true
+	}
+	rec, has := s.st.GetPendingTransfer(id)
+	if !has {
+		return nil, false
+	}
+	_ = s.st.DeletePendingTransfer(id)
+	p, err := s.loadPendingRecord(rec)
+	if err != nil {
+		return nil, false
+	}
+	return p, true
+}
+
+func (s *Server) handleTransferComplete(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var req struct {
+		Sigs map[string]string `json:"sigs"` // enclave input index (decimal string) -> 64-byte schnorr sig hex
+		// PaymentTx (OA-4) is the caller's own tx, identical in body to the built
+		// tx, whose payment-input witnesses the caller filled with its wallet. The
+		// server lifts only those witnesses; the tx body is pinned by txid so the
+		// caller cannot alter amounts or destinations. Absent for a no-payment
+		// transfer (the M5 flow).
+		PaymentTx string `json:"payment_tx,omitempty"`
+	}
+	if err := decodeBody(r, &req); err != nil {
+		httpErr(w, 400, "%v", err)
+		return
+	}
+	p, ok := s.takePending(id)
 	if !ok {
 		httpErr(w, 404, "unknown or expired transfer")
 		return
@@ -683,6 +883,36 @@ func (s *Server) handleTransferComplete(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		userSigs[idx] = sigBytes
+	}
+
+	// OA-4: merge the caller's payment-input witnesses. The caller signed those
+	// ordinary inputs with its own wallet and returns a tx identical in body to
+	// the build. Pin the body by txid (which excludes witnesses) so a tampered
+	// amount or destination is rejected, then lift only the payment inputs'
+	// witness stacks into the build the server will co-sign and broadcast.
+	if len(p.paymentInputs) > 0 {
+		if req.PaymentTx == "" {
+			httpErr(w, 400, "payment_tx required: this transfer carries a payment leg")
+			return
+		}
+		payTx, err := elements.DeserializeTx(mustHexBytes(req.PaymentTx))
+		if err != nil {
+			httpErr(w, 400, "payment_tx: %v", err)
+			return
+		}
+		if payTx.TxID() != p.tx.TxID() {
+			httpErr(w, 400, "payment_tx body does not match the built transaction")
+			return
+		}
+		payTx.NormalizeWitness()
+		p.tx.NormalizeWitness()
+		for _, idx := range p.paymentInputs {
+			if idx >= len(payTx.InWit) || len(payTx.InWit[idx].ScriptWitness) == 0 {
+				httpErr(w, 400, "payment_tx is missing a signature for payment input %d", idx)
+				return
+			}
+			p.tx.InWit[idx].ScriptWitness = payTx.InWit[idx].ScriptWitness
+		}
 	}
 
 	txid, err := s.cosignAndBroadcast(p, sender, userSigs)
@@ -800,6 +1030,31 @@ func (s *Server) handleCosign(w http.ResponseWriter, r *http.Request) {
 		claimed[idx] = true
 		if hex.EncodeToString(spent[idx].ScriptPubKey) != senderSpk {
 			httpErr(w, 403, "input %d is not the sender's enclave output", idx)
+			return
+		}
+	}
+	// Containment: every enclave input of this asset must be claimed. Resolve the
+	// enclave scriptPubKey of every registered user for this asset, then refuse
+	// any UNCLAIMED input landing on one (a co-sign hiding someone else's enclave
+	// coins of the same asset in the same tx). Additive: a legitimate cosign, in
+	// which all such inputs are claimed, resolves no unclaimed enclave input.
+	enclaveSpks := map[string]bool{}
+	s.st.View(func(st *store.State) {
+		for _, u := range st.Users {
+			cp := *u
+			tree, err := s.treeFor(&cp, asset)
+			if err == nil {
+				enclaveSpks[hex.EncodeToString(tree.ScriptPubKey())] = true
+			}
+		}
+	})
+	for idx := range tx.In {
+		if claimed[idx] {
+			continue
+		}
+		if enclaveSpks[hex.EncodeToString(spent[idx].ScriptPubKey)] {
+			logRefusal("cosign", s.st, map[string]any{"sender": sender.AID, "asset": asset.ID, "reason": "unclaimed enclave input"})
+			httpErr(w, 403, "input %d is an unclaimed enclave output of this asset", idx)
 			return
 		}
 	}

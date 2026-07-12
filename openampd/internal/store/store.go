@@ -105,14 +105,36 @@ type LogEntry struct {
 	Hash   string          `json:"hash"`
 }
 
+// PendingTransfer is a hosted-transfer build awaiting the caller's signatures
+// (M6/OA-4). It persists so a multi-party settlement survives a restart between
+// build and complete; M5's single-party pending was in-memory only. The tx and
+// its policy-check (pre-blind) copy are stored as raw hex so the exact bytes the
+// caller signed are reconstructed verbatim; the sighashes are stored so the
+// enclave signatures are verified without re-resolving prevouts.
+type PendingTransfer struct {
+	ID            string    `json:"id"`
+	TxHex         string    `json:"tx_hex"`                    // (possibly blinded) tx that gets signed and broadcast
+	ExplicitTxHex string    `json:"explicit_tx_hex,omitempty"` // pre-blind tx for the policy check (== TxHex when transparent)
+	AssetID       string    `json:"asset_id"`
+	SenderAID     string    `json:"sender_aid"`
+	Atoms         uint64    `json:"atoms"`
+	Enclave       []int     `json:"enclave"`   // restricted input indices the enclave key signs
+	Sighashes     []string  `json:"sighashes"` // hex 32-byte sighashes, aligned with Enclave
+	UserPub       string    `json:"user_pub"`  // x-only hex of the enclave key
+	FeeMode       string    `json:"fee_mode"`
+	PaymentInputs []int     `json:"payment_inputs,omitempty"` // ordinary payment input indices the caller's wallet signs
+	Created       time.Time `json:"created"`
+}
+
 type State struct {
-	Users        map[string]*User  `json:"users"`
-	Assets       map[string]*Asset `json:"assets"`
-	Transfers    []TransferRecord  `json:"transfers"`
-	RecentBlocks []string          `json:"recent_blocks"` // newest last
-	Height       int64             `json:"height"`
-	LogHead      string            `json:"log_head"`
-	LogSeq       uint64            `json:"log_seq"`
+	Users            map[string]*User            `json:"users"`
+	Assets           map[string]*Asset           `json:"assets"`
+	Transfers        []TransferRecord            `json:"transfers"`
+	PendingTransfers map[string]*PendingTransfer `json:"pending_transfers,omitempty"`
+	RecentBlocks     []string                    `json:"recent_blocks"` // newest last
+	Height           int64                       `json:"height"`
+	LogHead          string                      `json:"log_head"`
+	LogSeq           uint64                      `json:"log_seq"`
 }
 
 type Store struct {
@@ -132,8 +154,9 @@ func Open(dir string) (*Store, error) {
 		keys: filepath.Join(dir, "keys.json"),
 		log:  filepath.Join(dir, "transparency.log"),
 		state: &State{
-			Users:  map[string]*User{},
-			Assets: map[string]*Asset{},
+			Users:            map[string]*User{},
+			Assets:           map[string]*Asset{},
+			PendingTransfers: map[string]*PendingTransfer{},
 		},
 	}
 	data, err := os.ReadFile(s.path)
@@ -144,7 +167,59 @@ func Open(dir string) (*Store, error) {
 	} else if !os.IsNotExist(err) {
 		return nil, err
 	}
+	// A state document written before OA-4 has no pending_transfers field;
+	// initialise it so callers never touch a nil map.
+	if s.state.PendingTransfers == nil {
+		s.state.PendingTransfers = map[string]*PendingTransfer{}
+	}
 	return s, nil
+}
+
+// --- pending transfers (OA-4) ------------------------------------------------
+
+// PutPendingTransfer persists a build awaiting the caller's signatures.
+func (s *Store) PutPendingTransfer(pt *PendingTransfer) error {
+	return s.Update(func(st *State) error {
+		if st.PendingTransfers == nil {
+			st.PendingTransfers = map[string]*PendingTransfer{}
+		}
+		cp := *pt
+		st.PendingTransfers[pt.ID] = &cp
+		return nil
+	})
+}
+
+// GetPendingTransfer returns a copy of the pending transfer, if present.
+func (s *Store) GetPendingTransfer(id string) (*PendingTransfer, bool) {
+	var out *PendingTransfer
+	s.View(func(st *State) {
+		if pt, ok := st.PendingTransfers[id]; ok {
+			cp := *pt
+			out = &cp
+		}
+	})
+	return out, out != nil
+}
+
+// DeletePendingTransfer consumes a pending transfer (idempotent). This is the
+// once-only guard: a completed or expired id can never be settled twice.
+func (s *Store) DeletePendingTransfer(id string) error {
+	return s.Update(func(st *State) error {
+		delete(st.PendingTransfers, id)
+		return nil
+	})
+}
+
+// GCPendingTransfers drops pending transfers older than ttl.
+func (s *Store) GCPendingTransfers(ttl time.Duration) {
+	_ = s.Update(func(st *State) error {
+		for id, pt := range st.PendingTransfers {
+			if time.Since(pt.Created) > ttl {
+				delete(st.PendingTransfers, id)
+			}
+		}
+		return nil
+	})
 }
 
 // Update runs fn under the lock and persists the state afterwards.

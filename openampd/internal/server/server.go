@@ -1,24 +1,26 @@
 // Package server implements openampd's HTTP API and policy engine.
 //
 // Wallet surface (no auth, testnet):
-//   POST /v1/users                      register pubkeys -> AID
-//   GET  /v1/users/{aid}                registration status
-//   GET  /v1/users/{aid}/address        enclave address for an asset
-//   GET  /v1/users/{aid}/balance        confirmed enclave balance
-//   POST /v1/transfers                  hosted transfer build (fee convert/sponsor)
-//   POST /v1/transfers/{id}/complete    submit user signatures -> broadcast
-//   POST /v1/cosign                     raw co-sign for self-built transactions
-//   GET  /v1/assets, /v1/assets/{id}    contracts and terms
-//   GET  /v1/log                        transparency log
+//
+//	POST /v1/users                      register pubkeys -> AID
+//	GET  /v1/users/{aid}                registration status
+//	GET  /v1/users/{aid}/address        enclave address for an asset
+//	GET  /v1/users/{aid}/balance        confirmed enclave balance
+//	POST /v1/transfers                  hosted transfer build (fee convert/sponsor)
+//	POST /v1/transfers/{id}/complete    submit user signatures -> broadcast
+//	POST /v1/cosign                     raw co-sign for self-built transactions
+//	GET  /v1/assets, /v1/assets/{id}    contracts and terms
+//	GET  /v1/log                        transparency log
 //
 // Issuer surface (Bearer token):
-//   POST /v1/issuer/assets              issue a restricted asset
-//   POST /v1/issuer/freeze              freeze/unfreeze a user
-//   POST /v1/issuer/categories          set a user's categories
-//   POST /v1/issuer/rules               update an asset's policy rules
-//   POST /v1/issuer/clawback            claw back a holder's UTXOs
-//   GET  /v1/issuer/holders             ownership report
-//   POST /v1/issuer/anchor              anchor the transparency log on-chain
+//
+//	POST /v1/issuer/assets              issue a restricted asset
+//	POST /v1/issuer/freeze              freeze/unfreeze a user
+//	POST /v1/issuer/categories          set a user's categories
+//	POST /v1/issuer/rules               update an asset's policy rules
+//	POST /v1/issuer/clawback            claw back a holder's UTXOs
+//	GET  /v1/issuer/holders             ownership report
+//	POST /v1/issuer/anchor              anchor the transparency log on-chain
 package server
 
 import (
@@ -49,8 +51,8 @@ type Config struct {
 type Server struct {
 	cfg    Config
 	st     *store.Store
-	node   *rpc.Client // chain queries
-	wallet *rpc.Client // wallet operations (fee funding, issuance, broadcast)
+	node   *rpc.Client  // chain queries
+	wallet *rpc.Client  // wallet operations (fee funding, issuance, broadcast)
 	signer PolicySigner // policy-key backend (local key for testnet; FROST/MPC for mainnet)
 
 	mu      sync.Mutex
@@ -59,17 +61,24 @@ type Server struct {
 	genesis [32]byte // internal order
 }
 
+// pendingTTL bounds how long a hosted-transfer build waits for the caller's
+// signatures. M5's single-party pending used 15 minutes in memory; an atomic
+// (OA-4) settlement can involve several parties, so the persisted build lives
+// for 72h and survives a restart.
+const pendingTTL = 72 * time.Hour
+
 type pendingTransfer struct {
-	tx         *elements.Tx // the (possibly blinded) tx that gets signed and broadcast
-	explicitTx *elements.Tx // pre-blind tx with readable amounts/assets for the policy check
-	asset      *store.Asset
-	senderAID  string
-	atoms      uint64
-	enclave    []int // input indices to co-sign
-	sighashes  [][32]byte
-	userPub    [32]byte
-	created    time.Time
-	feeMode    string
+	tx            *elements.Tx // the (possibly blinded) tx that gets signed and broadcast
+	explicitTx    *elements.Tx // pre-blind tx with readable amounts/assets for the policy check
+	asset         *store.Asset
+	senderAID     string
+	atoms         uint64
+	enclave       []int // restricted input indices the enclave key co-signs
+	sighashes     [][32]byte
+	userPub       [32]byte
+	created       time.Time
+	feeMode       string
+	paymentInputs []int // ordinary payment input indices the caller's own wallet signs (OA-4)
 }
 
 func New(cfg Config, st *store.Store, node, wallet *rpc.Client) (*Server, error) {
