@@ -10,6 +10,7 @@
 //	POST /v1/transfers/{id}/complete    submit user signatures -> broadcast
 //	POST /v1/cosign                     raw co-sign for self-built transactions
 //	GET  /v1/assets, /v1/assets/{id}    contracts and terms
+//	GET  /v1/supply                     chain-derived circulating supply
 //	GET  /v1/log                        transparency log
 //
 // Issuer surface (Bearer token):
@@ -19,6 +20,8 @@
 //	POST /v1/issuer/categories          set a user's categories
 //	POST /v1/issuer/rules               update an asset's policy rules
 //	POST /v1/issuer/clawback            claw back a holder's UTXOs
+//	POST /v1/issuer/burn                build a redeem burn (OA-5), holder-signed
+//	POST /v1/issuer/reissue             reissue more into a target enclave (OA-6)
 //	GET  /v1/issuer/holders             ownership report
 //	POST /v1/issuer/anchor              anchor the transparency log on-chain
 package server
@@ -78,7 +81,8 @@ type pendingTransfer struct {
 	userPub       [32]byte
 	created       time.Time
 	feeMode       string
-	paymentInputs []int // ordinary payment input indices the caller's own wallet signs (OA-4)
+	paymentInputs []int  // ordinary payment input indices the caller's own wallet signs (OA-4)
+	burnAtoms     uint64 // >0 marks a burn build (OA-5): the atoms sent to the unspendable output
 }
 
 func New(cfg Config, st *store.Store, node, wallet *rpc.Client) (*Server, error) {
@@ -109,6 +113,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /v1/cosign", s.handleCosign)
 	mux.HandleFunc("GET /v1/assets", s.handleAssets)
 	mux.HandleFunc("GET /v1/assets/{id}", s.handleAsset)
+	mux.HandleFunc("GET /v1/supply", s.handleSupply)
 	mux.HandleFunc("GET /v1/log", s.handleLog)
 
 	mux.HandleFunc("POST /v1/issuer/assets", s.issuerAuth(s.handleIssue))
@@ -116,6 +121,8 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /v1/issuer/categories", s.issuerAuth(s.handleCategories))
 	mux.HandleFunc("POST /v1/issuer/rules", s.issuerAuth(s.handleRules))
 	mux.HandleFunc("POST /v1/issuer/clawback", s.issuerAuth(s.handleClawback))
+	mux.HandleFunc("POST /v1/issuer/burn", s.issuerAuth(s.handleBurnBuild))
+	mux.HandleFunc("POST /v1/issuer/reissue", s.issuerAuth(s.handleReissue))
 	mux.HandleFunc("GET /v1/issuer/holders", s.issuerAuth(s.handleHolders))
 	mux.HandleFunc("POST /v1/issuer/anchor", s.issuerAuth(s.handleAnchor))
 	return mux
@@ -346,7 +353,16 @@ func (s *Server) handleCategories(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, 404, "%v", err)
 		return
 	}
-	s.st.AppendLog("categories", req)
+	// OA-LM: the public transparency log records a commitment to the category
+	// set, not the raw vector, so it stops leaking each holder's exact
+	// categories. The private state above keeps the raw set for policy checks.
+	// Format-versioned ("v":1): older entries carry a raw "categories" list and
+	// stay readable; new entries carry "categories_hash" and no raw list.
+	s.st.AppendLog("categories", map[string]any{
+		"v":               1,
+		"aid":             req.AID,
+		"categories_hash": store.CategorySetHash(req.Categories),
+	})
 	httpJSON(w, map[string]any{"ok": true})
 }
 

@@ -169,9 +169,9 @@ type SignRawResult struct {
 	Hex      string `json:"hex"`
 	Complete bool   `json:"complete"`
 	Errors   []struct {
-		Txid    string `json:"txid"`
-		Vout    uint32 `json:"vout"`
-		Error   string `json:"error"`
+		Txid  string `json:"txid"`
+		Vout  uint32 `json:"vout"`
+		Error string `json:"error"`
 	} `json:"errors"`
 }
 
@@ -203,6 +203,16 @@ func (c *Client) ListUnspent(minConf int, asset string) ([]Unspent, error) {
 func (c *Client) GetNewAddress() (string, error) {
 	var addr string
 	err := c.Call(&addr, "getnewaddress")
+	return addr, err
+}
+
+// GetNewBlindedAddress requests a confidential (blech32) address PER CALL, which
+// forces blinding for that address even on a wallet running -blindedaddresses=0
+// (so it never touches the node's default-blinding flag). Its getaddressinfo
+// carries a confidential_key, unlike a default unconfidential address.
+func (c *Client) GetNewBlindedAddress() (string, error) {
+	var addr string
+	err := c.Call(&addr, "getnewaddress", "", "blech32")
 	return addr, err
 }
 
@@ -298,8 +308,8 @@ func (c *Client) CreateBlindedAddress(address, blindingPubKeyHex string) (string
 // scriptPubKey as (e.g. bech32m for a v1 taproot program).
 func (c *Client) AddressForScript(scriptHex string) (string, error) {
 	var res struct {
-		Address  string `json:"address"`
-		Segwit   struct {
+		Address string `json:"address"`
+		Segwit  struct {
 			Address string `json:"address"`
 		} `json:"segwit"`
 	}

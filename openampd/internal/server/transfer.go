@@ -760,7 +760,7 @@ func pendingRecord(id string, p *pendingTransfer) *store.PendingTransfer {
 		ID: id, TxHex: hex.EncodeToString(p.tx.Serialize()), ExplicitTxHex: explicitHex,
 		AssetID: p.asset.ID, SenderAID: p.senderAID, Atoms: p.atoms,
 		Enclave: p.enclave, Sighashes: sh, UserPub: hex.EncodeToString(p.userPub[:]),
-		FeeMode: p.feeMode, PaymentInputs: p.paymentInputs, Created: p.created,
+		FeeMode: p.feeMode, PaymentInputs: p.paymentInputs, BurnAtoms: p.burnAtoms, Created: p.created,
 	}
 }
 
@@ -798,7 +798,7 @@ func (s *Server) loadPendingRecord(rec *store.PendingTransfer) (*pendingTransfer
 	}
 	return &pendingTransfer{
 		tx: tx, explicitTx: explicitTx, asset: asset, senderAID: rec.SenderAID, atoms: rec.Atoms,
-		enclave: rec.Enclave, sighashes: sighashes, paymentInputs: rec.PaymentInputs,
+		enclave: rec.Enclave, sighashes: sighashes, paymentInputs: rec.PaymentInputs, burnAtoms: rec.BurnAtoms,
 		userPub: elements.MustHex32(rec.UserPub), created: rec.Created, feeMode: rec.FeeMode,
 	}, nil
 }
@@ -969,14 +969,23 @@ func (s *Server) cosignAndBroadcast(p *pendingTransfer, sender *store.User, user
 	for _, a := range atomsOut {
 		sent += a
 	}
+	// A burn build (OA-5) sends the sender's units to the unspendable output, so
+	// none of them land in a recipient enclave (atomsOut is empty); the moved
+	// amount is the burned amount. Record it as a "burn" so the reduction in the
+	// chain-derived supply is attributable in the transparency log. A plain
+	// transfer keeps its exact M5/M6 accounting (burnAtoms == 0 here).
+	action, moved := "transfer", sent
+	if p.burnAtoms > 0 {
+		action, moved = "burn", p.burnAtoms
+	}
 	s.st.Update(func(st *store.State) error {
 		st.Transfers = append(st.Transfers, store.TransferRecord{
-			Txid: txid, Asset: p.asset.ID, SenderAID: sender.AID, Atoms: sent, Height: -1,
+			Txid: txid, Asset: p.asset.ID, SenderAID: sender.AID, Atoms: moved, Height: -1,
 		})
 		return nil
 	})
-	s.st.AppendLog("transfer", map[string]any{
-		"txid": txid, "asset": p.asset.ID, "sender": sender.AID, "atoms": sent, "fee_mode": p.feeMode,
+	s.st.AppendLog(action, map[string]any{
+		"txid": txid, "asset": p.asset.ID, "sender": sender.AID, "atoms": moved, "fee_mode": p.feeMode,
 	})
 	return txid, nil
 }

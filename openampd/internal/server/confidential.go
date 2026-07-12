@@ -202,24 +202,20 @@ func (s *Server) blindTx(tx *elements.Tx) (*elements.Tx, error) {
 }
 
 // confWalletOutput builds an output paying `sats` of the fee asset to a fresh
-// CONFIDENTIAL wallet address (so it blinds and counts toward the >=2 blinded
-// outputs a blinded transaction needs).
+// per-call blinded (blech32) wallet address, so it blinds and counts toward the
+// >=2 blinded outputs a blinded transaction needs. OA-8: the per-call blinded
+// address forces blinding for this output even on a wallet running
+// -blindedaddresses=0, so confidential transfers and burns never depend on
+// node000's default-blinding flag.
 func (s *Server) confWalletOutput(sats uint64) (*elements.TxOut, error) {
-	addr, err := s.wallet.GetNewAddress()
+	nonce, spk, err := s.blindedWalletOutput()
 	if err != nil {
 		return nil, err
-	}
-	info, err := s.wallet.GetAddressInfo(addr)
-	if err != nil {
-		return nil, err
-	}
-	if info.ConfidentialKey == "" {
-		return nil, fmt.Errorf("wallet address is not confidential (need -blindedaddresses=1)")
 	}
 	feeAssetID := elements.MustHex32(s.cfg.FeeAsset)
 	return &elements.TxOut{
 		Asset: elements.ExplicitAsset(feeAssetID), Value: elements.ExplicitValue(sats),
-		Nonce: mustHexBytes(info.ConfidentialKey), ScriptPubKey: mustHexBytes(info.ScriptPubKey),
+		Nonce: nonce, ScriptPubKey: spk,
 	}, nil
 }
 

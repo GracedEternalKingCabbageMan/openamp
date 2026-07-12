@@ -84,6 +84,12 @@ type Asset struct {
 	Confidential bool            `json:"confidential"`
 	IssueTxid    string          `json:"issue_txid"`
 	Rules        Rules           `json:"rules"`
+	// Reissuance material (OA-6), recorded at issuance so a later DR mint can
+	// re-derive the asset entropy and locate the reissuance token. Both are
+	// display-hex. Absent on assets issued before OA-6 (reissue is refused for
+	// them), so existing records are byte-compatible.
+	Entropy string `json:"entropy,omitempty"` // final asset entropy
+	Token   string `json:"token,omitempty"`   // reissuance token id
 }
 
 // TransferRecord supports velocity accounting; entries above a reorged-out
@@ -123,6 +129,7 @@ type PendingTransfer struct {
 	UserPub       string    `json:"user_pub"`  // x-only hex of the enclave key
 	FeeMode       string    `json:"fee_mode"`
 	PaymentInputs []int     `json:"payment_inputs,omitempty"` // ordinary payment input indices the caller's wallet signs
+	BurnAtoms     uint64    `json:"burn_atoms,omitempty"`     // >0 marks a burn build (OA-5); the atoms sent to the unspendable output
 	Created       time.Time `json:"created"`
 }
 
@@ -131,10 +138,22 @@ type State struct {
 	Assets           map[string]*Asset           `json:"assets"`
 	Transfers        []TransferRecord            `json:"transfers"`
 	PendingTransfers map[string]*PendingTransfer `json:"pending_transfers,omitempty"`
-	RecentBlocks     []string                    `json:"recent_blocks"` // newest last
-	Height           int64                       `json:"height"`
-	LogHead          string                      `json:"log_head"`
-	LogSeq           uint64                      `json:"log_seq"`
+	// Reissues maps a caller idempotency key (request_id) to the reissuance txid
+	// it produced (OA-6), so a retried DR mint returns the same txid instead of
+	// minting again. Absent on pre-OA-6 documents; initialised on load.
+	Reissues map[string]string `json:"reissues,omitempty"`
+	// PendingReissues reserves a request_id with the EXACT signed reissuance tx and
+	// its txid BEFORE broadcast. A DR mint regenerates its own input (the token is
+	// re-output for the next mint), so unlike a burn/transfer it has no
+	// UTXO-exhaustion backstop; this reservation is the sole double-mint guard. A
+	// retry rebroadcasts the identical stored tx (same txid, the node dedupes) and
+	// returns the reserved txid, so a crash between broadcast and MarkReissue can
+	// never mint a second distinct transaction. Initialised on load.
+	PendingReissues map[string]*PendingReissue `json:"pending_reissues,omitempty"`
+	RecentBlocks []string          `json:"recent_blocks"` // newest last
+	Height       int64             `json:"height"`
+	LogHead      string            `json:"log_head"`
+	LogSeq       uint64            `json:"log_seq"`
 }
 
 type Store struct {
@@ -172,7 +191,71 @@ func Open(dir string) (*Store, error) {
 	if s.state.PendingTransfers == nil {
 		s.state.PendingTransfers = map[string]*PendingTransfer{}
 	}
+	if s.state.Reissues == nil {
+		s.state.Reissues = map[string]string{}
+	}
+	if s.state.PendingReissues == nil {
+		s.state.PendingReissues = map[string]*PendingReissue{}
+	}
 	return s, nil
+}
+
+// --- reissuance idempotency (OA-6) -------------------------------------------
+
+// GetReissue returns the txid a prior reissue with this request_id produced.
+func (s *Store) GetReissue(requestID string) (string, bool) {
+	var txid string
+	var ok bool
+	s.View(func(st *State) { txid, ok = st.Reissues[requestID] })
+	return txid, ok
+}
+
+// MarkReissue records the txid produced for a request_id (idempotency key), so a
+// retry with the same key never mints again. It also clears any pending
+// reservation for the key: the mint is now durably recorded, so the reserved tx
+// is no longer needed.
+func (s *Store) MarkReissue(requestID, txid string) error {
+	return s.Update(func(st *State) error {
+		if st.Reissues == nil {
+			st.Reissues = map[string]string{}
+		}
+		st.Reissues[requestID] = txid
+		delete(st.PendingReissues, requestID)
+		return nil
+	})
+}
+
+// PendingReissue is the pre-broadcast reservation for a reissuance request_id: the
+// exact signed transaction hex and its deterministically computed txid.
+type PendingReissue struct {
+	SignedHex string `json:"signed_hex"`
+	Txid      string `json:"txid"`
+}
+
+// GetPendingReissue returns the reservation for a request_id, if any.
+func (s *Store) GetPendingReissue(requestID string) (*PendingReissue, bool) {
+	var pr *PendingReissue
+	var ok bool
+	s.View(func(st *State) {
+		if p, has := st.PendingReissues[requestID]; has {
+			cp := *p
+			pr, ok = &cp, true
+		}
+	})
+	return pr, ok
+}
+
+// ReserveReissue persists the signed reissuance tx and its txid under a request_id
+// BEFORE the tx is broadcast, so a crash in the broadcast window is recoverable by
+// rebroadcasting the identical tx rather than minting a second one.
+func (s *Store) ReserveReissue(requestID, signedHex, txid string) error {
+	return s.Update(func(st *State) error {
+		if st.PendingReissues == nil {
+			st.PendingReissues = map[string]*PendingReissue{}
+		}
+		st.PendingReissues[requestID] = &PendingReissue{SignedHex: signedHex, Txid: txid}
+		return nil
+	})
 }
 
 // --- pending transfers (OA-4) ------------------------------------------------
@@ -349,6 +432,33 @@ func (s *Store) AppendLog(action string, data any) (string, error) {
 }
 
 func (s *Store) LogPath() string { return s.log }
+
+// CategorySetHash is the transparency-log commitment to a holder's category
+// set (OA-LM log minimization). The public log records this hash in place of
+// the raw category vector, so an observer can no longer read a holder's exact
+// categories, while a holder or auditor who knows the set recomputes the hash
+// and verifies it. The commitment is SHA-256 over the sorted, de-duplicated
+// labels under a versioned domain tag, so it is order- and duplicate-stable and
+// the "v1" format tag lets a later scheme coexist. The private server state
+// keeps the raw set for policy enforcement; only the public log is minimized.
+func CategorySetHash(categories []string) string {
+	seen := map[string]bool{}
+	uniq := make([]string, 0, len(categories))
+	for _, c := range categories {
+		if !seen[c] {
+			seen[c] = true
+			uniq = append(uniq, c)
+		}
+	}
+	sort.Strings(uniq)
+	h := sha256.New()
+	h.Write([]byte("openamp-catset-v1"))
+	for _, c := range uniq {
+		h.Write([]byte{0}) // unambiguous separator between labels
+		h.Write([]byte(c))
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
 
 // AID derives the account id from a registered pubkey set: 20-byte
 // hash160-style id over the sorted x-only keys (hex).

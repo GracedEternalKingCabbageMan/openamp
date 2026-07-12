@@ -102,6 +102,9 @@ func (s *Server) handleIssue(w http.ResponseWriter, r *http.Request) {
 		PolicyPub: hex.EncodeToString(policyX[:]), IssuerPub: hex.EncodeToString(issuerX[:]),
 		IssuerAID: req.IssuerAID, Clawback: clawback, BurnAllowed: req.BurnAllowed,
 		Confidential: req.Confidential, Rules: req.Rules,
+		// Recorded for a later DR reissuance (OA-6): the final entropy re-derives
+		// the asset and the token id locates the reissuance token in the wallet.
+		Entropy: displayHash(entropy), Token: displayHash(tokenID),
 	}
 	holderTree, err := s.treeFor(holder, asset)
 	if err != nil {
@@ -133,13 +136,19 @@ func (s *Server) handleIssue(w http.ResponseWriter, r *http.Request) {
 	}
 
 	feeAssetID := elements.MustHex32(s.cfg.FeeAsset)
-	// Output nonces: null for transparent assets; blinding public keys for a
-	// confidential asset (the enclave output blinds to the holder's key, the
-	// wallet token/change outputs blind to the wallet's own keys, giving the
-	// >=2 confidential outputs a blinded transaction needs).
+	// Output nonces + destinations. For a transparent asset (the default) the
+	// token and fee-change outputs go to ordinary wallet addresses with null
+	// nonces, byte-identically to before OA-8. For a confidential asset the
+	// enclave output blinds to the holder's key and the token/fee-change outputs
+	// go to per-call blinded (blech32) wallet addresses, which forces blinding
+	// for THIS transaction even on a wallet running -blindedaddresses=0 (node000's
+	// flag is never touched) and gives the >=2 confidential outputs a blinded
+	// transaction needs.
 	holderNonce := elements.NullNonce()
 	tokenNonce := elements.NullNonce()
 	changeNonce := elements.NullNonce()
+	tokenSpk := mustHexBytes(tokenInfo.ScriptPubKey)
+	changeSpk := mustHexBytes(changeInfo.ScriptPubKey)
 	if req.Confidential {
 		holderX := elements.MustHex32(holder.Pubkeys[0])
 		hn, err := s.enclaveConfNonce(assetDisplay, holderX, hex.EncodeToString(holderTree.ScriptPubKey()))
@@ -148,12 +157,21 @@ func (s *Server) handleIssue(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		holderNonce = hn
-		if tokenInfo.ConfidentialKey == "" || changeInfo.ConfidentialKey == "" {
-			httpErr(w, 500, "wallet is not confidential (need -blindedaddresses=1 for confidential issuance)")
+		// OA-8: opt-in confidential per call, no node flag. Request a fresh
+		// blech32 address for each of the token and fee-change outputs; the
+		// wallet returns a blinding key for it even under -blindedaddresses=0.
+		tn, tspk, err := s.blindedWalletOutput()
+		if err != nil {
+			httpErr(w, 500, "confidential token output: %v", err)
 			return
 		}
-		tokenNonce = mustHexBytes(tokenInfo.ConfidentialKey)
-		changeNonce = mustHexBytes(changeInfo.ConfidentialKey)
+		cn, cspk, err := s.blindedWalletOutput()
+		if err != nil {
+			httpErr(w, 500, "confidential fee-change output: %v", err)
+			return
+		}
+		tokenNonce, tokenSpk = tn, tspk
+		changeNonce, changeSpk = cn, cspk
 	}
 	tx := &elements.Tx{Version: 2}
 	tx.In = append(tx.In, &elements.TxIn{
@@ -169,9 +187,9 @@ func (s *Server) handleIssue(w http.ResponseWriter, r *http.Request) {
 		&elements.TxOut{Asset: elements.ExplicitAssetInternal(assetID), Value: elements.ExplicitValue(req.Atoms),
 			Nonce: holderNonce, ScriptPubKey: holderTree.ScriptPubKey()},
 		&elements.TxOut{Asset: elements.ExplicitAssetInternal(tokenID), Value: elements.ExplicitValue(1_0000_0000),
-			Nonce: tokenNonce, ScriptPubKey: mustHexBytes(tokenInfo.ScriptPubKey)},
+			Nonce: tokenNonce, ScriptPubKey: tokenSpk},
 		&elements.TxOut{Asset: elements.ExplicitAsset(feeAssetID), Value: elements.ExplicitValue(funding.sats - s.cfg.FeeSats),
-			Nonce: changeNonce, ScriptPubKey: mustHexBytes(changeInfo.ScriptPubKey)},
+			Nonce: changeNonce, ScriptPubKey: changeSpk},
 		&elements.TxOut{Asset: elements.ExplicitAsset(feeAssetID), Value: elements.ExplicitValue(s.cfg.FeeSats),
 			Nonce: elements.NullNonce(), ScriptPubKey: nil},
 	)
@@ -476,6 +494,39 @@ func (s *Server) handleHolders(w http.ResponseWriter, r *http.Request) {
 	var height int64
 	s.st.View(func(st *store.State) { height = st.Height })
 	httpJSON(w, map[string]any{"asset": asset.ID, "height": height, "holders": balances, "total_atoms": total})
+}
+
+// handleSupply reports an asset's circulating supply as a purely chain-derived
+// figure: the sum of every registered holder's confirmed enclave balance. It is
+// never a stored counter, so a burn (OA-5) that spends enclave units into an
+// unspendable output lowers it and a reissuance (OA-6) that lands new units in
+// an enclave raises it, both as soon as the change confirms. The reissuance
+// token (held in the server wallet, not an enclave) is deliberately excluded.
+func (s *Server) handleSupply(w http.ResponseWriter, r *http.Request) {
+	assetID := r.URL.Query().Get("asset")
+	var asset *store.Asset
+	s.st.View(func(st *store.State) {
+		if a, ok := st.Assets[assetID]; ok {
+			cp := *a
+			asset = &cp
+		}
+	})
+	if asset == nil {
+		httpErr(w, 404, "unknown asset")
+		return
+	}
+	balances, err := s.holderBalances(asset)
+	if err != nil {
+		httpErr(w, 502, "%v", err)
+		return
+	}
+	var total uint64
+	for _, a := range balances {
+		total += a
+	}
+	var height int64
+	s.st.View(func(st *store.State) { height = st.Height })
+	httpJSON(w, map[string]any{"asset": asset.ID, "circulating_atoms": total, "height": height})
 }
 
 // handleAnchor commits the transparency-log head on-chain in an OP_RETURN.
