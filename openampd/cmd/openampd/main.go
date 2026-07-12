@@ -27,6 +27,7 @@ func main() {
 		feeAsset    = flag.String("feeasset", "", "display hex of the fee asset the server pays fees in (default: the chain's policy asset)")
 		feeSats     = flag.Uint64("feesats", 1000, "flat fee attached to server-funded transactions, in fee-asset atoms")
 		demoIssuer  = flag.Bool("demoissuer", false, "hold issuer keys server-side (testnet demo only)")
+		electrsURL  = flag.String("electrs", envOr("OPENAMPD_ELECTRS_URL", "http://127.0.0.1:3003"), "explorer (electrs) base URL; prevout fallback when the node lacks -txindex")
 		follow      = flag.Duration("follow", 2*time.Second, "chain follower poll interval")
 	)
 	flag.Parse()
@@ -75,6 +76,7 @@ func main() {
 	srv, err := server.New(server.Config{
 		Listen: *listen, IssuerToken: *issuerToken,
 		FeeAsset: *feeAsset, FeeSats: *feeSats, DemoIssuer: *demoIssuer,
+		ElectrsURL: *electrsURL,
 	}, st, node, wallet)
 	if err != nil {
 		log.Fatal(err)
@@ -96,4 +98,11 @@ func defaultDatadir() string {
 		return ".openampd"
 	}
 	return home + "/.openampd"
+}
+
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }

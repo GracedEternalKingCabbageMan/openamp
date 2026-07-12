@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/hex"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -321,6 +322,29 @@ func (s *Server) holderBalances(asset *store.Asset) (map[string]uint64, error) {
 // nValue and scriptPubKey bytes (commitments for confidential outputs), read
 // from the raw prevout transaction. This is what the taproot sighash commits
 // to, uniformly for explicit and confidential inputs.
+// rawTxViaElectrs fetches a transaction's raw hex from the explorer (electrs),
+// which indexes every transaction, so a confirmed prevout resolves even though
+// the node runs without -txindex.
+func (s *Server) rawTxViaElectrs(txid string) (string, error) {
+	if s.cfg.ElectrsURL == "" {
+		return "", fmt.Errorf("getrawtransaction failed and no electrs URL is configured (node needs -txindex)")
+	}
+	url := strings.TrimRight(s.cfg.ElectrsURL, "/") + "/tx/" + txid + "/hex"
+	resp, err := http.Get(url)
+	if err != nil {
+		return "", fmt.Errorf("electrs fetch %s: %w", txid, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("electrs %s -> HTTP %d", txid, resp.StatusCode)
+	}
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(b)), nil
+}
+
 func (s *Server) spentOutputs(tx *elements.Tx) ([]*elements.SpentOutput, error) {
 	spent := make([]*elements.SpentOutput, len(tx.In))
 	cache := map[string]*elements.Tx{}
@@ -328,9 +352,16 @@ func (s *Server) spentOutputs(tx *elements.Tx) ([]*elements.SpentOutput, error) 
 		txid := displayHash(in.Prevout.Hash)
 		prev, ok := cache[txid]
 		if !ok {
+			// getrawtransaction resolves a mempool prevout without -txindex, but a
+			// CONFIRMED prevout needs -txindex, which the shared producer node does
+			// not run. Fall back to electrs (which indexes every tx) so a transfer
+			// from a confirmed enclave UTXO still resolves.
 			raw, err := s.node.GetRawTransactionHex(txid)
 			if err != nil {
-				return nil, refuse("input %d (%s:%d): %v", i, txid, in.Prevout.N, err)
+				raw, err = s.rawTxViaElectrs(txid)
+				if err != nil {
+					return nil, refuse("input %d (%s:%d): %v", i, txid, in.Prevout.N, err)
+				}
 			}
 			prev, err = elements.DeserializeTx(mustHexBytes(raw))
 			if err != nil {

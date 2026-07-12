@@ -42,7 +42,8 @@ type Config struct {
 	IssuerToken string
 	FeeAsset    string // display hex of the ordinary fee asset the server pays fees in
 	FeeSats     uint64
-	DemoIssuer  bool // hold issuer keys server-side (testnet demo); production keeps them offline
+	DemoIssuer  bool   // hold issuer keys server-side (testnet demo); production keeps them offline
+	ElectrsURL  string // explorer (electrs) base; prevout fallback when the node lacks -txindex
 }
 
 type Server struct {
