@@ -19,20 +19,7 @@ import (
 // around the locally derived asset ids, so consensus acceptance re-validates
 // the derivation every time.
 func (s *Server) handleIssue(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Name        string      `json:"name"`
-		Ticker      string      `json:"ticker"`
-		Precision   int         `json:"precision"`
-		Atoms       uint64      `json:"atoms"`
-		HolderAID   string      `json:"holder_aid"`
-		IssuerAID   string      `json:"issuer_aid"`
-		Clawback     *bool       `json:"clawback,omitempty"`
-		BurnAllowed  bool        `json:"burn_allowed"`
-		Confidential bool        `json:"confidential"`
-		Rules        store.Rules `json:"rules"`
-		TermsHash    string      `json:"terms_hash,omitempty"`
-		Endpoint     string      `json:"endpoint,omitempty"`
-	}
+	var req issueRequest
 	if err := decodeBody(r, &req); err != nil {
 		httpErr(w, 400, "%v", err)
 		return
@@ -80,27 +67,7 @@ func (s *Server) handleIssue(w http.ResponseWriter, r *http.Request) {
 	issuerX := elements.XOnlyFromPriv(issuerPriv)
 
 	// Contract (canonical: sorted keys, no whitespace; see spec/contract-v1.md).
-	contract := map[string]any{
-		"name":          req.Name,
-		"ticker":        req.Ticker,
-		"precision":     req.Precision,
-		"version":       0,
-		"issuer_pubkey": hex.EncodeToString(issuerX[:]),
-		"openamp": map[string]any{
-			"version":       1,
-			"type":          "restricted",
-			"policy_pubkey": hex.EncodeToString(policyX[:]),
-			"clawback":      clawback,
-			"burn_allowed":  req.BurnAllowed,
-			"confidential":  req.Confidential,
-		},
-	}
-	if req.TermsHash != "" {
-		contract["openamp"].(map[string]any)["terms_hash"] = req.TermsHash
-	}
-	if req.Endpoint != "" {
-		contract["openamp"].(map[string]any)["policy_endpoints"] = []string{req.Endpoint}
-	}
+	contract := req.buildContract(hex.EncodeToString(issuerX[:]), hex.EncodeToString(policyX[:]), clawback)
 	canonical, err := canonicalJSON(contract)
 	if err != nil {
 		httpErr(w, 500, "%v", err)
@@ -257,6 +224,78 @@ func (s *Server) handleIssue(w http.ResponseWriter, r *http.Request) {
 		"asset": assetDisplay, "token": displayHash(tokenID), "entropy": displayHash(entropy),
 		"txid": txid, "contract": json.RawMessage(canonical), "contract_hash": asset.ContractHash,
 	})
+}
+
+// issueRequest is the POST /v1/issuer/assets body. The entity_* / operator_*
+// fields (OA-1) are optional: when entity_domain is absent the contract is
+// byte-identical to the pre-OA-1 shape (so existing assets like BONDX are
+// unaffected); when present they add the registry-required entity block and an
+// operator-identity block, both committed by contract_hash.
+type issueRequest struct {
+	Name         string      `json:"name"`
+	Ticker       string      `json:"ticker"`
+	Precision    int         `json:"precision"`
+	Atoms        uint64      `json:"atoms"`
+	HolderAID    string      `json:"holder_aid"`
+	IssuerAID    string      `json:"issuer_aid"`
+	Clawback     *bool       `json:"clawback,omitempty"`
+	BurnAllowed  bool        `json:"burn_allowed"`
+	Confidential bool        `json:"confidential"`
+	Rules        store.Rules `json:"rules"`
+	TermsHash    string      `json:"terms_hash,omitempty"`
+	Endpoint     string      `json:"endpoint,omitempty"`
+
+	// OA-1: optional issuer/operator identity for asset-registry publication.
+	EntityDomain         string `json:"entity_domain,omitempty"`
+	EntityName           string `json:"entity_name,omitempty"`
+	OperatorName         string `json:"operator_name,omitempty"`
+	OperatorRegistration string `json:"operator_registration,omitempty"`
+}
+
+// buildContract assembles the canonical issuance contract map. Go's json.Marshal
+// sorts map keys at every level, so the result serializes deterministically and
+// contract_hash commits to the whole document. When EntityDomain is empty no
+// entity/operator keys are added, keeping the output byte-identical to pre-OA-1.
+func (req *issueRequest) buildContract(issuerPubkey, policyPubkey string, clawback bool) map[string]any {
+	contract := map[string]any{
+		"name":          req.Name,
+		"ticker":        req.Ticker,
+		"precision":     req.Precision,
+		"version":       0,
+		"issuer_pubkey": issuerPubkey,
+		"openamp": map[string]any{
+			"version":       1,
+			"type":          "restricted",
+			"policy_pubkey": policyPubkey,
+			"clawback":      clawback,
+			"burn_allowed":  req.BurnAllowed,
+			"confidential":  req.Confidential,
+		},
+	}
+	if req.TermsHash != "" {
+		contract["openamp"].(map[string]any)["terms_hash"] = req.TermsHash
+	}
+	if req.Endpoint != "" {
+		contract["openamp"].(map[string]any)["policy_endpoints"] = []string{req.Endpoint}
+	}
+	if req.EntityDomain != "" {
+		entity := map[string]any{"domain": req.EntityDomain}
+		if req.EntityName != "" {
+			entity["issuer"] = req.EntityName
+		}
+		contract["entity"] = entity
+		operator := map[string]any{}
+		if req.OperatorName != "" {
+			operator["name"] = req.OperatorName
+		}
+		if req.OperatorRegistration != "" {
+			operator["registration"] = req.OperatorRegistration
+		}
+		if len(operator) > 0 {
+			contract["operator"] = operator
+		}
+	}
+	return contract
 }
 
 type rpcUnspentLite struct {
