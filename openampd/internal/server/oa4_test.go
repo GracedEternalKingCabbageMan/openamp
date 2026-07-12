@@ -125,6 +125,7 @@ type oa4Node struct {
 	addrSpk    map[string]string            // address -> scriptPubKey hex (getaddressinfo)
 	newAddr    string                       // getnewaddress
 	broadcast  string                       // sendrawtransaction return txid
+	sends      int                          // count of sendrawtransaction calls
 }
 
 func newOA4Node() *oa4Node {
@@ -173,11 +174,15 @@ func (n *oa4Node) handler(w http.ResponseWriter, r *http.Request) {
 		var addr string
 		_ = json.Unmarshal(req.Params[0], &addr)
 		reply(map[string]any{"scriptPubKey": n.addrSpk[addr], "unconfidential": ""})
+	case "gettxout":
+		// A non-null result marks the utxo unspent (utxoUnspent guard).
+		reply(map[string]any{"confirmations": 1})
 	case "signrawtransactionwithwallet":
 		var hexTx string
 		_ = json.Unmarshal(req.Params[0], &hexTx)
 		reply(map[string]any{"hex": hexTx, "complete": true})
 	case "sendrawtransaction":
+		n.sends++
 		reply(n.broadcast)
 	default:
 		reply(nil)

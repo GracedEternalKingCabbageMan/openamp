@@ -19,7 +19,8 @@
 //	POST /v1/issuer/freeze              freeze/unfreeze a user
 //	POST /v1/issuer/categories          set a user's categories
 //	POST /v1/issuer/rules               update an asset's policy rules
-//	POST /v1/issuer/clawback            claw back a holder's UTXOs
+//	POST /v1/issuer/clawback            claw back a holder's UTXOs (legacy: signs+broadcasts; external issuer: builds the L_claw sweep)
+//	POST /v1/issuer/clawback/{id}/complete  submit the external issuer's signatures -> broadcast
 //	POST /v1/issuer/burn                build a redeem burn (OA-5), holder-signed
 //	POST /v1/issuer/reissue             reissue more into a target enclave (OA-6)
 //	GET  /v1/issuer/holders             ownership report
@@ -121,6 +122,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /v1/issuer/categories", s.issuerAuth(s.handleCategories))
 	mux.HandleFunc("POST /v1/issuer/rules", s.issuerAuth(s.handleRules))
 	mux.HandleFunc("POST /v1/issuer/clawback", s.issuerAuth(s.handleClawback))
+	mux.HandleFunc("POST /v1/issuer/clawback/{id}/complete", s.issuerAuth(s.handleClawbackComplete))
 	mux.HandleFunc("POST /v1/issuer/burn", s.issuerAuth(s.handleBurnBuild))
 	mux.HandleFunc("POST /v1/issuer/reissue", s.issuerAuth(s.handleReissue))
 	mux.HandleFunc("GET /v1/issuer/holders", s.issuerAuth(s.handleHolders))

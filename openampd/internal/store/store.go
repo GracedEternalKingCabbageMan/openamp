@@ -78,6 +78,13 @@ type Asset struct {
 	ContractHash string          `json:"contract_hash"` // display hex
 	PolicyPub    string          `json:"policy_pub"`
 	IssuerPub    string          `json:"issuer_pub"`
+	// IssuerExternal marks an asset whose issuer key is the entity's own external
+	// (browser) key rather than a server-held key (M9). Clawback then runs
+	// two-phase: the server builds the L_claw sweep and the issuer signs it
+	// externally, so the server never holds the issuer key for this asset. Absent
+	// or false = the legacy server-held issuer key and the single-call clawback,
+	// so records issued before M9 stay byte-compatible.
+	IssuerExternal bool          `json:"issuer_external,omitempty"`
 	IssuerAID    string          `json:"issuer_aid"`
 	Clawback     bool            `json:"clawback"`
 	BurnAllowed  bool            `json:"burn_allowed"`
@@ -150,6 +157,15 @@ type State struct {
 	// returns the reserved txid, so a crash between broadcast and MarkReissue can
 	// never mint a second distinct transaction. Initialised on load.
 	PendingReissues map[string]*PendingReissue `json:"pending_reissues,omitempty"`
+	// Clawbacks maps a two-phase clawback build id to the sweep txid it produced
+	// (M9), so replaying complete returns the same txid instead of driving a fresh
+	// broadcast. Absent on pre-M9 documents; initialised on load.
+	Clawbacks map[string]string `json:"clawbacks,omitempty"`
+	// PendingClawbacks holds a two-phase clawback build (the assembled L_claw sweep
+	// and its leaf sighashes) awaiting the external issuer's signatures (M9). It
+	// persists so the build survives a restart between build and complete, exactly
+	// like a pending transfer. Initialised on load.
+	PendingClawbacks map[string]*PendingClawback `json:"pending_clawbacks,omitempty"`
 	RecentBlocks []string          `json:"recent_blocks"` // newest last
 	Height       int64             `json:"height"`
 	LogHead      string            `json:"log_head"`
@@ -196,6 +212,12 @@ func Open(dir string) (*Store, error) {
 	}
 	if s.state.PendingReissues == nil {
 		s.state.PendingReissues = map[string]*PendingReissue{}
+	}
+	if s.state.Clawbacks == nil {
+		s.state.Clawbacks = map[string]string{}
+	}
+	if s.state.PendingClawbacks == nil {
+		s.state.PendingClawbacks = map[string]*PendingClawback{}
 	}
 	return s, nil
 }
@@ -301,6 +323,86 @@ func (s *Store) GCPendingTransfers(ttl time.Duration) {
 				delete(st.PendingTransfers, id)
 			}
 		}
+		return nil
+	})
+}
+
+// --- two-phase clawback (M9) -------------------------------------------------
+
+// PendingClawback is a two-phase clawback build awaiting the external issuer's
+// signatures. The assembled sweep tx (empty enclave witnesses) is stored as raw
+// hex so the exact bytes are reconstructed verbatim on complete; the leaf
+// sighashes are stored so the issuer's signatures are verified without
+// re-resolving prevouts, aligned with Enclave (the L_claw input indices). Only
+// external-issuer assets (Asset.IssuerExternal) ever create one; the legacy
+// server-held-key clawback still signs and broadcasts in a single call.
+type PendingClawback struct {
+	ID        string    `json:"id"`
+	TxHex     string    `json:"tx_hex"` // assembled L_claw sweep, enclave witnesses empty
+	AssetID   string    `json:"asset_id"`
+	HolderAID string    `json:"holder_aid"`
+	Atoms     uint64    `json:"atoms"`
+	Enclave   []int     `json:"enclave"`   // L_claw input indices the issuer signs
+	Sighashes []string  `json:"sighashes"` // hex 32-byte sighashes, aligned with Enclave
+	IssuerPub string    `json:"issuer_pub"` // x-only hex of the external issuer key
+	Reason    string    `json:"reason"`
+	Created   time.Time `json:"created"`
+}
+
+// PutPendingClawback persists a two-phase clawback build awaiting issuer sigs.
+func (s *Store) PutPendingClawback(pc *PendingClawback) error {
+	return s.Update(func(st *State) error {
+		if st.PendingClawbacks == nil {
+			st.PendingClawbacks = map[string]*PendingClawback{}
+		}
+		cp := *pc
+		st.PendingClawbacks[pc.ID] = &cp
+		return nil
+	})
+}
+
+// GetPendingClawback returns a copy of the pending clawback, if present.
+func (s *Store) GetPendingClawback(id string) (*PendingClawback, bool) {
+	var out *PendingClawback
+	s.View(func(st *State) {
+		if pc, ok := st.PendingClawbacks[id]; ok {
+			cp := *pc
+			out = &cp
+		}
+	})
+	return out, out != nil
+}
+
+// GCPendingClawbacks drops pending clawbacks older than ttl.
+func (s *Store) GCPendingClawbacks(ttl time.Duration) {
+	_ = s.Update(func(st *State) error {
+		for id, pc := range st.PendingClawbacks {
+			if time.Since(pc.Created) > ttl {
+				delete(st.PendingClawbacks, id)
+			}
+		}
+		return nil
+	})
+}
+
+// GetClawback returns the sweep txid a completed two-phase clawback produced.
+func (s *Store) GetClawback(id string) (string, bool) {
+	var txid string
+	var ok bool
+	s.View(func(st *State) { txid, ok = st.Clawbacks[id] })
+	return txid, ok
+}
+
+// MarkClawback records the txid a two-phase clawback produced (so a replay of
+// complete returns the same txid, never a second broadcast) and clears the
+// consumed pending build. Mirrors MarkReissue's consume-once semantics.
+func (s *Store) MarkClawback(id, txid string) error {
+	return s.Update(func(st *State) error {
+		if st.Clawbacks == nil {
+			st.Clawbacks = map[string]string{}
+		}
+		st.Clawbacks[id] = txid
+		delete(st.PendingClawbacks, id)
 		return nil
 	})
 }
