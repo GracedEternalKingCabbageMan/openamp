@@ -29,6 +29,15 @@ type VestingEntry struct {
 	UntilHeight int64  `json:"until_height"`
 }
 
+// CategoryDeny refuses delivery to a recipient carrying a category whose token
+// has Prefix as a prefix, until the chain reaches UntilHeight. It models a
+// Reg S distribution-compliance window keyed by a jurisdiction prefix (e.g.
+// Prefix "j:US" until height H). Only non-primary senders are bound by it.
+type CategoryDeny struct {
+	Prefix      string `json:"prefix"`
+	UntilHeight int64  `json:"until_height"`
+}
+
 type Rules struct {
 	// Recipient must hold one of these categories (empty = any registered user).
 	AllowedCategories []string `json:"allowed_categories,omitempty"`
@@ -45,6 +54,19 @@ type Rules struct {
 	// Flat conversion charge for issuer-bridged fees, in asset atoms.
 	// Placeholder pricing until price-server integration.
 	FeeConvertAtoms uint64 `json:"fee_convert_atoms,omitempty"`
+	// Sender scoping (OA-3). When the transfer's sender AID is one of these,
+	// LockinUntilHeight and CategoryDenies do NOT bind (so escrow/treasury
+	// delivery to an investor works during a lockup). AllowedCategories, the
+	// holder caps (global and per-category) and velocity still apply.
+	PrimaryAIDs []string `json:"primary_aids,omitempty"`
+	// Reg S style windows (OA-3). For a non-primary sender, refuse if any
+	// recipient holds a category whose token has one of these prefixes while
+	// height < UntilHeight.
+	CategoryDenies []CategoryDeny `json:"category_denies,omitempty"`
+	// Per exact category token holder caps (OA-3), e.g. EU per-member-state
+	// caps. Like HolderCap but counts only distinct nonzero holders carrying
+	// that category, including incoming recipients. Empty = no per-category cap.
+	HolderCapsByCategory map[string]int `json:"holder_caps_by_category,omitempty"`
 }
 
 type Asset struct {

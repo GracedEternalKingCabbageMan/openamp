@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
@@ -72,6 +73,18 @@ func (s *Server) checkTransfer(tx *elements.Tx, asset *store.Asset, sender *stor
 	}
 
 	rules := asset.Rules
+	// Sender scoping (OA-3): a primary sender (per-offering escrow / entity
+	// treasury) is exempt from the lock-in and the Reg S category-deny windows,
+	// so it can deliver to investors during a lockup. Every other rule still
+	// applies to it.
+	senderIsPrimary := false
+	for _, a := range rules.PrimaryAIDs {
+		if a == sender.AID {
+			senderIsPrimary = true
+			break
+		}
+	}
+
 	// Category gating (issuer exempt as conversion/redemption counterparty).
 	if len(rules.AllowedCategories) > 0 {
 		for aid := range recipients {
@@ -96,8 +109,36 @@ func (s *Server) checkTransfer(tx *elements.Tx, asset *store.Asset, sender *stor
 		}
 	}
 
-	// Lock-in period.
-	if rules.LockinUntilHeight > 0 && height < rules.LockinUntilHeight {
+	// Reg S category-deny windows (OA-3): only bind non-primary senders.
+	if !senderIsPrimary && len(rules.CategoryDenies) > 0 {
+		recipCats := map[string][]string{}
+		s.st.View(func(st *store.State) {
+			for aid := range recipients {
+				if aid == asset.IssuerAID {
+					continue
+				}
+				if u, has := st.Users[aid]; has {
+					recipCats[aid] = append([]string(nil), u.Categories...)
+				}
+			}
+		})
+		for aid, cats := range recipCats {
+			for _, d := range rules.CategoryDenies {
+				if height >= d.UntilHeight {
+					continue
+				}
+				for _, c := range cats {
+					if strings.HasPrefix(c, d.Prefix) {
+						return refuse("recipient %s holds category %s denied until height %d (current %d)",
+							aid, c, d.UntilHeight, height)
+					}
+				}
+			}
+		}
+	}
+
+	// Lock-in period: only binds non-primary senders (OA-3 scoping).
+	if !senderIsPrimary && rules.LockinUntilHeight > 0 && height < rules.LockinUntilHeight {
 		onlyIssuer := true
 		for aid := range recipients {
 			if aid != asset.IssuerAID {
@@ -131,8 +172,8 @@ func (s *Server) checkTransfer(tx *elements.Tx, asset *store.Asset, sender *stor
 		}
 	}
 
-	// Holder cap and vesting need chain balances.
-	if rules.HolderCap > 0 || len(rules.Vesting) > 0 {
+	// Holder cap, per-category caps and vesting need chain balances.
+	if rules.HolderCap > 0 || len(rules.Vesting) > 0 || len(rules.HolderCapsByCategory) > 0 {
 		balances, err := s.holderBalances(asset)
 		if err != nil {
 			return fmt.Errorf("holder scan: %w", err)
@@ -155,6 +196,43 @@ func (s *Server) checkTransfer(tx *elements.Tx, asset *store.Asset, sender *stor
 				return refuse("holder cap %d would be exceeded (%d holders)", rules.HolderCap, len(holders))
 			}
 		}
+		// Per-category holder caps (OA-3): each holder's categories come from the
+		// registry; a distinct nonzero holder (existing or incoming) carrying the
+		// exact category token counts once against that category's cap.
+		if len(rules.HolderCapsByCategory) > 0 {
+			aidCats := map[string][]string{}
+			s.st.View(func(st *store.State) {
+				for aid := range balances {
+					if u, has := st.Users[aid]; has {
+						aidCats[aid] = append([]string(nil), u.Categories...)
+					}
+				}
+				for aid := range recipients {
+					if u, has := st.Users[aid]; has {
+						aidCats[aid] = append([]string(nil), u.Categories...)
+					}
+				}
+			})
+			for cat, limit := range rules.HolderCapsByCategory {
+				if limit <= 0 {
+					continue
+				}
+				holders := map[string]bool{}
+				for aid, atoms := range balances {
+					if atoms > 0 && hasCategory(aidCats[aid], cat) {
+						holders[aid] = true
+					}
+				}
+				for aid, got := range recipients {
+					if got > 0 && hasCategory(aidCats[aid], cat) {
+						holders[aid] = true
+					}
+				}
+				if len(holders) > limit {
+					return refuse("holder cap for category %s: %d holders would exceed %d", cat, len(holders), limit)
+				}
+			}
+		}
 		for _, v := range rules.Vesting {
 			if v.AID != sender.AID || v.UntilHeight <= height {
 				continue
@@ -165,6 +243,16 @@ func (s *Server) checkTransfer(tx *elements.Tx, asset *store.Asset, sender *stor
 		}
 	}
 	return nil
+}
+
+// hasCategory reports whether cats contains the exact category token want.
+func hasCategory(cats []string, want string) bool {
+	for _, c := range cats {
+		if c == want {
+			return true
+		}
+	}
+	return false
 }
 
 func explicitAssetCommit(displayID string) []byte {
