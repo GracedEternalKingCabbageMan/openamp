@@ -17,19 +17,45 @@ import (
 	"github.com/GracedEternalKingCabbageMan/openamp/openampd/internal/store"
 )
 
+// precisionUnset is the pre-decode sentinel for issueRequest.Precision. Because
+// JSON leaves an omitted field untouched, seeding the field with -1 before
+// decoding lets us tell "precision absent" (stays -1 → default 8) apart from an
+// explicit "precision": 0 (integer-only asset, honoured as denomination 0).
+const precisionUnset = -1
+
+// normalizePrecision resolves the on-chain denomination (nDenomination, 0..18)
+// for an issuance request. An unset precision (the sentinel) defaults to 8; an
+// explicit value in range is honoured exactly, INCLUDING 0.
+func normalizePrecision(p int) (int, error) {
+	if p == precisionUnset {
+		return 8, nil
+	}
+	if p < 0 || p > 18 {
+		return 0, fmt.Errorf("precision must be between 0 and 18, got %d", p)
+	}
+	return p, nil
+}
+
 // handleIssue mints a new restricted asset directly into the initial
 // holder's enclave, exactly like the M0 proof: the transaction is built
 // around the locally derived asset ids, so consensus acceptance re-validates
 // the derivation every time.
 func (s *Server) handleIssue(w http.ResponseWriter, r *http.Request) {
-	var req issueRequest
+	// Pre-seed Precision with the "unset" sentinel so an OMITTED precision is
+	// distinguishable from an explicit 0. Otherwise a caller asking for an
+	// integer-only (precision 0) restricted asset would have it silently
+	// rewritten to 8, making such assets unissuable (the same trap Core fixed).
+	req := issueRequest{Precision: precisionUnset}
 	if err := decodeBody(r, &req); err != nil {
 		httpErr(w, 400, "%v", err)
 		return
 	}
-	if req.Precision == 0 {
-		req.Precision = 8
+	precision, err := normalizePrecision(req.Precision)
+	if err != nil {
+		httpErr(w, 400, "%v", err)
+		return
 	}
+	req.Precision = precision
 	clawback := true
 	if req.Clawback != nil {
 		clawback = *req.Clawback
