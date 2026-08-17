@@ -56,6 +56,40 @@ func (s *Server) handleIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.Precision = precision
+	// Enforcement election (OpenDAMP M2). Validated up front, BEFORE any side
+	// effect (no key generated, no funding selected, nothing persisted):
+	//   ""/"cosign": the existing model; the contract stays byte-identical to an
+	//                enforcement-absent issuance, so nothing more to do here.
+	//   "damp":      refused with a capability error until the Simplicity
+	//                covenants ship (M1/M3). The request shape (including
+	//                verifier_amount) is accepted and validated NOW so the wire
+	//                format is pinned before the capability lands.
+	switch req.Enforcement {
+	case "", "cosign":
+		if req.VerifierAmount != 0 {
+			httpErr(w, 400, "verifier_amount is only meaningful with enforcement \"damp\"")
+			return
+		}
+	case "damp":
+		// Where the capability lands (M1/M3), the contract's openamp block gains
+		// the fields of opendamp-design.md section 5 — "enforcement": "damp",
+		// "verifier_asset", "verifier_amount" (q, from req.VerifierAmount),
+		// "issuer_update_key", "genesis_policy" (pi_0) and
+		// "genesis_snapshot_hash" — committed into the issuance entropy, and the
+		// stored Asset persists Enforcement = "damp". Until then the election is
+		// refused before any side effect, and the refusal is logged.
+		logRefusal("issue", s.st, map[string]any{
+			"reason":      "enforcement=damp requested but network enforcement is not yet available",
+			"enforcement": "damp",
+			"ticker":      req.Ticker,
+			"issuer":      req.IssuerAID,
+		})
+		httpErr(w, 501, "network enforcement is not yet available on this policy server")
+		return
+	default:
+		httpErr(w, 400, "enforcement must be \"cosign\" or \"damp\" (or omitted for cosign)")
+		return
+	}
 	clawback := true
 	if req.Clawback != nil {
 		clawback = *req.Clawback
@@ -150,7 +184,7 @@ func (s *Server) handleIssue(w http.ResponseWriter, r *http.Request) {
 		Contract: canonical, ContractHash: displayHash(digest),
 		PolicyPub: hex.EncodeToString(policyX[:]), IssuerPub: hex.EncodeToString(issuerX[:]),
 		IssuerExternal: issuerExternal,
-		IssuerAID: req.IssuerAID, Clawback: clawback, BurnAllowed: req.BurnAllowed,
+		IssuerAID:      req.IssuerAID, Clawback: clawback, BurnAllowed: req.BurnAllowed,
 		Confidential: req.Confidential, Rules: req.Rules,
 		// Recorded for a later DR reissuance (OA-6): the final entropy re-derives
 		// the asset and the token id locates the reissuance token in the wallet.
@@ -349,7 +383,19 @@ type issueRequest struct {
 	// two-phase (the issuer signs the sweep externally). When absent the server
 	// generates the issuer key exactly as before M9 (the legacy single-call
 	// clawback), keeping a no-key issuance byte-identical.
-	IssuerPubkey string      `json:"issuer_pubkey,omitempty"`
+	IssuerPubkey string `json:"issuer_pubkey,omitempty"`
+
+	// Enforcement (OpenDAMP M2) is the per-asset enforcement election:
+	// "" or "cosign" = the existing co-signed model (the contract gains NOTHING,
+	// so it stays byte-identical to a pre-M2 issuance); "damp" = policy enforced
+	// on-chain by a Simplicity verifier covenant — refused with 501 until the
+	// covenant milestones (M1/M3) ship. Any other value is a 400.
+	Enforcement string `json:"enforcement,omitempty"`
+	// VerifierAmount is the fixed amount q of the verifier asset a valid
+	// verifier output carries (opendamp-design.md section 5, "verifier_amount").
+	// Only meaningful with enforcement "damp"; accepted now so the request
+	// shape is pinned ahead of the capability.
+	VerifierAmount uint64 `json:"verifier_amount,omitempty"`
 
 	// OA-1: optional issuer/operator identity for asset-registry publication.
 	EntityDomain         string `json:"entity_domain,omitempty"`
@@ -362,6 +408,10 @@ type issueRequest struct {
 // sorts map keys at every level, so the result serializes deterministically and
 // contract_hash commits to the whole document. When EntityDomain is empty no
 // entity/operator keys are added, keeping the output byte-identical to pre-OA-1.
+// The enforcement election deliberately adds nothing here: cosign IS the absent
+// state, so an enforcement:"cosign" issuance stays byte-identical to an
+// enforcement-absent one (BONDX invariant). A damp issuance (refused until
+// M1/M3) will add the opendamp-design.md section 5 fields to the openamp block.
 func (req *issueRequest) buildContract(issuerPubkey, policyPubkey string, clawback bool) map[string]any {
 	contract := map[string]any{
 		"name":          req.Name,
