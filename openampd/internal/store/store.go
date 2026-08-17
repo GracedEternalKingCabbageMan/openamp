@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -102,6 +103,11 @@ type Asset struct {
 	// nothing ever writes "cosign" explicitly and every stored record stays
 	// byte-compatible. A future damp asset (M1/M3) persists "damp" here.
 	Enforcement string `json:"enforcement,omitempty"`
+	// BlindEpoch is the asset's current blinding-key derivation epoch:
+	// server-side rotation bookkeeping, never an asset property and never part
+	// of the contract. Epoch 0 is the original (v1) derivation and is omitted,
+	// so every record written before rotation existed stays byte-compatible.
+	BlindEpoch uint32 `json:"blind_epoch,omitempty"`
 }
 
 // TransferRecord supports velocity accounting; entries above a reorged-out
@@ -526,6 +532,31 @@ func (s *Store) SaveKey(name, privHex string) error {
 	defer s.mu.Unlock()
 	return s.mutateKeysLocked(func(keys map[string]string) error {
 		keys[name] = privHex
+		return nil
+	})
+}
+
+// RenameKeyPrefix moves every stored key beginning with fromPrefix to the same
+// suffix under toPrefix, in ONE keys-file write — so binding a multi-key set
+// (a FROST share set) to its asset id is atomic and a crash cannot leave a
+// half-bound quorum. Errors when nothing matches.
+func (s *Store) RenameKeyPrefix(fromPrefix, toPrefix string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.mutateKeysLocked(func(keys map[string]string) error {
+		var matched []string
+		for name := range keys {
+			if strings.HasPrefix(name, fromPrefix) {
+				matched = append(matched, name)
+			}
+		}
+		if len(matched) == 0 {
+			return fmt.Errorf("no keys under %q", fromPrefix)
+		}
+		for _, name := range matched {
+			keys[toPrefix+name[len(fromPrefix):]] = keys[name]
+			delete(keys, name)
+		}
 		return nil
 	})
 }

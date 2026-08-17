@@ -27,6 +27,8 @@
 //	POST /v1/issuer/snapshots           publish a signed OpenDAMP policy snapshot
 //	GET  /v1/issuer/holders             ownership report
 //	POST /v1/issuer/anchor              anchor the transparency log on-chain
+//	POST /v1/issuer/rotate-blinding     cut a new blinding-key epoch for an asset
+//	POST /v1/issuer/consolidate         sweep blinded fee-asset change into an explicit coin
 package server
 
 import (
@@ -52,6 +54,7 @@ type Config struct {
 	FeeSats     uint64
 	DemoIssuer  bool   // hold issuer keys server-side (testnet demo); production keeps them offline
 	ElectrsURL  string // explorer (electrs) base; prevout fallback when the node lacks -txindex
+	Signer      string // policy-key backend: "local" (default) or "frost"
 }
 
 type Server struct {
@@ -67,6 +70,10 @@ type Server struct {
 	// watchReconcile guards the watch-wallet rescan reconcile (W-5c) to at
 	// most one run per process start.
 	watchReconcile sync.Once
+
+	// consolidateMu serializes blinded-fee consolidation so concurrent
+	// fee-picker failures sweep once, not once each.
+	consolidateMu sync.Mutex
 
 	genesis [32]byte // internal order
 }
@@ -93,8 +100,12 @@ type pendingTransfer struct {
 }
 
 func New(cfg Config, st *store.Store, node, wallet *rpc.Client) (*Server, error) {
+	signer, err := newSigner(cfg.Signer, st)
+	if err != nil {
+		return nil, err
+	}
 	s := &Server{cfg: cfg, st: st, node: node, wallet: wallet, pending: map[string]*pendingTransfer{},
-		signer: NewLocalKeySigner(st)}
+		signer: signer}
 	gh, err := node.GetBlockHash(0)
 	if err != nil {
 		return nil, fmt.Errorf("genesis: %w", err)
@@ -139,6 +150,8 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /v1/issuer/snapshots", s.issuerAuth(s.handleSnapshotPost))
 	mux.HandleFunc("GET /v1/issuer/holders", s.issuerAuth(s.handleHolders))
 	mux.HandleFunc("POST /v1/issuer/anchor", s.issuerAuth(s.handleAnchor))
+	mux.HandleFunc("POST /v1/issuer/rotate-blinding", s.issuerAuth(s.handleRotateBlinding))
+	mux.HandleFunc("POST /v1/issuer/consolidate", s.issuerAuth(s.handleConsolidate))
 	return mux
 }
 

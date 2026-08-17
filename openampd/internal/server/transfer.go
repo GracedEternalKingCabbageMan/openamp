@@ -497,26 +497,12 @@ func (s *Server) handleTransferBuild(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Server fee funding.
-	feeUtxos, err := s.wallet.ListUnspent(1, s.cfg.FeeAsset)
+	// Server fee funding (consolidates blinded fee change when that is all
+	// that is left; see consolidate.go).
+	feeIn, err := s.feeUTXO(s.cfg.FeeSats * 2)
 	if err != nil {
 		httpErr(w, 502, "fee funding: %v", err)
 		return
-	}
-	var feeIn *struct {
-		txid string
-		vout uint32
-		sats uint64
-	}
-	for _, u := range feeUtxos {
-		if u.Spendable && u.Explicit() && sats(u.Amount) > s.cfg.FeeSats*2 {
-			feeIn = &struct {
-				txid string
-				vout uint32
-				sats uint64
-			}{u.TxID, u.Vout, sats(u.Amount)}
-			break
-		}
 	}
 	if feeIn == nil {
 		httpErr(w, 503, "policy server has no fee funds")

@@ -133,20 +133,6 @@ func (s *Server) blindedWalletOutput() (nonce []byte, spk []byte, err error) {
 
 var errNoBlinding = &PolicyRefusal{Reason: "wallet returned no blinding key for a per-call blinded address"}
 
-// pickFeeUTXO selects one spendable fee-asset coin large enough to fund a fee.
-func (s *Server) pickFeeUTXO() (*rpcUnspentLite, error) {
-	feeUtxos, err := s.wallet.ListUnspent(1, s.cfg.FeeAsset)
-	if err != nil {
-		return nil, err
-	}
-	for _, u := range feeUtxos {
-		if u.Spendable && u.Explicit() && sats(u.Amount) > s.cfg.FeeSats*2 {
-			return &rpcUnspentLite{u.TxID, u.Vout, sats(u.Amount)}, nil
-		}
-	}
-	return nil, nil
-}
-
 // tokenUTXO locates the reissuance token in the server wallet. The token is a
 // spendable coin of the demo wallet (issuance paid it there, and a re-blind
 // re-outputs it to a demo-wallet blinded address), so the demo wallet lists it
@@ -254,7 +240,7 @@ func (s *Server) handleReissue(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Blinded token: assemble the reissuance.
-	feeIn, err := s.pickFeeUTXO()
+	feeIn, err := s.feeUTXO(s.cfg.FeeSats * 2)
 	if err != nil {
 		httpErr(w, 502, "fee funding: %v", err)
 		return
@@ -370,7 +356,7 @@ func (s *Server) handleReissue(w http.ResponseWriter, r *http.Request) {
 // output and a fee-change output are blinded (the two blinded outputs a blindable
 // tx needs); the wallet signs both its own inputs.
 func (s *Server) reblindToken(tok *rpc.ConfUnspent) (string, error) {
-	feeIn, err := s.pickFeeUTXO()
+	feeIn, err := s.feeUTXO(s.cfg.FeeSats * 2)
 	if err != nil {
 		return "", err
 	}

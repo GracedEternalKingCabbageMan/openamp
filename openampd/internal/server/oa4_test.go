@@ -264,6 +264,11 @@ func (n *oa4Node) handler(w http.ResponseWriter, r *http.Request) {
 		var hexTx string
 		_ = json.Unmarshal(req.Params[0], &hexTx)
 		n.lastBroadcast = hexTx
+		// Register the broadcast under its REAL txid so a later build can
+		// resolve it as a prevout (0-conf chaining, e.g. off a consolidation).
+		if tx, err := elements.DeserializeTx(mustHexBytes(hexTx)); err == nil {
+			n.rawTxs[tx.TxID()] = hexTx
+		}
 		reply(n.broadcast)
 	default:
 		reply(nil)

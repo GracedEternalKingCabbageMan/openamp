@@ -13,6 +13,7 @@ import (
 
 	"github.com/GracedEternalKingCabbageMan/openamp/openampd/internal/rpc"
 	"github.com/GracedEternalKingCabbageMan/openamp/openampd/internal/server"
+	_ "github.com/GracedEternalKingCabbageMan/openamp/openampd/internal/server/frostsigner" // registers -signer=frost
 	"github.com/GracedEternalKingCabbageMan/openamp/openampd/internal/store"
 )
 
@@ -27,6 +28,7 @@ func main() {
 		feeAsset    = flag.String("feeasset", "", "display hex of the fee asset the server pays fees in (default: the chain's policy asset)")
 		feeSats     = flag.Uint64("feesats", 1000, "flat fee attached to server-funded transactions, in fee-asset atoms")
 		demoIssuer  = flag.Bool("demoissuer", false, "hold issuer keys server-side (testnet demo only)")
+		signerName  = flag.String("signer", envOr("OPENAMPD_SIGNER", "local"), "policy-key backend: local (one key per asset) or frost (2-of-3 threshold)")
 		electrsURL  = flag.String("electrs", envOr("OPENAMPD_ELECTRS_URL", "http://127.0.0.1:3003"), "explorer (electrs) base URL; prevout fallback when the node lacks -txindex")
 		follow      = flag.Duration("follow", 2*time.Second, "chain follower poll interval")
 	)
@@ -76,7 +78,7 @@ func main() {
 	srv, err := server.New(server.Config{
 		Listen: *listen, IssuerToken: *issuerToken,
 		FeeAsset: *feeAsset, FeeSats: *feeSats, DemoIssuer: *demoIssuer,
-		ElectrsURL: *electrsURL,
+		ElectrsURL: *electrsURL, Signer: *signerName,
 	}, st, node, wallet)
 	if err != nil {
 		log.Fatal(err)
