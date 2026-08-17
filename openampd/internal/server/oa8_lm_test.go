@@ -261,6 +261,11 @@ func TestOA8_ConfidentialIssuanceOnUnblindedWallet(t *testing.T) {
 	if code != 200 {
 		t.Fatalf("confidential issuance failed on a -blindedaddresses=0 wallet: %d %s", code, body)
 	}
+	// Per-transfer model: "confidential" is a property of the MINT TRANSACTION
+	// only. The issuance contract must not record it, even for a blinded mint.
+	if contractJSON, err := json.Marshal(out["contract"]); err != nil || strings.Contains(string(contractJSON), "confidential") {
+		t.Fatalf("the contract must never carry a confidential key (err=%v): %v", err, out["contract"])
+	}
 	if !node.blechAsked {
 		t.Fatal("confidential issuance must request a per-call blech32 address (no node flag)")
 	}

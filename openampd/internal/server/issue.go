@@ -185,7 +185,7 @@ func (s *Server) handleIssue(w http.ResponseWriter, r *http.Request) {
 		PolicyPub: hex.EncodeToString(policyX[:]), IssuerPub: hex.EncodeToString(issuerX[:]),
 		IssuerExternal: issuerExternal,
 		IssuerAID:      req.IssuerAID, Clawback: clawback, BurnAllowed: req.BurnAllowed,
-		Confidential: req.Confidential, Rules: req.Rules,
+		Rules: req.Rules,
 		// Recorded for a later DR reissuance (OA-6): the final entropy re-derives
 		// the asset and the token id locates the reissuance token in the wallet.
 		Entropy: displayHash(entropy), Token: displayHash(tokenID),
@@ -220,12 +220,13 @@ func (s *Server) handleIssue(w http.ResponseWriter, r *http.Request) {
 	}
 
 	feeAssetID := elements.MustHex32(s.cfg.FeeAsset)
-	// Output nonces + destinations. For a transparent asset (the default) the
+	// Output nonces + destinations. For a transparent mint (the default) the
 	// token and fee-change outputs go to ordinary wallet addresses with null
-	// nonces, byte-identically to before OA-8. For a confidential asset the
-	// enclave output blinds to the holder's key and the token/fee-change outputs
-	// go to per-call blinded (blech32) wallet addresses, which forces blinding
-	// for THIS transaction even on a wallet running -blindedaddresses=0 (node000's
+	// nonces, byte-identically to before OA-8. For a confidential MINT REQUEST
+	// (a property of this transaction only, never of the asset) the enclave
+	// output blinds to the holder's key and the token/fee-change outputs go to
+	// per-call blinded (blech32) wallet addresses, which forces blinding for
+	// THIS transaction even on a wallet running -blindedaddresses=0 (node000's
 	// flag is never touched) and gives the >=2 confidential outputs a blinded
 	// transaction needs.
 	holderNonce := elements.NullNonce()
@@ -369,8 +370,13 @@ type issueRequest struct {
 	Atoms        uint64      `json:"atoms"`
 	HolderAID    string      `json:"holder_aid"`
 	IssuerAID    string      `json:"issuer_aid"`
-	Clawback     *bool       `json:"clawback,omitempty"`
-	BurnAllowed  bool        `json:"burn_allowed"`
+	Clawback    *bool `json:"clawback,omitempty"`
+	BurnAllowed bool  `json:"burn_allowed"`
+	// Confidential means ONLY "blind this mint transaction's outputs" (the
+	// enclave output to the holder's derived key, token/fee-change to per-call
+	// blech32 wallet addresses). It is NOT an asset property: confidentiality is
+	// chosen per transfer, the contract never records it, and later transfers of
+	// the asset choose blinded or explicit independently. Default false.
 	Confidential bool        `json:"confidential"`
 	Rules        store.Rules `json:"rules"`
 	TermsHash    string      `json:"terms_hash,omitempty"`
@@ -408,6 +414,9 @@ type issueRequest struct {
 // sorts map keys at every level, so the result serializes deterministically and
 // contract_hash commits to the whole document. When EntityDomain is empty no
 // entity/operator keys are added, keeping the output byte-identical to pre-OA-1.
+// The contract NEVER records a "confidential" key: confidentiality is a
+// per-transfer choice, not an asset property (assets issued before this change
+// carry the key in their frozen bytes and verify as-is).
 // The enforcement election deliberately adds nothing here: cosign IS the absent
 // state, so an enforcement:"cosign" issuance stays byte-identical to an
 // enforcement-absent one (BONDX invariant). A damp issuance (refused until
@@ -425,7 +434,6 @@ func (req *issueRequest) buildContract(issuerPubkey, policyPubkey string, clawba
 			"policy_pubkey": policyPubkey,
 			"clawback":      clawback,
 			"burn_allowed":  req.BurnAllowed,
-			"confidential":  req.Confidential,
 		},
 	}
 	if req.TermsHash != "" {
@@ -538,8 +546,10 @@ func (s *Server) handleClawback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var total uint64
+	anyBlindedIn := false
 	for _, u := range utxos {
 		total += u.atoms
+		anyBlindedIn = anyBlindedIn || u.blinded
 	}
 
 	// Fee funding.
@@ -567,19 +577,20 @@ func (s *Server) handleClawback(w http.ResponseWriter, r *http.Request) {
 	}
 	tx.In = append(tx.In, &elements.TxIn{Prevout: elements.OutPoint{Hash: internalHash(feeIn.txid), N: feeIn.vout}})
 
-	// Seized output + fee change. For a transparent asset both are explicit to
-	// ordinary destinations, exactly as before W-5. For a confidential asset the
-	// seized output blinds to the ISSUER's enclave blinding key (the holder's
-	// enclave inputs are blinded commitments, so an explicit seized output would
-	// leak the amount and could never balance) and the fee change goes to a
-	// per-call blinded (blech32) wallet output, giving the >=2 blinded outputs a
-	// blindable transaction needs — the same discipline as transfer.go/burn.go.
+	// Seized output + fee change. When every swept input is explicit both are
+	// explicit to ordinary destinations, exactly as before W-5. When ANY swept
+	// input is blinded the seized output blinds to the ISSUER's enclave blinding
+	// key — those amounts were private and must stay so, and an explicit seized
+	// output over blinded inputs could never balance anyway — and the fee change
+	// goes to a per-call blinded (blech32) wallet output, the same discipline as
+	// transfer.go/burn.go. The decision keys on the ACTUAL inputs, never on the
+	// legacy per-asset flag: confidentiality is per transfer.
 	seizedNonce := elements.NullNonce()
 	feeChangeOut := &elements.TxOut{
 		Asset: elements.ExplicitAsset(feeAssetID), Value: elements.ExplicitValue(feeIn.sats - s.cfg.FeeSats),
 		Nonce: elements.NullNonce(),
 	}
-	if asset.Confidential {
+	if anyBlindedIn {
 		seizedNonce, err = s.enclaveConfNonce(asset.ID, elements.MustHex32(issuerUser.Pubkeys[0]), hex.EncodeToString(issuerTree.ScriptPubKey()))
 		if err != nil {
 			httpErr(w, 500, "confidential seized output: %v", err)
@@ -611,9 +622,10 @@ func (s *Server) handleClawback(w http.ResponseWriter, r *http.Request) {
 	// Blind BEFORE logging and before the sighashes: the sighashes must commit
 	// to the blinded outputs (prevouts are already the on-chain commitment
 	// bytes, which TaprootSighash reads uniformly), and the logged txid must be
-	// the txid that can actually confirm. The watch wallet supplies the enclave
-	// inputs' blinders inside blindTx.
-	if asset.Confidential {
+	// the txid that can actually confirm. The watch wallet supplies the blinded
+	// enclave inputs' blinders inside blindTx; explicit inputs in the same
+	// mixed sweep contribute zero blinders.
+	if anyBlindedIn {
 		blinded, err := s.blindTx(tx)
 		if err != nil {
 			httpErr(w, 500, "blind clawback: %v", err)

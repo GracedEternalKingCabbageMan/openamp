@@ -14,7 +14,7 @@ Design document: [`doc/sequentia/openamp-design.md`](https://github.com/GracedEt
   curl -s https://sequentiatestnet.com/openamp/v1/assets
   ```
 
-- Working today (committed code): registration, enclave addresses and balances, hosted transfers with fee conversion or sponsorship, raw co-signing of self-built transactions, hosted issuance (demo mode) of transparent or confidential assets, opt-in confidential (blinded) restricted assets end to end (blinded issuance and transfers, watch-wallet unblinding, blinded co-signing), freezes, categories, per-asset rules (velocity, holder cap, lock-in, vesting), clawback, ownership reports, transparency log with on-chain anchoring, and a reorg-aware chain follower.
+- Working today (committed code): registration, enclave addresses and balances, hosted transfers with fee conversion or sponsorship, raw co-signing of self-built transactions, hosted issuance (demo mode) with optional blinded minting, per-transfer opt-in confidentiality end to end (blinded or explicit transfers of any asset, mixed explicit+blinded enclave sets, watch-wallet unblinding), freezes, categories, per-asset rules (velocity, holder cap, lock-in, vesting), clawback, ownership reports, transparency log with on-chain anchoring, and a reorg-aware chain follower.
 - In progress (not in this repository yet): a FROST threshold backend for the policy key. The committed daemon signs with a single local policy key per asset behind the `PolicySigner` interface; the FROST quorum backend is the mainnet swap-in. See "Trust model" below for what is design intent versus committed code.
 
 ## Trust model
@@ -22,7 +22,7 @@ Design document: [`doc/sequentia/openamp-design.md`](https://github.com/GracedEt
 - **Enclave outputs.** A restricted asset exists only in taproot outputs with a NUMS internal key (no key-path spend) and script leaves `<K_user> CHECKSIGVERIFY <K_policy> CHECKSIG` (transfer) and, if enabled at issuance, `<K_issuer> CHECKSIGVERIFY <K_policy> CHECKSIG` (clawback). Every spend therefore needs the policy server's signature in addition to the holder's: enforcement is server-side, not consensus-side.
 - **The asset ID commits to the policy key.** The issuance contract JSON (which names `K_policy`) is hashed into the asset's issuance entropy, so anyone holding the contract can verify offline that a given asset ID is governed by a given policy key. No registry state, no consensus lookup. Format: [`spec/contract-v1.md`](spec/contract-v1.md).
 - **Policy key backend.** On-chain, `K_policy` is always a single x-only key, so the signing backend is swappable without any chain migration. The committed backend is `LocalKeySigner` (one software key per asset, stored in a 0600 file): appropriate for testnet and demos only. The `PolicySigner` interface in `openampd/internal/server/signer.go` is the seam for a production FROST threshold (or MPC/HSM) backend, where `K_policy` is the FROST group public key and signing runs a t-of-n quorum off-chain. That backend is designed for but **not yet implemented in this repository**.
-- **Confidentiality is opt-in per asset.** Sequentia is transparent by default with opt-in confidentiality, and OpenAMP follows: an asset issued with `confidential: true` lives in blinded enclave outputs (amounts and asset tags hidden on-chain), while the policy server holds the per-holder blinding keys in a node watch wallet, so the issuer sees and reports every holding and outside observers see nothing. This is exactly AMP2's model on Liquid; it is narrower than a normal Sequentia confidential address (the issuer always sees the amount). No confidential-transaction crypto is reimplemented: the node's `rawblindrawtransaction`/unblind machinery does the work, and the holder still only signs the returned sighashes.
+- **Confidentiality is opt-in per transfer.** Sequentia is transparent by default with opt-in confidentiality, and OpenAMP follows: an asset is never "a confidential asset" — any holder may receive or move ANY restricted asset confidentially in a given transaction. `POST /v1/transfers` takes `"confidential": true` to blind that transfer's enclave outputs (amounts and asset tags hidden on-chain); `GET /address?confidential=1` returns the blinded (blech32) enclave address; issuance and reissue accept `"confidential": true` meaning only "blind this mint transaction". An enclave can hold a mix of explicit and blinded coins, and every read (balances, holders, supply) unifies both views. The policy server derives and holds the per-(holder, asset) blinding keys in a node watch wallet, so the issuer sees and reports every holding and outside observers see nothing: confidentiality is privacy from outsiders only, never from the issuer. No confidential-transaction crypto is reimplemented: the node's `rawblindrawtransaction`/unblind machinery does the work, and the holder still only signs the returned sighashes.
 - **Fees (Rule 1).** A restricted asset never appears in a fee output, so it can never be swept into a block producer's coinbase. The policy server refuses to co-sign such a transaction, and Sequentia's default-deny fee-asset whitelist makes it non-paying at every producer regardless. Holders still pay costs in the restricted asset via fee conversion (the issuer takes a fee-equivalent slice into its own enclave and attaches the real fee in an ordinary asset, atomically in the same transaction), or the server sponsors the fee, or the sender self-pays in an ordinary asset with no issuer involvement.
 - **Transparency log.** Every registration, rule change, freeze, transfer approval, refusal, and clawback is appended to a hash-chained public log (`GET /v1/log`); clawbacks are logged before they are signed. The issuer can anchor the log head on-chain in an OP_RETURN (`POST /v1/issuer/anchor`).
 - **Reorg awareness.** Sequentia reorganizes whenever Bitcoin reorganizes (anchoring is supreme). The chain follower detects forks and re-marks transfer records above the fork point as unconfirmed, so velocity accounting and reports reflect only the surviving chain.
@@ -37,7 +37,7 @@ Base URL of the public testnet instance: `https://sequentiatestnet.com/openamp` 
 |---|---|
 | `POST /v1/users` | Register a pubkey set, returns the account ID (AID) |
 | `GET /v1/users/{aid}` | Registration status |
-| `GET /v1/users/{aid}/address?asset=<id>` | Enclave address and spend data for an asset |
+| `GET /v1/users/{aid}/address?asset=<id>` | Enclave address and spend data for an asset (`&confidential=1` for the blinded form) |
 | `GET /v1/users/{aid}/balance?asset=<id>` | Confirmed enclave balance |
 | `POST /v1/transfers` | Build a hosted transfer (fee conversion or sponsorship) |
 | `POST /v1/transfers/{id}/complete` | Submit the holder's signatures, co-sign and broadcast |
@@ -48,12 +48,14 @@ Base URL of the public testnet instance: `https://sequentiatestnet.com/openamp` 
 
 **`POST /v1/users`**, body `{"pubkeys": ["<x-only hex>", ...]}`, response `{"aid": "<40-char hex>"}`. The AID is `sha256("openamp-aid-v1" || sorted pubkey hex)` truncated to 20 bytes. Registering the same key set twice returns the same AID. `pubkeys[0]` is the active enclave key.
 
-**`GET /v1/users/{aid}/address?asset=<id>`** returns everything a wallet needs to receive and later spend from its enclave:
+**`GET /v1/users/{aid}/address?asset=<id>`** returns everything a wallet needs to receive and later spend from its enclave. With `&confidential=1` the primary `address` is the blinded (blech32) form instead; either way both forms are returned, and either way the server imports the enclave script and its blinding key into the watch wallet so later blinded receipts to this enclave stay readable:
 
 ```json
 {
   "aid": "...", "asset": "...",
-  "address": "<unblinded taproot address>",
+  "address": "<taproot address; blech32 when confidential=1>",
+  "address_confidential": "<blech32 confidential address>",
+  "confidential": false,
   "script_pubkey": "<hex>",
   "user_pubkey": "<x-only hex>",
   "transfer_leaf": "<leaf script hex>", "transfer_control": "<control block hex>",
@@ -67,10 +69,10 @@ Base URL of the public testnet instance: `https://sequentiatestnet.com/openamp` 
 
 ```json
 {"asset": "<id>", "sender_aid": "...", "recipient_aid": "...",
- "atoms": 1000, "fee_mode": "convert"}
+ "atoms": 1000, "fee_mode": "convert", "confidential": false}
 ```
 
-`fee_mode` is `"convert"` (a fee-equivalent slice of the asset, `rules.fee_convert_atoms`, goes to the issuer's enclave and the server attaches the real fee) or `"sponsor"` (the server pays the fee and takes nothing). Self-paid transactions use `POST /v1/cosign` instead. Response:
+`confidential` (default false) is the per-transfer privacy choice: `true` blinds this transaction's enclave outputs to the server-derived blinding keys, whatever the asset; `false` builds the asset legs explicit even when some of the sender's coins are blinded (spending a blinded coin then requires one blinded balancing output, which the server puts on its own fee change). `fee_mode` is `"convert"` (a fee-equivalent slice of the asset, `rules.fee_convert_atoms`, goes to the issuer's enclave and the server attaches the real fee) or `"sponsor"` (the server pays the fee and takes nothing). Self-paid transactions use `POST /v1/cosign` instead. Response:
 
 ```json
 {"id": "<transfer id>", "tx": "<unsigned tx hex>",
@@ -82,7 +84,7 @@ The wallet signs each sighash with BIP340 Schnorr under its enclave key. Pending
 
 **`POST /v1/transfers/{id}/complete`**, body `{"sigs": {"<input index>": "<64-byte schnorr sig hex>"}}`. The server verifies the holder's signatures, runs the policy engine, attaches the policy signatures and its own fee-input signature, broadcasts, and returns `{"txid": "..."}`. A policy refusal returns 403 with the reason.
 
-**`POST /v1/cosign`** for self-built transactions (the sender attaches its own ordinary-asset fee), body:
+**`POST /v1/cosign`** for self-built transactions (the sender attaches its own ordinary-asset fee). Self-built flows are transparent-only: a transaction containing blinded outputs, or claiming a blinded enclave coin as an input, is refused whatever the asset — per-transfer confidentiality lives in the hosted flow. Body:
 
 ```json
 {"tx": "<tx hex>", "asset": "<id>", "sender_aid": "...", "inputs": [0, 1]}
@@ -123,7 +125,7 @@ If no issuer token is configured, every issuer request is rejected (401).
  "terms_hash": "<sha256 hex, optional>", "endpoint": "<base URL, optional>"}
 ```
 
-Mints directly into the initial holder's enclave; `clawback` defaults to true and cannot be retrofitted either way. Response: `{"asset", "token", "entropy", "txid", "contract", "contract_hash"}`. Hosted issuance holds the issuer key server-side and therefore requires the `-demoissuer` flag (testnet demo only; a production issuer keeps that key offline).
+Mints directly into the initial holder's enclave; `clawback` defaults to true and cannot be retrofitted either way. An optional `"confidential": true` blinds the mint transaction's outputs — it marks nothing about the asset (the contract never records it), and later transfers choose blinded or explicit independently. Response: `{"asset", "token", "entropy", "txid", "contract", "contract_hash"}`. Hosted issuance holds the issuer key server-side and therefore requires the `-demoissuer` flag (testnet demo only; a production issuer keeps that key offline).
 
 **Rules object** (used at issuance and by `POST /v1/issuer/rules` with body `{"asset": "<id>", "rules": {...}}`):
 
@@ -150,7 +152,7 @@ All fields optional; zero/empty means no restriction.
 
 `GET /v1/log` serves the raw log: one JSON object per line, `{"seq", "prev", "time", "action", "data", "hash"}`, where `hash = sha256("<seq>|<prev>|<time>|<action>|<data-json>")` and `prev` is the previous entry's hash. Any client can re-verify the chain and compare its head against the latest on-chain anchor.
 
-Note on the live demo asset: BONDX was issued before the contract-v1 freeze, so its on-chain contract JSON carries a legacy `"tier": "A"` field and no `"confidential"` field. Verify pre-freeze contracts as-is (the hash commits to the exact bytes); new issuances follow [`spec/contract-v1.md`](spec/contract-v1.md).
+Note on contract history: BONDX was issued before the contract-v1 freeze, so its on-chain contract JSON carries a legacy `"tier": "A"` field. Assets issued while confidentiality was per-asset carry a `"confidential"` key in their openamp block; new issuances never write one (confidentiality is per transfer). Verify every contract as-is over its exact committed bytes; new issuances follow [`spec/contract-v1.md`](spec/contract-v1.md).
 
 ## End-to-end walkthrough
 

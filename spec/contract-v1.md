@@ -4,6 +4,8 @@ STATUS: frozen with M0 (2026-07-08). Fields marked "reserved" are written but no
 
 Historical note: the public-testnet demo asset BONDX was issued before this freeze; its on-chain contract carries a legacy `"tier": "A"` field and omits `confidential`. Verification of any contract is over its exact committed bytes, so pre-freeze contracts verify as-is.
 
+Amendment (2026-08-17, per-transfer confidentiality): new issuances no longer write an `openamp.confidential` key at all — confidentiality is a property of individual transactions (chosen per transfer/mint), never of an asset. Contracts issued in the window when the key existed keep it in their frozen bytes and verify as-is; verifiers must treat the key, when present, as historical metadata with no behavioral meaning.
+
 The contract is the machine-readable issuance document of an OpenAMP asset. Its hash is committed into the asset's issuance entropy, so the asset ID itself proves which policy key and which terms govern the asset. Verification needs no registry and no consensus state.
 
 ## 1. Contract JSON
@@ -21,7 +23,6 @@ The contract is the machine-readable issuance document of an OpenAMP asset. Its 
     "policy_pubkey": "<32-byte x-only hex>",
     "clawback": true,
     "burn_allowed": true,
-    "confidential": false,
     "policy_endpoints": ["https://amp.example-issuer.com"],
     "terms_hash": "<sha256 hex>"
   }
@@ -35,7 +36,7 @@ Field rules:
 - `openamp.policy_pubkey`: the asset-wide policy key `K_policy`, 32-byte x-only, lowercase hex. This key must co-sign every transfer. It is a FROST threshold key (the group public key); on-chain it is always one point.
 - `openamp.clawback`: whether the enclave tree contains the clawback leaf (default `true`). Committed here so holders accept the terms at purchase time; it cannot be retrofitted.
 - `openamp.burn_allowed`: whether `OP_RETURN` burns of the asset are permitted.
-- `openamp.confidential`: whether the asset is issued and held blinded (opt-in; the policy server holds the blinding keys, outside observers see nothing). Committed at issuance.
+- `openamp.confidential` (historical only, never written anymore): earlier issuances committed a per-asset blinding flag here; confidentiality is now chosen per transfer and the key carries no meaning where present.
 - `openamp.policy_endpoints` (reserved): base URLs of the policy server API. `openampd` writes it when the issuer supplies an endpoint at issuance; no implementation consumes it yet.
 - `openamp.terms_hash` (optional): sha256 of the legal terms document.
 - Top-level `name`, `ticker`, `precision`, `version`, `issuer_pubkey` follow the Sequentia asset-registry conventions (`precision` mirrors the on-chain issuance denomination).

@@ -24,20 +24,25 @@ func baseReq() *issueRequest {
 	return &issueRequest{Name: "BONDX", Ticker: "BONDX", Precision: 8}
 }
 
-// TestOA1_WithoutEntity_UnchangedShape pins the pre-OA-1 canonical bytes: a
-// request without entity_domain must serialize exactly as before OA-1.
+// TestOA1_WithoutEntity_UnchangedShape pins the canonical bytes of a minimal
+// contract. Since the per-transfer confidentiality rework the openamp block
+// carries NO "confidential" key — confidentiality is a property of individual
+// transactions, never of an asset — and this pin is the byte-shape proof.
 func TestOA1_WithoutEntity_UnchangedShape(t *testing.T) {
 	got, err := canonicalJSON(baseReq().buildContract(oa1IssuerPub, oa1PolicyPub, true))
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := `{"issuer_pubkey":"` + oa1IssuerPub + `","name":"BONDX","openamp":{"burn_allowed":false,"clawback":true,"confidential":false,"policy_pubkey":"` + oa1PolicyPub + `","type":"restricted","version":1},"precision":8,"ticker":"BONDX","version":0}`
+	want := `{"issuer_pubkey":"` + oa1IssuerPub + `","name":"BONDX","openamp":{"burn_allowed":false,"clawback":true,"policy_pubkey":"` + oa1PolicyPub + `","type":"restricted","version":1},"precision":8,"ticker":"BONDX","version":0}`
 	if string(got) != want {
-		t.Fatalf("pre-OA-1 shape changed.\n got: %s\nwant: %s", got, want)
+		t.Fatalf("contract shape changed.\n got: %s\nwant: %s", got, want)
 	}
-	// No entity/operator keys leaked in.
+	// No entity/operator keys leaked in, and no confidential key ever again.
 	if strings.Contains(string(got), "entity") || strings.Contains(string(got), "operator") {
 		t.Fatalf("entity/operator must not appear without entity_domain: %s", got)
+	}
+	if strings.Contains(string(got), "confidential") {
+		t.Fatalf("a new issuance contract must never carry a confidential key: %s", got)
 	}
 }
 
@@ -52,7 +57,7 @@ func TestOA1_WithEntity_Canonical(t *testing.T) {
 
 	want := `{"entity":{"domain":"sequentiatestnet.com","issuer":"Concatena Labs"},` +
 		`"issuer_pubkey":"` + oa1IssuerPub + `","name":"BONDX",` +
-		`"openamp":{"burn_allowed":false,"clawback":true,"confidential":false,"policy_pubkey":"` + oa1PolicyPub + `","type":"restricted","version":1},` +
+		`"openamp":{"burn_allowed":false,"clawback":true,"policy_pubkey":"` + oa1PolicyPub + `","type":"restricted","version":1},` +
 		`"operator":{"name":"Concatena Labs","registration":"HN-PROSPERA-001"},` +
 		`"precision":8,"ticker":"BONDX","version":0}`
 
@@ -110,7 +115,7 @@ func TestOA1_EntityDomainOnly(t *testing.T) {
 	}
 	want := `{"entity":{"domain":"sequentiatestnet.com"},` +
 		`"issuer_pubkey":"` + oa1IssuerPub + `","name":"BONDX",` +
-		`"openamp":{"burn_allowed":false,"clawback":true,"confidential":false,"policy_pubkey":"` + oa1PolicyPub + `","type":"restricted","version":1},` +
+		`"openamp":{"burn_allowed":false,"clawback":true,"policy_pubkey":"` + oa1PolicyPub + `","type":"restricted","version":1},` +
 		`"precision":8,"ticker":"BONDX","version":0}`
 	if string(got) != want {
 		t.Fatalf("entity-domain-only shape wrong.\n got: %s\nwant: %s", got, want)
@@ -136,7 +141,7 @@ func TestOA1_TermsHashUnaffected(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := `{"issuer_pubkey":"` + oa1IssuerPub + `","name":"BONDX",` +
-		`"openamp":{"burn_allowed":false,"clawback":true,"confidential":false,"policy_endpoints":["https://sequentiatestnet.com/openamp"],"policy_pubkey":"` + oa1PolicyPub + `","terms_hash":"deadbeef","type":"restricted","version":1},` +
+		`"openamp":{"burn_allowed":false,"clawback":true,"policy_endpoints":["https://sequentiatestnet.com/openamp"],"policy_pubkey":"` + oa1PolicyPub + `","terms_hash":"deadbeef","type":"restricted","version":1},` +
 		`"precision":8,"ticker":"BONDX","version":0}`
 	if string(got) != want {
 		t.Fatalf("terms_hash/endpoint placement changed.\n got: %s\nwant: %s", got, want)

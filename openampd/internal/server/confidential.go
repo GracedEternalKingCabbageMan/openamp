@@ -15,12 +15,16 @@ import (
 	"github.com/GracedEternalKingCabbageMan/openamp/openampd/internal/store"
 )
 
-// Confidential-asset support. Sequentia is transparent by default and
-// confidentiality is opt-in per asset; for a governed asset the policy server
-// holds the blinding keys (so the issuer always sees who owns what) while
-// outside observers see nothing. No confidential-transaction crypto is
-// reimplemented here: the node's tested CT machinery does the blinding and a
-// node watch wallet (holding the blinding keys) does the unblinding.
+// Per-transfer confidentiality support. Sequentia is transparent by default
+// and confidentiality is opt-in PER CALL: an asset is never "a confidential
+// asset" — any holder may receive or move ANY restricted asset confidentially
+// in a given transaction (issue/transfer/reissue take "confidential": true;
+// GET /address takes ?confidential=1). The policy server derives and holds the
+// per-(holder, asset) blinding keys, so the issuer always sees every holding
+// through the watch wallet; confidentiality is privacy from outsiders only.
+// No confidential-transaction crypto is reimplemented here: the node's tested
+// CT machinery does the blinding and a node watch wallet (holding the blinding
+// keys) does the unblinding.
 
 const watchWalletName = "openampd-watch"
 
@@ -122,33 +126,34 @@ func (s *Server) importConfidentialEnclave(enclaveSpkHex string, blindingPriv []
 	return nil
 }
 
-// confidentialUTXOs returns the watch wallet's unblinded UTXOs for a given
-// enclave scriptPubKey and asset.
-func (s *Server) confidentialUTXOs(enclaveSpkHex, assetID string) ([]rpc.ConfUnspent, error) {
-	w, err := s.watchClient()
-	if err != nil {
-		return nil, err
-	}
-	all, err := w.ListUnspentAll()
-	if err != nil {
-		return nil, err
-	}
-	var out []rpc.ConfUnspent
-	for _, u := range all {
-		if u.ScriptPubKey == enclaveSpkHex && u.Asset == assetID {
-			out = append(out, u)
-		}
-	}
-	return out, nil
-}
-
 const zeroBlinder = "0000000000000000000000000000000000000000000000000000000000000000"
 
 // blindTx blinds a raw transaction: it gathers each input's amount, asset and
 // blinders from the demo wallet (fee/funding inputs) and the watch wallet
 // (enclave inputs), then runs the node's rawblindrawtransaction. Outputs that
-// carry a blinding pubkey (nonce) are blinded; the transaction must have at
-// least two such outputs. Returns the blinded transaction, deserialized.
+// carry a blinding pubkey (nonce) are blinded. Returns the blinded transaction,
+// deserialized.
+//
+// Blinded inputs and explicit outputs — what the node actually requires: a
+// transaction spending a blinded input can NEVER have all-explicit outputs.
+// Consensus checks the value balance homomorphically on the Pedersen
+// commitments themselves (explicit values enter as zero-blinder commitments),
+// so the input's non-zero blinding factors must be absorbed by at least one
+// blinded OUTPUT whose blinder rawblindrawtransaction computes to balance;
+// "supplying the input blinders to the node" is not a mechanism that exists at
+// validation time — the blinders are only inputs to rawblindrawtransaction,
+// which is why every build touching a blinded input must route through here
+// (with a blinded output to balance into), while a build over purely explicit
+// inputs with no blinded outputs skips blinding entirely. With no blinded
+// inputs the transaction needs >=2 blinded outputs (a single one would get a
+// forced, trivially-unwindable blinder and the node refuses); with a blinded
+// input present, one blinded output suffices.
+//
+// Every input's amount/asset/blinders must be known: blinded inputs come from
+// the demo or watch wallet (which unblinds imported enclave scripts); an
+// explicit input unknown to either wallet (e.g. a never-imported enclave UTXO)
+// is resolved from its prevout bytes, since an explicit prevout needs no
+// secret knowledge (zero blinders).
 func (s *Server) blindTx(tx *elements.Tx) (*elements.Tx, error) {
 	idx := map[string]rpc.ConfUnspent{}
 	sources := []*rpc.Client{s.wallet}
@@ -164,13 +169,30 @@ func (s *Server) blindTx(tx *elements.Tx) (*elements.Tx, error) {
 			idx[fmt.Sprintf("%s:%d", u.TxID, u.Vout)] = u
 		}
 	}
+	var spent []*elements.SpentOutput // lazily resolved prevouts (explicit-input fallback)
 	var amountBlinders, assets, assetBlinders []string
 	var amounts []float64
 	for i, in := range tx.In {
 		key := fmt.Sprintf("%s:%d", displayHash(in.Prevout.Hash), in.Prevout.N)
 		u, ok := idx[key]
 		if !ok {
-			return nil, fmt.Errorf("input %d (%s) not found in demo/watch wallets for blinding", i, key)
+			// Fallback: resolve the prevout. Only an EXPLICIT prevout can be used
+			// this way; a blinded prevout without wallet knowledge has no
+			// recoverable blinders.
+			if spent == nil {
+				var err error
+				if spent, err = s.spentOutputs(tx); err != nil {
+					return nil, fmt.Errorf("resolve prevouts for blinding: %w", err)
+				}
+			}
+			o := spent[i]
+			amt, okv := elements.ExplicitValueAmount(o.Value)
+			if !okv || len(o.Asset) != 33 || o.Asset[0] != 1 {
+				return nil, fmt.Errorf("input %d (%s): blinded prevout not found in demo/watch wallets (no blinders available)", i, key)
+			}
+			var assetInternal [32]byte
+			copy(assetInternal[:], o.Asset[1:]) // commitment bytes are internal order
+			u = rpc.ConfUnspent{Amount: float64(amt) / 1e8, Asset: displayHash(assetInternal)}
 		}
 		ab := u.AmountBlinder
 		if ab == "" {
@@ -242,15 +264,17 @@ func (s *Server) startWatchReconcile() {
 	s.watchReconcile.Do(func() { go s.reconcileWatchWallet() })
 }
 
-// reconcileWatchWallet re-imports the enclave script + blinding key of every
-// registered (holder, asset) pair of a confidential asset into the watch
-// wallet, then runs ONE rescanblockchain pass. The request paths import with
-// rescan=false (to keep them fast), so an enclave whose key arrived after its
-// funds — a restored data directory, a receipt while the daemon was down —
-// holds UTXOs the wallet has never seen; the rescan surfaces them. We cannot
-// tell which imports were "first" imports, so the pass runs whenever any
-// confidential pair exists at all: it is read-only against the chain and
-// bounded to once per process start by startWatchReconcile.
+// reconcileWatchWallet re-imports the enclave script + blinding key of EVERY
+// registered (holder, asset) pair into the watch wallet, then runs ONE
+// rescanblockchain pass. Confidentiality is per transfer, so any enclave of
+// any asset may hold blinded UTXOs — the legacy per-asset Confidential flag is
+// deliberately not consulted. The request paths import with rescan=false (to
+// keep them fast), so an enclave whose key arrived after its funds — a
+// restored data directory, a receipt while the daemon was down — holds UTXOs
+// the wallet has never seen; the rescan surfaces them. We cannot tell which
+// imports were "first" imports, so the pass runs whenever any pair exists at
+// all: it is read-only against the chain and bounded to once per process start
+// by startWatchReconcile.
 func (s *Server) reconcileWatchWallet() {
 	type pair struct {
 		assetID string
@@ -260,9 +284,6 @@ func (s *Server) reconcileWatchWallet() {
 	var pairs []pair
 	s.st.View(func(st *store.State) {
 		for _, a := range st.Assets {
-			if !a.Confidential {
-				continue
-			}
 			for _, u := range st.Users {
 				tree, err := s.treeFor(u, a)
 				if err != nil {
@@ -273,7 +294,7 @@ func (s *Server) reconcileWatchWallet() {
 		}
 	})
 	if len(pairs) == 0 {
-		return // no confidential enclaves registered: nothing to import or rescan
+		return // no enclaves registered: nothing to import or rescan
 	}
 	imported := 0
 	for _, p := range pairs {
@@ -297,7 +318,7 @@ func (s *Server) reconcileWatchWallet() {
 		log.Printf("watch reconcile: rescanblockchain: %v", err)
 		return
 	}
-	log.Printf("watch reconcile: re-imported %d/%d confidential enclaves, rescan complete", imported, len(pairs))
+	log.Printf("watch reconcile: re-imported %d/%d enclaves, rescan complete", imported, len(pairs))
 }
 
 // utxoUnspent verifies a wallet-listed utxo is actually unspent in the global
