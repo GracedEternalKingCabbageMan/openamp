@@ -216,13 +216,16 @@ func WindowsHash(windows []Window) ([32]byte, error) {
 	return taggedHash(TagWindows, c), nil
 }
 
-// dmtWhitelistRoot recomputes a dmt-v1 list predicate's root from its inline
-// entries and checks it against the declared root, returning nil when the
-// predicate is absent (so RulesRootCovenant commits zeros for the slot). The
-// entries are raw 32-byte x-only owner keys; dmt.New refuses the guard values
-// and duplicates, which would make slot assignment ambiguous.
-func dmtWhitelistRoot(p PredicateList) (*[32]byte, error) {
-	const name = "predicates.whitelist"
+// dmtPredicateRoot recomputes a dmt-v1 list predicate's root from its inline
+// entries with the tree that predicate actually uses, and checks it against the
+// declared root. Both trees are keyed by raw 32-byte values and both refuse the
+// guard values and duplicates, which would make slot assignment ambiguous.
+//
+// The two trees are DIFFERENT SHAPES and are not interchangeable: the whitelist
+// is a sorted dense tree of owner keys (membership), the blacklist an interval
+// tree of outpoint keys (non-membership by bracketing interval). Building one
+// with the other's constructor yields a root no covenant answers to.
+func dmtPredicateRoot(name string, p PredicateList, build func([][32]byte) ([32]byte, error)) (*[32]byte, error) {
 	if p.Root == "" {
 		if len(p.Entries) != 0 || p.URL != "" {
 			return nil, fmt.Errorf("%s: entries/url present but root empty (absent predicate must be fully absent)", name)
@@ -244,7 +247,7 @@ func dmtWhitelistRoot(p PredicateList) (*[32]byte, error) {
 		}
 		keys = append(keys, k)
 	}
-	got, err := WhitelistRoot(keys)
+	got, err := build(keys)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", name, err)
 	}
@@ -256,17 +259,29 @@ func dmtWhitelistRoot(p PredicateList) (*[32]byte, error) {
 
 // computePiDMT is the pi a dmt-v1 snapshot commits to: the one the deployed
 // verifier covenant is instantiated with. It mirrors `pi_of` in
-// opendamp/src/bin/opendamp.rs exactly — a dmt-v1 whitelist root, the
-// covenant rules_root, and the asset id in INTERNAL byte order.
+// opendamp/src/bin/opendamp.rs exactly — a dmt-v1 whitelist root, a dmt-v1
+// interval blacklist root, the covenant rules_root, and the asset id in
+// INTERNAL byte order.
 //
-// The blacklist slot is deliberately the empty hash: no shipped program reads a
-// blacklist root (opendamp/STATUS.md, degradation (a)), so committing one would
-// advertise enforcement that does not exist. Validate refuses a dmt-v1 snapshot
-// that carries a blacklist rather than silently dropping it, because an issuer
-// who publishes one and believes it binds has a false sense of a freeze.
-// Windows are refused for the same reason.
+// Both list roots are commitments the covenant reads. An empty blacklist is NOT
+// an absent one: the empty interval tree still has a root (the guard interval),
+// so a policy that freezes nothing commits to that root rather than to zeros.
+// Validate therefore refuses a dmt-v1 snapshot with no blacklist root at all,
+// instead of quietly committing zeros the covenant would never accept.
+//
+// Blacklist entries are outpoint keys, SHA256(txid || BE32(vout)) with the txid
+// in INTERNAL (consensus) byte order — the bytes the covenant's outpoint jet
+// returns, not the reversed display form. Getting that backwards produces a root
+// that looks right and freezes nothing.
+//
+// Height windows are still refused: no shipped program reads them, and an issuer
+// who publishes one and believes it binds has a false sense of a rule.
 func (s *Snapshot) computePiDMT() ([32]byte, error) {
-	wl, err := dmtWhitelistRoot(s.Predicates.Whitelist)
+	wl, err := dmtPredicateRoot("predicates.whitelist", s.Predicates.Whitelist, WhitelistRoot)
+	if err != nil {
+		return [32]byte{}, err
+	}
+	bl, err := dmtPredicateRoot("predicates.blacklist", s.Predicates.Blacklist, BlacklistRoot)
 	if err != nil {
 		return [32]byte{}, err
 	}
@@ -282,7 +297,7 @@ func (s *Snapshot) computePiDMT() ([32]byte, error) {
 	for i := 0; i < 32; i++ {
 		internal[i] = display[31-i]
 	}
-	return PiCovenant(internal, s.Seq, RulesRootCovenant(nil, wl, limit, nil)), nil
+	return PiCovenant(internal, s.Seq, RulesRootCovenant(bl, wl, limit, nil)), nil
 }
 
 // ComputePi derives the policy commitment the snapshot's contents imply. Which
@@ -333,12 +348,19 @@ func (s *Snapshot) Validate() error {
 	switch s.Tree {
 	case TreeSMTv1:
 	case TreeDMTv1:
-		// The consensus-bearing format: refuse anything the shipped covenant does
-		// not read, rather than committing to it and implying enforcement.
-		bl := s.Predicates.Blacklist
-		if bl.Root != "" || len(bl.Entries) != 0 || bl.URL != "" {
-			return fmt.Errorf("a dmt-v1 snapshot must not carry a blacklist: the shipped covenant commits the empty hash in that slot and enforces nothing there, so listed outpoints would stay spendable (opendamp/STATUS.md)")
+		// The consensus-bearing format. Both list predicates are real: the covenant
+		// reads a whitelist root AND a blacklist root, so both must be present and
+		// recomputable. An empty blacklist still commits to the empty interval
+		// tree's root, never to zeros, so "freeze nothing" is a root like any other
+		// and its absence is a malformed policy rather than a permissive one.
+		if s.Predicates.Whitelist.Root == "" {
+			return fmt.Errorf("a dmt-v1 snapshot must carry a whitelist root: the covenant checks the recipient of every regulated output against it")
 		}
+		if s.Predicates.Blacklist.Root == "" {
+			return fmt.Errorf("a dmt-v1 snapshot must carry a blacklist root: the covenant proves non-membership against it on every regulated input, and an empty blacklist still commits to the empty interval tree's root rather than to zeros")
+		}
+		// Refuse what nothing reads, rather than committing to it and implying
+		// enforcement that does not exist.
 		if len(s.Predicates.Windows) != 0 {
 			return fmt.Errorf("a dmt-v1 snapshot must not carry height windows: no shipped covenant enforces them")
 		}

@@ -54,6 +54,9 @@ func (s *Server) handleBurnBuild(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, 404, "%v", err)
 		return
 	}
+	if refuseDampCosign(w, asset) {
+		return
+	}
 	if !asset.BurnAllowed {
 		logRefusal("burn", s.st, map[string]any{"holder": holder.AID, "asset": asset.ID, "reason": "burns are not permitted for this asset"})
 		httpErr(w, 403, "burns are not permitted for this asset")

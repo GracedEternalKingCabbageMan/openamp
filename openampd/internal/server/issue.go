@@ -71,20 +71,23 @@ func (s *Server) handleIssue(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	case "damp":
-		// Where the capability lands (M1/M3), the contract's openamp block gains
-		// the fields of opendamp-design.md section 5 — "enforcement": "damp",
-		// "verifier_asset", "verifier_amount" (q, from req.VerifierAmount),
-		// "issuer_update_key", "genesis_policy" (pi_0) and
-		// "genesis_snapshot_hash" — committed into the issuance entropy, and the
-		// stored Asset persists Enforcement = "damp". Until then the election is
-		// refused before any side effect, and the refusal is logged.
+		// Network enforcement has its own endpoint, because it needs inputs this
+		// one has no field for and cannot invent: the initial holder's x-only key
+		// (a damp asset is minted into a covenant, not into an enclave, so an AID
+		// is not enough), the whitelist pi_0 commits to, the issuer update key, and
+		// the compiled-program CMRs. Routing rather than silently doing something
+		// else is the honest answer: the request shapes are not interchangeable.
+		if s.dampConfigured() {
+			httpErr(w, 400, "enforcement \"damp\" is issued through POST /v1/issuer/damp-assets, which takes the holder key, whitelist and issuer update key a network-enforced asset commits to")
+			return
+		}
 		logRefusal("issue", s.st, map[string]any{
-			"reason":      "enforcement=damp requested but network enforcement is not yet available",
+			"reason":      "enforcement=damp requested but network enforcement is not configured",
 			"enforcement": "damp",
 			"ticker":      req.Ticker,
 			"issuer":      req.IssuerAID,
 		})
-		httpErr(w, 501, "network enforcement is not yet available on this policy server")
+		httpErr(w, 501, dampNotConfigured)
 		return
 	default:
 		httpErr(w, 400, "enforcement must be \"cosign\" or \"damp\" (or omitted for cosign)")
@@ -497,6 +500,12 @@ func (s *Server) handleClawback(w http.ResponseWriter, r *http.Request) {
 	holderTree, _, asset, err := s.enclaveFor(req.HolderAID, req.Asset)
 	if err != nil {
 		httpErr(w, 404, "%v", err)
+		return
+	}
+	// A damp asset has no L_claw leaf, so there is nothing here to seize with. The
+	// issuer's powers over such an asset are a policy update and a halt, both
+	// through the covenant's issuer path G(I).
+	if refuseDampCosign(w, asset) {
 		return
 	}
 	if !asset.Clawback {

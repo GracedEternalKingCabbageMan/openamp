@@ -181,6 +181,12 @@ func (s *Server) handleReissue(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, 404, "%v", err)
 		return
 	}
+	// A damp asset's units live in covenants, not enclaves: a reissuance would
+	// have to mint into C_U for a named recipient key and lock a verifier output,
+	// which is the damp issuance path, not this one.
+	if refuseDampCosign(w, asset) {
+		return
+	}
 	if asset.Entropy == "" || asset.Token == "" {
 		httpErr(w, 501, "reissuance needs an asset issued with OA-6 (its entropy and token id were not recorded)")
 		return

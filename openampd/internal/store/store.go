@@ -98,16 +98,51 @@ type Asset struct {
 	// them), so existing records are byte-compatible.
 	Entropy string `json:"entropy,omitempty"` // final asset entropy
 	Token   string `json:"token,omitempty"`   // reissuance token id
-	// Enforcement records the issuance-time enforcement election (OpenDAMP M2).
-	// Absent (or "") = cosign, the only model this daemon can issue today, so
-	// nothing ever writes "cosign" explicitly and every stored record stays
-	// byte-compatible. A future damp asset (M1/M3) persists "damp" here.
+	// Enforcement records the issuance-time enforcement election (OpenDAMP).
+	// Absent (or "") = cosign, so nothing ever writes "cosign" explicitly and
+	// every stored record stays byte-compatible. A network-enforced (damp) asset
+	// persists "damp" here and carries Damp below.
 	Enforcement string `json:"enforcement,omitempty"`
+	// Damp is the verifier binding of a network-enforced asset: present exactly
+	// when Enforcement == "damp", absent (and omitted) for every cosign asset, so
+	// existing records are byte-compatible.
+	Damp *DampBinding `json:"damp,omitempty"`
 	// BlindEpoch is the asset's current blinding-key derivation epoch:
 	// server-side rotation bookkeeping, never an asset property and never part
 	// of the contract. Epoch 0 is the original (v1) derivation and is omitted,
 	// so every record written before rotation existed stays byte-compatible.
 	BlindEpoch uint32 `json:"blind_epoch,omitempty"`
+}
+
+// DampBinding is everything a holder or auditor needs to act on a
+// network-enforced (OpenDAMP) asset without asking this server for permission:
+// the verifier asset and its fixed amount q, the issuer key that may update the
+// policy, the genesis policy commitment pi_0 and the whitelist it commits to,
+// the three program CMRs the covenant addresses derive from, and the derived
+// addresses themselves.
+//
+// The first four are committed into the asset id through the contract's openamp
+// block (opendamp-design.md section 5), so they are chain-provable. The CMRs are
+// NOT in the contract: they are the compiled-program identities the operator
+// supplied from `opendamp derive`, recorded here so the addresses this server
+// reports are reproducible. A holder verifies them the same way anyone does — by
+// recompiling the programs and comparing, or against a template registry.
+type DampBinding struct {
+	VerifierAsset     string `json:"verifier_asset"`      // display hex of V
+	VerifierAmount    uint64 `json:"verifier_amount"`     // q
+	VerifierIssueTxid string `json:"verifier_issue_txid"` // the tx that minted q of V
+	IssuerUpdateKey   string `json:"issuer_update_key"`   // x-only hex; may spend C_V through G(I)
+	HolderPubkey      string `json:"holder_pubkey"`       // x-only hex of the initial holder
+	Pi                string `json:"pi"`                  // pi_0, hex
+	WhitelistRoot     string `json:"whitelist_root"`      // dmt-v1 root, hex
+	Tree              string `json:"tree"`                // "dmt-v1"
+	UserCMR           string `json:"user_cmr"`
+	VerifierCMR       string `json:"verifier_cmr"`
+	IssuerCMR         string `json:"issuer_cmr"`
+	UserCovenantSPK   string `json:"user_covenant_spk"`     // C_U(initial holder), hex
+	UserCovenantAddr  string `json:"user_covenant_address"` // best-effort, node-decoded
+	VerifierSPK       string `json:"verifier_covenant_spk"`
+	VerifierAddr      string `json:"verifier_covenant_address"`
 }
 
 // TransferRecord supports velocity accounting; entries above a reorged-out
@@ -177,6 +212,12 @@ type State struct {
 	// persists so the build survives a restart between build and complete, exactly
 	// like a pending transfer. Initialised on load.
 	PendingClawbacks map[string]*PendingClawback `json:"pending_clawbacks,omitempty"`
+	// PendingDampIssuances holds a network-enforced issuance between its two
+	// phases: prepare (which fixes the asset id and pi_0 and mints the verifier
+	// asset) and complete (which needs the covenant CMRs only the Rust toolchain
+	// can compile). Absent on documents written before damp issuance existed;
+	// initialised on load.
+	PendingDampIssuances map[string]*PendingDampIssuance `json:"pending_damp_issuances,omitempty"`
 	// Snapshots maps an asset id to its published OpenDAMP policy snapshots in
 	// seq order (index == seq; the snapshot service enforces gapless append).
 	// Absent on documents written before M2; initialised on load.
@@ -237,7 +278,110 @@ func Open(dir string) (*Store, error) {
 	if s.state.Snapshots == nil {
 		s.state.Snapshots = map[string][]*StoredSnapshot{}
 	}
+	if s.state.PendingDampIssuances == nil {
+		s.state.PendingDampIssuances = map[string]*PendingDampIssuance{}
+	}
 	return s, nil
+}
+
+// --- network-enforced (OpenDAMP) issuance, phase 1 ----------------------------
+
+// PendingDampIssuance is a network-enforced issuance waiting for its covenant
+// parameters. Phase 1 mints the verifier asset, pins the funding outpoint, and
+// therefore FIXES the asset id and pi_0; phase 2 supplies the program CMRs and
+// broadcasts the asset issuance straight into the user covenant. Everything
+// phase 2 needs is recorded here, so the contract bytes phase 2 commits to are
+// the exact bytes phase 1 hashed into the asset id.
+type PendingDampIssuance struct {
+	ID string `json:"id"`
+
+	Name      string `json:"name"`
+	Ticker    string `json:"ticker"`
+	Precision int    `json:"precision"`
+	Atoms     uint64 `json:"atoms"`
+
+	HolderPubkey  string   `json:"holder_pubkey"`
+	Whitelist     []string `json:"whitelist"`
+	WhitelistRoot string   `json:"whitelist_root"`
+
+	VerifierAsset     string `json:"verifier_asset"`
+	VerifierAmount    uint64 `json:"verifier_amount"`
+	VerifierIssueTxid string `json:"verifier_issue_txid"`
+	VerifierToken     string `json:"verifier_token"`
+	VerifierVout      uint32 `json:"verifier_vout"`
+
+	IssuerUpdateKey string `json:"issuer_update_key"`
+	IssuerAID       string `json:"issuer_aid,omitempty"`
+	BurnAllowed     bool   `json:"burn_allowed"`
+
+	// Policy key material: PolicyPub is committed in the contract (and therefore
+	// in the asset id); PolicyRef is the signer-backend handle phase 2 adopts.
+	PolicyPub string `json:"policy_pub"`
+	PolicyRef string `json:"policy_ref"`
+
+	Contract     json.RawMessage `json:"contract"`
+	ContractHash string          `json:"contract_hash"`
+	AssetID      string          `json:"asset_id"`
+	Entropy      string          `json:"entropy"`
+	Token        string          `json:"token"`
+
+	FundingTxid string `json:"funding_txid"`
+	FundingVout uint32 `json:"funding_vout"`
+	FundingSats uint64 `json:"funding_sats"`
+
+	Pi             string          `json:"pi"`
+	Snapshot       json.RawMessage `json:"snapshot"`         // canonical seq-0 snapshot/v1 bytes
+	SnapshotHash   string          `json:"snapshot_hash"`    // SHA256 of those bytes
+	SnapshotSigMsg string          `json:"snapshot_sig_msg"` // the 32 bytes the issuer signs
+
+	Created time.Time `json:"created"`
+}
+
+// PutPendingDampIssuance persists a prepared issuance awaiting covenant params.
+func (s *Store) PutPendingDampIssuance(p *PendingDampIssuance) error {
+	return s.Update(func(st *State) error {
+		if st.PendingDampIssuances == nil {
+			st.PendingDampIssuances = map[string]*PendingDampIssuance{}
+		}
+		cp := *p
+		st.PendingDampIssuances[p.ID] = &cp
+		return nil
+	})
+}
+
+// GetPendingDampIssuance returns a copy of the prepared issuance, if present.
+func (s *Store) GetPendingDampIssuance(id string) (*PendingDampIssuance, bool) {
+	var out *PendingDampIssuance
+	s.View(func(st *State) {
+		if p, ok := st.PendingDampIssuances[id]; ok {
+			cp := *p
+			out = &cp
+		}
+	})
+	return out, out != nil
+}
+
+// DeletePendingDampIssuance consumes a prepared issuance (idempotent). This is
+// the once-only guard: a completed prepare can never mint its asset twice.
+func (s *Store) DeletePendingDampIssuance(id string) error {
+	return s.Update(func(st *State) error {
+		delete(st.PendingDampIssuances, id)
+		return nil
+	})
+}
+
+// GCPendingDampIssuances drops prepared issuances older than ttl. An expired
+// prepare has cost the operator only the verifier asset it minted, which is
+// internal plumbing and can be reused by preparing again.
+func (s *Store) GCPendingDampIssuances(ttl time.Duration) {
+	_ = s.Update(func(st *State) error {
+		for id, p := range st.PendingDampIssuances {
+			if time.Since(p.Created) > ttl {
+				delete(st.PendingDampIssuances, id)
+			}
+		}
+		return nil
+	})
 }
 
 // --- OpenDAMP policy snapshots (M2) -------------------------------------------
@@ -532,6 +676,18 @@ func (s *Store) SaveKey(name, privHex string) error {
 	defer s.mu.Unlock()
 	return s.mutateKeysLocked(func(keys map[string]string) error {
 		keys[name] = privHex
+		return nil
+	})
+}
+
+// DeleteKey removes a stored key. Idempotent — a missing key is not an error —
+// so it is safe as the rollback step of a multi-key provisioning run that
+// failed partway (a quorum member discarding the share of an aborted DKG).
+func (s *Store) DeleteKey(name string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.mutateKeysLocked(func(keys map[string]string) error {
+		delete(keys, name)
 		return nil
 	})
 }

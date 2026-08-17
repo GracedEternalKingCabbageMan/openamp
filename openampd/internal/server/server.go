@@ -16,7 +16,9 @@
 //
 // Issuer surface (Bearer token):
 //
-//	POST /v1/issuer/assets              issue a restricted asset
+//	POST /v1/issuer/assets              issue a co-signed restricted asset
+//	POST /v1/issuer/damp-assets         prepare a network-enforced (OpenDAMP) asset
+//	POST /v1/issuer/damp-assets/{id}/complete  supply the covenant CMRs and mint it
 //	POST /v1/issuer/freeze              freeze/unfreeze a user
 //	POST /v1/issuer/categories          set a user's categories
 //	POST /v1/issuer/rules               update an asset's policy rules
@@ -42,6 +44,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/GracedEternalKingCabbageMan/openamp/openampd/internal/damp"
 	"github.com/GracedEternalKingCabbageMan/openamp/openampd/internal/elements"
 	"github.com/GracedEternalKingCabbageMan/openamp/openampd/internal/rpc"
 	"github.com/GracedEternalKingCabbageMan/openamp/openampd/internal/store"
@@ -55,6 +58,12 @@ type Config struct {
 	DemoIssuer  bool   // hold issuer keys server-side (testnet demo); production keeps them offline
 	ElectrsURL  string // explorer (electrs) base; prevout fallback when the node lacks -txindex
 	Signer      string // policy-key backend: "local" (default) or "frost"
+	// DampRegistry is the path to the OpenDAMP CMR pinning file (`opendamp
+	// registry`, or opendamp/vectors/addresses.json, which carries the same
+	// fields). Empty = network enforcement is not configured, and every damp
+	// endpoint answers 501. A CMR is a program identity, so this is deliberately
+	// a file the operator controls rather than a compiled-in constant.
+	DampRegistry string
 }
 
 type Server struct {
@@ -63,6 +72,10 @@ type Server struct {
 	node   *rpc.Client  // chain queries
 	wallet *rpc.Client  // wallet operations (fee funding, issuance, broadcast)
 	signer PolicySigner // policy-key backend (local key for testnet; FROST/MPC for mainnet)
+
+	// dampReg pins the OpenDAMP program CMRs. nil means network enforcement is
+	// not configured; it is the single gate every damp endpoint checks.
+	dampReg *damp.ProgramRegistry
 
 	mu      sync.Mutex
 	pending map[string]*pendingTransfer
@@ -106,6 +119,16 @@ func New(cfg Config, st *store.Store, node, wallet *rpc.Client) (*Server, error)
 	}
 	s := &Server{cfg: cfg, st: st, node: node, wallet: wallet, pending: map[string]*pendingTransfer{},
 		signer: signer}
+	// Fail fast on a misconfigured pinning file rather than at the first damp
+	// request: a wrong CMR is a wrong covenant address, and a wrong covenant
+	// address funded with a real asset is a fund-loss bug.
+	if cfg.DampRegistry != "" {
+		reg, err := damp.LoadProgramRegistry(cfg.DampRegistry)
+		if err != nil {
+			return nil, err
+		}
+		s.dampReg = reg
+	}
 	gh, err := node.GetBlockHash(0)
 	if err != nil {
 		return nil, fmt.Errorf("genesis: %w", err)
@@ -140,6 +163,8 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /v1/log", s.handleLog)
 
 	mux.HandleFunc("POST /v1/issuer/assets", s.issuerAuth(s.handleIssue))
+	mux.HandleFunc("POST /v1/issuer/damp-assets", s.issuerAuth(s.handleDampIssuePrepare))
+	mux.HandleFunc("POST /v1/issuer/damp-assets/{id}/complete", s.issuerAuth(s.handleDampIssueComplete))
 	mux.HandleFunc("POST /v1/issuer/freeze", s.issuerAuth(s.handleFreeze))
 	mux.HandleFunc("POST /v1/issuer/categories", s.issuerAuth(s.handleCategories))
 	mux.HandleFunc("POST /v1/issuer/rules", s.issuerAuth(s.handleRules))
@@ -297,6 +322,32 @@ func (s *Server) handleAddress(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, 404, "%v", err)
 		return
 	}
+	// A damp asset has no enclave. Rather than 409 here — which would leave a
+	// wallet with no way to be paid — answer with the address that actually
+	// receives it: the user covenant C_U(X) under the asset's own user program.
+	// There are no leaves and no control blocks to hand out, because a C_U spend
+	// carries its data in the Simplicity witness, not in a script.
+	if asset.Enforcement == "damp" {
+		spk, derr := dampHolderSPK(asset, user.Pubkeys[0])
+		if derr != nil {
+			httpErr(w, 500, "%v", derr)
+			return
+		}
+		if wantConf {
+			httpErr(w, 409, "a network-enforced asset has no confidential address: the covenant must read an explicit asset id on every output it scans, so a blinded receipt could not be spent")
+			return
+		}
+		httpJSON(w, map[string]any{
+			"aid": aid, "asset": asset.ID,
+			"script_pubkey": hex.EncodeToString(spk),
+			"address":       s.addressOfSPK(spk),
+			"user_pubkey":   user.Pubkeys[0],
+			"enforcement":   "damp",
+			"covenant":      true,
+			"note":          dampNotCosigned,
+		})
+		return
+	}
 	spk := tree.ScriptPubKey()
 	var addr struct {
 		Address string `json:"address"`
@@ -347,9 +398,34 @@ func (s *Server) handleAddress(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleBalance(w http.ResponseWriter, r *http.Request) {
 	aid := r.PathValue("aid")
 	assetID := r.URL.Query().Get("asset")
-	tree, _, asset, err := s.enclaveFor(aid, assetID)
+	tree, user, asset, err := s.enclaveFor(aid, assetID)
 	if err != nil {
 		httpErr(w, 404, "%v", err)
+		return
+	}
+	// A damp asset is scanned at its covenant address, never at an enclave. This
+	// matters: reporting the enclave balance would report 0 for a holder who has
+	// coins, which reads as "empty" rather than "wrong place to look".
+	if asset.Enforcement == "damp" {
+		spk, derr := dampHolderSPK(asset, user.Pubkeys[0])
+		if derr != nil {
+			httpErr(w, 500, "%v", derr)
+			return
+		}
+		spkHex := hex.EncodeToString(spk)
+		utxos, err := s.unifiedUTXOs([]string{spkHex}, asset.ID)
+		if err != nil {
+			httpErr(w, 502, "scan: %v", err)
+			return
+		}
+		var atoms uint64
+		for _, u := range utxos {
+			atoms += u.atoms
+		}
+		httpJSON(w, map[string]any{
+			"aid": aid, "asset": asset.ID, "atoms": atoms, "utxos": len(utxos),
+			"script_pubkey": spkHex, "enforcement": "damp", "covenant": true,
+		})
 		return
 	}
 	utxos, err := s.enclaveUTXOs(tree, asset.ID)

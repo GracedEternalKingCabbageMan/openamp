@@ -268,6 +268,20 @@ func (s *Server) holderBalances(asset *store.Asset) (map[string]uint64, error) {
 	var scanErr error
 	s.st.View(func(st *store.State) {
 		for _, u := range st.Users {
+			// A damp asset lives in covenants, so the script to scan is C_U(X), not
+			// an enclave tree. Ownership reporting and supply therefore keep working
+			// for a network-enforced asset, even though nothing about it is co-signed.
+			if asset.Enforcement == "damp" {
+				raw, err := dampHolderSPK(asset, u.Pubkeys[0])
+				if err != nil {
+					scanErr = err
+					return
+				}
+				spk := hex.EncodeToString(raw)
+				spkToAID[spk] = u.AID
+				spks = append(spks, spk)
+				continue
+			}
 			tree, err := s.treeFor(u, asset)
 			if err != nil {
 				scanErr = err
@@ -442,6 +456,9 @@ func (s *Server) handleTransferBuild(w http.ResponseWriter, r *http.Request) {
 	senderTree, sender, asset, err := s.enclaveFor(req.SenderAID, req.Asset)
 	if err != nil {
 		httpErr(w, 404, "%v", err)
+		return
+	}
+	if refuseDampCosign(w, asset) {
 		return
 	}
 	recipTree, recipUser, _, err := s.enclaveFor(req.RecipientAID, req.Asset)
@@ -1004,6 +1021,9 @@ func (s *Server) handleCosign(w http.ResponseWriter, r *http.Request) {
 	senderTree, sender, asset, err := s.enclaveFor(req.SenderAID, req.Asset)
 	if err != nil {
 		httpErr(w, 404, "%v", err)
+		return
+	}
+	if refuseDampCosign(w, asset) {
 		return
 	}
 	tx, err := elements.DeserializeTx(mustHexBytes(req.Tx))

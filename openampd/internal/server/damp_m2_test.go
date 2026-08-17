@@ -95,8 +95,11 @@ func storeIsPristine(t *testing.T, st *store.Store) {
 	}
 }
 
-// TestM2_DampIssuanceRefused: enforcement "damp" is a 501 capability error
-// with the exact documented body, a logged refusal, and no side effects.
+// TestM2_DampIssuanceRefused: with no CMR pinning file configured, enforcement
+// "damp" on the CO-SIGNED endpoint is a 501 capability error with the exact
+// documented body, a logged refusal, and no side effects. (When network
+// enforcement IS configured this same election is routed to
+// /v1/issuer/damp-assets instead; see TestDamp_HostedIssueRoutesToDampEndpoint.)
 func TestM2_DampIssuanceRefused(t *testing.T) {
 	s, st := newM2Server(t, Config{DemoIssuer: true})
 	code, out := postIssue(t, s, map[string]any{
@@ -107,7 +110,7 @@ func TestM2_DampIssuanceRefused(t *testing.T) {
 	if code != 501 {
 		t.Fatalf("want 501, got %d: %v", code, out)
 	}
-	if out["error"] != "network enforcement is not yet available on this policy server" {
+	if out["error"] != dampNotConfigured {
 		t.Fatalf("wrong capability error: %v", out["error"])
 	}
 	storeIsPristine(t, st)
