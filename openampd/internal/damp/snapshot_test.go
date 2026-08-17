@@ -259,10 +259,12 @@ func TestSnapshotDMTv1MatchesVectors(t *testing.T) {
 		VerifierAsset  string `json:"verifier_asset"`
 		VerifierAmount uint64 `json:"verifier_amount"`
 		Policy         struct {
-			Pi               string   `json:"pi"`
-			Seq              uint64   `json:"seq"`
-			WhitelistRoot    string   `json:"whitelist_root"`
-			WhitelistEntries []string `json:"whitelist_entries"`
+			Pi                      string   `json:"pi"`
+			Seq                     uint64   `json:"seq"`
+			WhitelistRoot           string   `json:"whitelist_root"`
+			WhitelistEntries        []string `json:"whitelist_entries"`
+			BlacklistRoot           string   `json:"blacklist_root"`
+			BlacklistedOutpointKeys []string `json:"blacklisted_outpoint_keys"`
 		} `json:"policy"`
 	}
 	if err := json.Unmarshal(raw, &v); err != nil {
@@ -273,6 +275,11 @@ func TestSnapshotDMTv1MatchesVectors(t *testing.T) {
 		Pi: v.Policy.Pi, Seq: v.Policy.Seq, PrevPi: nil, Tree: TreeDMTv1,
 		Predicates: Predicates{
 			Whitelist: PredicateList{Root: v.Policy.WhitelistRoot, Entries: v.Policy.WhitelistEntries},
+			// The blacklist slot carries a real root now that the covenant
+			// enforces non-membership; omitting it here would commit the empty
+			// hash and reproduce a pi no deployed covenant answers to, which is
+			// exactly the divergence this test exists to catch.
+			Blacklist: PredicateList{Root: v.Policy.BlacklistRoot, Entries: v.Policy.BlacklistedOutpointKeys},
 		},
 	}
 	if err := s.Validate(); err != nil {
@@ -294,22 +301,33 @@ func TestSnapshotDMTv1MatchesVectors(t *testing.T) {
 	}
 }
 
-// TestSnapshotDMTv1RefusesUnenforcedPredicates: the covenant reads no blacklist
-// and no height windows, so a dmt-v1 snapshot carrying either is refused rather
-// than published with the slot silently committed empty. An issuer who publishes
-// a blacklist and believes it binds has a false sense of a freeze.
-func TestSnapshotDMTv1RefusesUnenforcedPredicates(t *testing.T) {
+// TestSnapshotDMTv1PredicateShape: both list predicates are consensus-bearing,
+// so both must be present and recomputable, each with ITS OWN tree. What the
+// covenant does not read (height windows) is still refused rather than committed
+// to, because an issuer who publishes a rule that binds nothing has a false
+// sense of a rule.
+func TestSnapshotDMTv1PredicateShape(t *testing.T) {
+	wl := rep(0x55)
+	wlRoot, err := WhitelistRoot([][32]byte{wl})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// An EMPTY blacklist still has a root: the empty interval tree's guard
+	// interval. "Freeze nothing" is a commitment like any other, never zeros.
+	emptyBl, err := BlacklistRoot(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if emptyBl == ([32]byte{}) {
+		t.Fatal("the empty blacklist must commit to the guard interval, not to zeros")
+	}
 	base := func() *Snapshot {
-		wl := rep(0x55)
-		root, err := WhitelistRoot([][32]byte{wl})
-		if err != nil {
-			t.Fatal(err)
-		}
 		s := &Snapshot{
 			V: 1, Asset: strings.Repeat("11", 32), VerifierAsset: strings.Repeat("99", 32),
 			Q: 1, Seq: 0, Tree: TreeDMTv1,
 			Predicates: Predicates{
-				Whitelist: PredicateList{Root: hex.EncodeToString(root[:]), Entries: []string{hex.EncodeToString(wl[:])}},
+				Blacklist: PredicateList{Root: hex.EncodeToString(emptyBl[:]), Entries: []string{}},
+				Whitelist: PredicateList{Root: hex.EncodeToString(wlRoot[:]), Entries: []string{hex.EncodeToString(wl[:])}},
 			},
 		}
 		pi, err := s.ComputePi()
@@ -323,11 +341,50 @@ func TestSnapshotDMTv1RefusesUnenforcedPredicates(t *testing.T) {
 		t.Fatalf("the plain dmt-v1 shape must validate: %v", err)
 	}
 
-	withBl := base()
-	blRoot, blEntry := rep(0x77), rep(0x88)
-	withBl.Predicates.Blacklist = PredicateList{Root: hex.EncodeToString(blRoot[:]), Entries: []string{hex.EncodeToString(blEntry[:])}}
-	if err := withBl.Validate(); err == nil || !strings.Contains(err.Error(), "must not carry a blacklist") {
-		t.Fatalf("a dmt-v1 blacklist must be refused, got %v", err)
+	noBl := base()
+	noBl.Predicates.Blacklist = PredicateList{}
+	if err := noBl.Validate(); err == nil || !strings.Contains(err.Error(), "must carry a blacklist root") {
+		t.Fatalf("a dmt-v1 snapshot with no blacklist root must be refused, got %v", err)
+	}
+
+	noWl := base()
+	noWl.Predicates.Whitelist = PredicateList{}
+	if err := noWl.Validate(); err == nil || !strings.Contains(err.Error(), "must carry a whitelist root") {
+		t.Fatalf("a dmt-v1 snapshot with no whitelist root must be refused, got %v", err)
+	}
+
+	// A populated blacklist is recomputed from its entries with the INTERVAL
+	// tree; a root built with the whitelist's tree is a different value and must
+	// be refused, because it is exactly the porting bug that would freeze nothing.
+	key := rep(0x88)
+	realBl, err := BlacklistRoot([][32]byte{key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongShape, err := WhitelistRoot([][32]byte{key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if realBl == wrongShape {
+		t.Fatal("the blacklist and whitelist trees must be different shapes")
+	}
+	frozen := base()
+	frozen.Predicates.Blacklist = PredicateList{Root: hex.EncodeToString(realBl[:]), Entries: []string{hex.EncodeToString(key[:])}}
+	pi, err := frozen.ComputePi()
+	if err != nil {
+		t.Fatal(err)
+	}
+	frozen.Pi = hex.EncodeToString(pi[:])
+	if err := frozen.Validate(); err != nil {
+		t.Fatalf("a dmt-v1 snapshot with a real blacklist must validate: %v", err)
+	}
+	if frozen.Pi == base().Pi {
+		t.Fatal("freezing an outpoint must change pi; otherwise the covenant is instantiated with the same policy")
+	}
+	mixedUp := base()
+	mixedUp.Predicates.Blacklist = PredicateList{Root: hex.EncodeToString(wrongShape[:]), Entries: []string{hex.EncodeToString(key[:])}}
+	if err := mixedUp.Validate(); err == nil || !strings.Contains(err.Error(), "blacklist.root mismatch") {
+		t.Fatalf("a blacklist root built with the wrong tree must be refused, got %v", err)
 	}
 
 	withWin := base()
