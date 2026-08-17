@@ -1,0 +1,91 @@
+{
+  "asset": "daa8284c0d06cb02ef28b75ffa74c3b512131884d9c72e4f11dac634703d4fc4",
+  "asset_internal_bytes": "c44f3d7034c6da114f2ec7d984181312b5c374fa5fb728ef02cb060d4c28a8da",
+  "dmt_v1": {
+    "depth": 16,
+    "empty_root": "e69f2dc2186b1cca0ed37d851b60121a87832be1ff7f61d58bc4931d26c844cf",
+    "guard_hi": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "guard_lo": "0000000000000000000000000000000000000000000000000000000000000000",
+    "leaf_of_guard_hi": "5e16d316ecd5773e50c3b02737d424192b02f25b4245822079181c557aafda7d",
+    "leaf_of_guard_lo": "7f9c9e31ac8256ca2f258583df262dbc7d6f68f2a03043d5c99a4ae5a7396ce9"
+  },
+  "issuer_key": "56b328b30c8bf5839e24058747879408bdb36241dc9c2e7c619faa12b2920967",
+  "note": "OpenDAMP taproot derivation golden vectors. TapLeaf/elements, TapBranch/elements and TapTweak/elements are BIP341-style tagged hashes (SHA256(SHA256(tag)||SHA256(tag)||msg)) with the /elements suffix; TapData is the bare string \"TapData\", tagged the same way. A Simplicity leaf hashes as H_TapLeaf(0xbe || compact_size(32) || CMR). TapBranch sorts its two children lexicographically; TapData sorts nothing. All hex is in internal byte order except asset ids and CMRs, which print reversed, as txids do.",
+  "nums_internal_key": "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0",
+  "policy": {
+    "pi": "e0000621a665f89924e07d71fa714281341990652c7f57fef4cc24eab3ab68e6",
+    "seq": 0,
+    "whitelist_entries": [
+      "1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f",
+      "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766",
+      "462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b"
+    ],
+    "whitelist_root": "dc9d33e167118409fba74538497bf7a984166cd60dc92ee62e4ad5283cf52118"
+  },
+  "programs": {
+    "budget_pad_words": 384,
+    "g_cmr": "53c55e01d58ffeea3983e4c13781009217ae524fbcfb684727bed6e767795816",
+    "g_tapleaf_hash": "33a233648f778c8ee8725354a54837a87e72b1406b12a0c58039ea4fc0813679",
+    "n_max_outputs": 8,
+    "p_cmr": "c877302d70733c25c30f94f8852967d26f36db862e5d8c75916d027168bac7b6",
+    "p_tapleaf_hash": "fe513300404e86dbfa6ca8a23f4a53c9bf59d2741ad0b06c1e4dfacd477c04e2",
+    "u_cmr": "92b619160ddbd03ce838da912494d8025f319d7556afd58482b35870ef0f9816",
+    "u_tapleaf_hash": "bf49363668add7fcd0f4719d2628cd833b906451848ad3a8d5703405af1a8bd4"
+  },
+  "simplicity_leaf_version": 190,
+  "user_covenants": [
+    {
+      "address_regtest": "ert1pulm9s5n3m4n9agwsparf47tgkk25qv6c09z3wp5cupq0cwgl427s28v3xt",
+      "address_testnet": "tb1pulm9s5n3m4n9agwsparf47tgkk25qv6c09z3wp5cupq0cwgl427skdwf64",
+      "control_block": "bf50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac01d834209f38bb5edc4f26336d154376e0aa3d90e4b066aeffa532d24388af750",
+      "dmt_whitelist_index": 1,
+      "merkle_root": "2c70d4fa0b7015b82debf4fb2c0d22fe23234333665596a38ee3eebf76eb7cdb",
+      "output_key": "e7f6585271dd665ea1d00f469af968b5954033587945170698e040fc391faabd",
+      "output_key_parity_odd": true,
+      "owner_xonly": "1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f",
+      "script_pubkey": "5120e7f6585271dd665ea1d00f469af968b5954033587945170698e040fc391faabd",
+      "tapdata_hash": "1d834209f38bb5edc4f26336d154376e0aa3d90e4b066aeffa532d24388af750",
+      "user_tapleaf_hash": "bf49363668add7fcd0f4719d2628cd833b906451848ad3a8d5703405af1a8bd4"
+    },
+    {
+      "address_regtest": "ert1p3jt00c9jkfkgveyc520rlv75rpmfj8w8w6hkyja7lvsd6v8nfukqs8uyzw",
+      "address_testnet": "tb1p3jt00c9jkfkgveyc520rlv75rpmfj8w8w6hkyja7lvsd6v8nfukqvd7u7s",
+      "control_block": "be50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac00def88982cf627696d4e59f687fd8472c80e92454cfc784cd663fa19c87c3aba",
+      "dmt_whitelist_index": 3,
+      "merkle_root": "928393cf9dc777069297f9c4a7f0e68ffc64eb791c9457191f46b3818546ca58",
+      "output_key": "8c96f7e0b2b26c866498a29e3fb3d41876991dc776af624bbefb20dd30f34f2c",
+      "output_key_parity_odd": false,
+      "owner_xonly": "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766",
+      "script_pubkey": "51208c96f7e0b2b26c866498a29e3fb3d41876991dc776af624bbefb20dd30f34f2c",
+      "tapdata_hash": "0def88982cf627696d4e59f687fd8472c80e92454cfc784cd663fa19c87c3aba",
+      "user_tapleaf_hash": "bf49363668add7fcd0f4719d2628cd833b906451848ad3a8d5703405af1a8bd4"
+    },
+    {
+      "address_regtest": "ert1p6xlxx8zpcstu7rgyd2x0c8f5sdv5rk46wmkzpcqc6qv7jnkqw2xsfk2q5q",
+      "address_testnet": "tb1p6xlxx8zpcstu7rgyd2x0c8f5sdv5rk46wmkzpcqc6qv7jnkqw2xs4ugcg7",
+      "control_block": "be50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac09096f570e58485b65b30eba3c840ebe0accc6e3cf17830da127b5a0f39adc1a1",
+      "dmt_whitelist_index": 2,
+      "merkle_root": "61b1af7273fd1536acbf3c3f8e6819ea7c1e9ca2d091c69a110c2b301759deb7",
+      "output_key": "d1be631c41c417cf0d046a8cfc1d34835941daba76ec20e018d019e94ec0728d",
+      "output_key_parity_odd": false,
+      "owner_xonly": "462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+      "script_pubkey": "5120d1be631c41c417cf0d046a8cfc1d34835941daba76ec20e018d019e94ec0728d",
+      "tapdata_hash": "9096f570e58485b65b30eba3c840ebe0accc6e3cf17830da127b5a0f39adc1a1",
+      "user_tapleaf_hash": "bf49363668add7fcd0f4719d2628cd833b906451848ad3a8d5703405af1a8bd4"
+    }
+  ],
+  "v": 1,
+  "verifier_amount": 100000,
+  "verifier_asset": "56b97cd9fc25cebe5636bbc07e8502e9262a6290c95fbdde58c7451e1d7c2d98",
+  "verifier_asset_internal_bytes": "982d7c1d1e45c758debd5fc990622a26e902857ec0bb3656bece25fcd97cb956",
+  "verifier_covenant": {
+    "address_regtest": "ert1p0hmqfqf85t825g0f85dxl3kmjjt6m869t5ljy9xy9j8tutg6cp7qest64s",
+    "address_testnet": "tb1p0hmqfqf85t825g0f85dxl3kmjjt6m869t5ljy9xy9j8tutg6cp7q96fzfw",
+    "control_block_issuer": "be50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0fe513300404e86dbfa6ca8a23f4a53c9bf59d2741ad0b06c1e4dfacd477c04e2",
+    "control_block_primary": "be50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac033a233648f778c8ee8725354a54837a87e72b1406b12a0c58039ea4fc0813679",
+    "merkle_root": "7dcf39b7e51b4d06e6ed7934ddccba86d4ef484fcd16ea28441a42b614648cee",
+    "output_key": "7df6048127a2ceaa21e93d1a6fc6db9497ad9f455d3f2214c42c8ebe2d1ac07c",
+    "output_key_parity_odd": false,
+    "script_pubkey": "51207df6048127a2ceaa21e93d1a6fc6db9497ad9f455d3f2214c42c8ebe2d1ac07c"
+  }
+}

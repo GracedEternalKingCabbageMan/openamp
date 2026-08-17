@@ -1,0 +1,87 @@
+/* OpenDAMP user covenant U.
+ *
+ * One fixed program per asset serves every holder. The holder key X is NOT a
+ * compile-time parameter: it lives in the hidden TapData branch of the taproot
+ * tree, and the witness supplies it. The program proves that the supplied key
+ * is the one committed in its own locking script by recomputing the script
+ * pubkey from scratch:
+ *
+ *     C_U(X) = P2TR(NUMS, TapBranch(TapLeaf_0xbe(CMR(U)), H_TapData(X)))
+ *
+ * The self-reference (U's own CMR appears inside C_U) is resolved without
+ * embedding the CMR as a constant: `jet::tapleaf_hash()` returns the tapleaf
+ * hash of the leaf that is currently executing, which consensus has already
+ * verified against the control block. Everything else is rebuilt with the
+ * taproot-construction jets and compared against the actual script pubkey of
+ * the current input, so a witness cannot substitute another key.
+ *
+ * Checks (design doc section 2.1):
+ *   (a) own SPK == C_U(witness OWNER_KEY)          [state binding]
+ *   (b) BIP340 signature by OWNER_KEY over sig_all_hash
+ *   (c) current input index != 0, current input carries explicit asset A
+ *   (d) input 0 carries explicit verifier asset V in amount exactly Q
+ *
+ * Compile-time parameters (per asset):
+ *   ASSET_A  - u256, asset id of the regulated asset (internal byte order)
+ *   ASSET_V  - u256, asset id of the verifier asset  (internal byte order)
+ *   AMOUNT_Q - u64, verifier amount in atoms
+ */
+
+fn tap_data_hash(x: u256) -> u256 {
+    let ctx: Ctx8 = jet::tapdata_init();
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, x);
+    jet::sha_256_ctx_8_finalize(ctx)
+}
+
+/* SHA256 of the P2TR script pubkey `OP_1 PUSH32 <output_key>`. */
+fn spk_hash_of_key(output_key: Pubkey) -> u256 {
+    let ctx: Ctx8 = jet::sha_256_ctx_8_init();
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_2(ctx, 0x5120);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, output_key);
+    jet::sha_256_ctx_8_finalize(ctx)
+}
+
+/* (a): recompute C_U(owner) and require it to equal the current input's SPK. */
+fn require_own_spk_is_cu(owner: Pubkey) {
+    let leaf: u256 = jet::tapleaf_hash();
+    let data: u256 = tap_data_hash(owner);
+    let root: u256 = jet::build_tapbranch(leaf, data);
+    let nums: Pubkey = 0x50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0;
+    let out_key: Pubkey = jet::build_taptweak(nums, root);
+    assert!(jet::eq_256(spk_hash_of_key(out_key), jet::current_script_hash()));
+}
+
+fn require_explicit_asset_eq(a: Asset1, expected: u256) {
+    match a {
+        Left(conf: (u1, u256)) => panic!(),
+        Right(id: ExplicitAsset) => assert!(jet::eq_256(id, expected)),
+    }
+}
+
+fn require_explicit_amount_eq(v: Amount1, expected: u64) {
+    match v {
+        Left(conf: (u1, u256)) => panic!(),
+        Right(x: u64) => assert!(jet::eq_64(x, expected)),
+    }
+}
+
+fn main() {
+    // (a) state binding: the witness key is the one this address commits to.
+    let owner: Pubkey = witness::OWNER_KEY;
+    require_own_spk_is_cu(owner);
+
+    // (b) owner authorisation over the whole transaction.
+    jet::bip_0340_verify((owner, jet::sig_all_hash()), witness::OWNER_SIG);
+
+    // (c) not the verifier slot, and this input carries the regulated asset.
+    match jet::eq_32(jet::current_index(), 0) {
+        true => panic!(),
+        false => {},
+    };
+    require_explicit_asset_eq(jet::current_asset(), param::ASSET_A);
+
+    // (d) the verifier covenant is present at input 0 with exactly Q of V.
+    let (a0, v0): (Asset1, Amount1) = unwrap(jet::input_amount(0));
+    require_explicit_asset_eq(a0, param::ASSET_V);
+    require_explicit_amount_eq(v0, param::AMOUNT_Q);
+}

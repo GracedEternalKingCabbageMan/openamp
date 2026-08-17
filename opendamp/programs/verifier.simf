@@ -1,0 +1,200 @@
+/* OpenDAMP verifier primary program P(pi).
+ *
+ * Spent at input 0 of every ordinary transfer of the regulated asset A.
+ * Confinement induction: every A output must pay a user covenant C_U(Y), and
+ * every A input independently requires (via the U program committed in it)
+ * that input 0 carries the verifier asset, which - as long as the issuer keeps
+ * V inside C_V outputs - means this program runs on every transfer of A.
+ *
+ * Checks (design doc section 2.2 + 2.3):
+ *   1. current input index == 0, carrying explicit asset V in amount exactly Q
+ *   2. output 0 recreates the verifier: asset V, amount Q, same script as the
+ *      current input (script-hash equality)
+ *   3. at least one input among 1..8 carries explicit asset A (that input is a
+ *      C_U by the confinement induction, so a holder authorised the spend)
+ *   4. num_outputs <= N_max (= 8); for every output 1..N_max-1 that exists:
+ *      - its asset id must be explicit (design doc 2.4; a fee output is
+ *        explicit by definition, so this subsumes the fee carve-out)
+ *      - if it carries A it must pay C_U(Y_i) for the witness-supplied
+ *        recipient key Y_i, rebuilt with the taproot-construction jets. A fee
+ *        output has an empty script pubkey which can never hash-equal a P2TR
+ *        script, so "a fee output must not carry A" is enforced by the same
+ *        script equality, not by a separate check.
+ *      - the recipient key Y_i must be a member of the committed whitelist
+ *        (dmt-v1 sorted dense Merkle tree, depth 16, root WL_ROOT)
+ *
+ * Compile-time parameters:
+ *   ASSET_A  - u256 asset id of A (internal byte order)
+ *   ASSET_V  - u256 asset id of V (internal byte order)
+ *   AMOUNT_Q - u64 verifier amount in atoms
+ *   U_CMR    - u256 CMR of the user program U for this asset
+ *   WL_ROOT  - u256 dmt-v1 root of the recipient whitelist (policy pi)
+ *
+ * Witness: for each output index i in 1..7 a slot W<i>, present (Some) iff
+ * output i carries asset A: the recipient key and its 16-level membership
+ * proof, bottom-up, each level (sibling_hash, current_node_is_right_child).
+ */
+
+fn tap_data_hash(x: u256) -> u256 {
+    let ctx: Ctx8 = jet::tapdata_init();
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, x);
+    jet::sha_256_ctx_8_finalize(ctx)
+}
+
+fn spk_hash_of_key(output_key: Pubkey) -> u256 {
+    let ctx: Ctx8 = jet::sha_256_ctx_8_init();
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_2(ctx, 0x5120);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, output_key);
+    jet::sha_256_ctx_8_finalize(ctx)
+}
+
+/* SHA256 of the script pubkey of C_U(owner). */
+fn cu_spk_hash(owner: Pubkey) -> u256 {
+    let leaf: u256 = jet::build_tapleaf_simplicity(param::U_CMR);
+    let root: u256 = jet::build_tapbranch(leaf, tap_data_hash(owner));
+    let nums: Pubkey = 0x50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0;
+    let out_key: Pubkey = jet::build_taptweak(nums, root);
+    spk_hash_of_key(out_key)
+}
+
+/* dmt-v1 leaf: SHA256(0x00 || key). */
+fn wl_leaf(key: Pubkey) -> u256 {
+    let ctx: Ctx8 = jet::sha_256_ctx_8_init();
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_1(ctx, 0x00);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, key);
+    jet::sha_256_ctx_8_finalize(ctx)
+}
+
+/* dmt-v1 node: SHA256(0x01 || left || right); the bool says whether the
+ * running node is the RIGHT child at this level. */
+fn wl_step(elt: (u256, bool), node: u256) -> u256 {
+    let (sib, node_is_right): (u256, bool) = elt;
+    let ctx: Ctx8 = jet::sha_256_ctx_8_init();
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_1(ctx, 0x01);
+    let ctx: Ctx8 = match node_is_right {
+        true => {
+            let c: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, sib);
+            jet::sha_256_ctx_8_add_32(c, node)
+        },
+        false => {
+            let c: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, node);
+            jet::sha_256_ctx_8_add_32(c, sib)
+        },
+    };
+    jet::sha_256_ctx_8_finalize(ctx)
+}
+
+fn require_wl_member(key: Pubkey, proof: [(u256, bool); 16]) {
+    let root: u256 = array_fold::<wl_step, 16>(proof, wl_leaf(key));
+    assert!(jet::eq_256(root, param::WL_ROOT));
+}
+
+fn require_explicit_asset_eq(a: Asset1, expected: u256) {
+    match a {
+        Left(conf: (u1, u256)) => panic!(),
+        Right(id: ExplicitAsset) => assert!(jet::eq_256(id, expected)),
+    }
+}
+
+fn require_explicit_amount_eq(v: Amount1, expected: u64) {
+    match v {
+        Left(conf: (u1, u256)) => panic!(),
+        Right(x: u64) => assert!(jet::eq_64(x, expected)),
+    }
+}
+
+fn input_carries_a(i: u32) -> bool {
+    match jet::input_asset(i) {
+        None => false,
+        Some(a: Asset1) => match a {
+            Left(conf: (u1, u256)) => false,
+            Right(id: ExplicitAsset) => jet::eq_256(id, param::ASSET_A),
+        },
+    }
+}
+
+fn bool_or(a: bool, b: bool) -> bool {
+    match a {
+        true => true,
+        false => b,
+    }
+}
+
+/* Scan one output slot in 1..N_max. */
+fn check_output(i: u32, w: Option<(Pubkey, [(u256, bool); 16])>) {
+    match jet::output_asset(i) {
+        None => {}, // beyond num_outputs; nothing to check
+        Some(a: Asset1) => match a {
+            Left(conf: (u1, u256)) => panic!(), // asset ids must be explicit
+            Right(id: ExplicitAsset) => match jet::eq_256(id, param::ASSET_A) {
+                false => {},
+                true => {
+                    let (y, proof): (Pubkey, [(u256, bool); 16]) = unwrap(w);
+                    assert!(jet::eq_256(cu_spk_hash(y), unwrap(jet::output_script_hash(i))));
+                    require_wl_member(y, proof);
+                },
+            },
+        },
+    }
+}
+
+/* Read a pad word without giving it meaning: eq_256(x, x) is always true. */
+fn absorb(x: u256, acc: bool) -> bool {
+    jet::eq_256(x, x)
+}
+
+fn main() {
+    // Budget padding. Simplicity buys execution budget with witness bytes
+    // (budget = serialized witness-stack size + 50 weight units) while the
+    // cost side is a STATIC bound over the whole program DAG: it does not
+    // shrink when a branch goes untaken. This program's functional witness is
+    // far too small to pay for its own output scan, so the covenant reserves
+    // inert padding.
+    //
+    // The pad has to be READ, not merely declared. Consensus rejects a redeem
+    // program containing FAIL nodes, so the program must be pruned; pruning
+    // drops witness leaves that execution never reads, which would delete an
+    // unused pad along with the budget it exists to buy. `absorb` therefore
+    // touches every word with eq_256(x, x) - always true, no semantics - at
+    // about 6 milli-WU per byte against the 1000 milli-WU per byte the same
+    // byte buys.
+    //
+    // The size is fixed at compile time and is part of the CMR, which is what
+    // the template registry pins. Padding through the taproot annex (what
+    // rust-simplicity's Cost::get_padding produces) is NOT usable here: the
+    // annex is non-standard on this network and would not relay.
+    let budget_pad: [u256; 384] = witness::BUDGET_PAD;
+    assert!(array_fold::<absorb, 384>(budget_pad, true));
+
+    // 1. own position and identity
+    assert!(jet::eq_32(jet::current_index(), 0));
+    let (ca, cv): (Asset1, Amount1) = jet::current_amount();
+    require_explicit_asset_eq(ca, param::ASSET_V);
+    require_explicit_amount_eq(cv, param::AMOUNT_Q);
+
+    // 2. output 0 recreates the verifier under the same script
+    let (a0, v0): (Asset1, Amount1) = unwrap(jet::output_amount(0));
+    require_explicit_asset_eq(a0, param::ASSET_V);
+    require_explicit_amount_eq(v0, param::AMOUNT_Q);
+    assert!(jet::eq_256(unwrap(jet::output_script_hash(0)), jet::current_script_hash()));
+
+    // 3. at least one regulated input (the C_U that authorises this spend)
+    let found: bool = bool_or(input_carries_a(1),
+                     bool_or(input_carries_a(2),
+                     bool_or(input_carries_a(3),
+                     bool_or(input_carries_a(4),
+                     bool_or(input_carries_a(5),
+                     bool_or(input_carries_a(6),
+                             input_carries_a(7)))))));
+    assert!(found);
+
+    // 4. bounded confinement scan over outputs 1..7 (N_max = 8)
+    assert!(jet::lt_32(jet::num_outputs(), 9));
+    check_output(1, witness::W1);
+    check_output(2, witness::W2);
+    check_output(3, witness::W3);
+    check_output(4, witness::W4);
+    check_output(5, witness::W5);
+    check_output(6, witness::W6);
+    check_output(7, witness::W7);
+}
