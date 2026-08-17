@@ -261,6 +261,28 @@ func (s *Server) handleIssue(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, 502, "issuance signing incomplete: %+v", signed.Errors)
 		return
 	}
+	// Safety gate (W-1): never broadcast an issuance the node would reject.
+	// A malformed issuance (confidential or transparent) is refused here,
+	// spending nothing.
+	if err := s.mempoolGate("issue", signed.Hex, map[string]any{
+		"holder": req.HolderAID, "issuer": req.IssuerAID, "ticker": req.Ticker,
+	}); err != nil {
+		httpErr(w, 502, "%v", err)
+		return
+	}
+	// Bind the policy key to its asset id BEFORE broadcast (W-8b). The asset id
+	// is already fixed (it derives from the funding outpoint + contract hash),
+	// and the failure modes are asymmetric: adopting first means a failed
+	// broadcast leaves a bound policy:<assetID> key for an asset that never
+	// reached the chain — harmless, and GC-able by checking stored assets. The
+	// old order (adopt after broadcast) had a real crash window: an issuance
+	// live on-chain with its key still staged as policy-pending:* leaves the
+	// server unable to co-sign the asset. Persist-first is the simpler correct
+	// choice; no startup reconcile is needed.
+	if err := s.signer.Adopt(policyRef, assetDisplay); err != nil {
+		httpErr(w, 500, "bind policy key: %v", err)
+		return
+	}
 	txid, err := s.wallet.SendRawTransaction(signed.Hex)
 	if err != nil {
 		log.Printf("issuance broadcast failed: %v\nraw: %s", err, signed.Hex)
@@ -269,10 +291,6 @@ func (s *Server) handleIssue(w http.ResponseWriter, r *http.Request) {
 	}
 	asset.IssueTxid = txid
 
-	if err := s.signer.Adopt(policyRef, assetDisplay); err != nil {
-		httpErr(w, 500, "bind policy key: %v", err)
-		return
-	}
 	// Only a server-generated issuer key is stored. For an external issuer key the
 	// server holds nothing (the entity signs clawbacks in its browser), so there is
 	// no issuer key to persist and clawback runs two-phase.
@@ -433,7 +451,7 @@ func (s *Server) handleClawback(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, 403, "this asset was issued without a clawback leaf; its terms cannot be retrofitted")
 		return
 	}
-	issuerTree, _, _, err := s.enclaveFor(asset.IssuerAID, req.Asset)
+	issuerTree, issuerUser, _, err := s.enclaveFor(asset.IssuerAID, req.Asset)
 	if err != nil {
 		httpErr(w, 500, "%v", err)
 		return
@@ -491,13 +509,6 @@ func (s *Server) handleClawback(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, 503, "no fee funds")
 		return
 	}
-	changeAddr, _ := s.wallet.GetNewAddress()
-	changeInfo, err := s.wallet.GetAddressInfo(changeAddr)
-	if err != nil {
-		httpErr(w, 502, "%v", err)
-		return
-	}
-
 	assetID := elements.MustHex32(asset.ID)
 	feeAssetID := elements.MustHex32(s.cfg.FeeAsset)
 	tx := &elements.Tx{Version: 2}
@@ -505,15 +516,61 @@ func (s *Server) handleClawback(w http.ResponseWriter, r *http.Request) {
 		tx.In = append(tx.In, &elements.TxIn{Prevout: elements.OutPoint{Hash: internalHash(u.txid), N: u.vout}})
 	}
 	tx.In = append(tx.In, &elements.TxIn{Prevout: elements.OutPoint{Hash: internalHash(feeIn.txid), N: feeIn.vout}})
+
+	// Seized output + fee change. For a transparent asset both are explicit to
+	// ordinary destinations, exactly as before W-5. For a confidential asset the
+	// seized output blinds to the ISSUER's enclave blinding key (the holder's
+	// enclave inputs are blinded commitments, so an explicit seized output would
+	// leak the amount and could never balance) and the fee change goes to a
+	// per-call blinded (blech32) wallet output, giving the >=2 blinded outputs a
+	// blindable transaction needs — the same discipline as transfer.go/burn.go.
+	seizedNonce := elements.NullNonce()
+	feeChangeOut := &elements.TxOut{
+		Asset: elements.ExplicitAsset(feeAssetID), Value: elements.ExplicitValue(feeIn.sats - s.cfg.FeeSats),
+		Nonce: elements.NullNonce(),
+	}
+	if asset.Confidential {
+		seizedNonce, err = s.enclaveConfNonce(asset.ID, elements.MustHex32(issuerUser.Pubkeys[0]), hex.EncodeToString(issuerTree.ScriptPubKey()))
+		if err != nil {
+			httpErr(w, 500, "confidential seized output: %v", err)
+			return
+		}
+		feeChangeOut, err = s.confWalletOutput(feeIn.sats - s.cfg.FeeSats)
+		if err != nil {
+			httpErr(w, 502, "confidential fee change: %v", err)
+			return
+		}
+	} else {
+		changeAddr, _ := s.wallet.GetNewAddress()
+		changeInfo, err := s.wallet.GetAddressInfo(changeAddr)
+		if err != nil {
+			httpErr(w, 502, "%v", err)
+			return
+		}
+		feeChangeOut.ScriptPubKey = mustHexBytes(changeInfo.ScriptPubKey)
+	}
 	tx.Out = append(tx.Out,
 		&elements.TxOut{Asset: elements.ExplicitAsset(assetID), Value: elements.ExplicitValue(total),
-			Nonce: elements.NullNonce(), ScriptPubKey: issuerTree.ScriptPubKey()},
-		&elements.TxOut{Asset: elements.ExplicitAsset(feeAssetID), Value: elements.ExplicitValue(feeIn.sats - s.cfg.FeeSats),
-			Nonce: elements.NullNonce(), ScriptPubKey: mustHexBytes(changeInfo.ScriptPubKey)},
+			Nonce: seizedNonce, ScriptPubKey: issuerTree.ScriptPubKey()},
+		feeChangeOut,
 		&elements.TxOut{Asset: elements.ExplicitAsset(feeAssetID), Value: elements.ExplicitValue(s.cfg.FeeSats),
 			Nonce: elements.NullNonce(), ScriptPubKey: nil},
 	)
 	tx.NormalizeWitness()
+
+	// Blind BEFORE logging and before the sighashes: the sighashes must commit
+	// to the blinded outputs (prevouts are already the on-chain commitment
+	// bytes, which TaprootSighash reads uniformly), and the logged txid must be
+	// the txid that can actually confirm. The watch wallet supplies the enclave
+	// inputs' blinders inside blindTx.
+	if asset.Confidential {
+		blinded, err := s.blindTx(tx)
+		if err != nil {
+			httpErr(w, 500, "blind clawback: %v", err)
+			return
+		}
+		tx = blinded
+	}
 
 	// Public notice precedes the signature.
 	s.st.AppendLog("clawback", map[string]any{
@@ -575,8 +632,11 @@ func (s *Server) handleClawback(w http.ResponseWriter, r *http.Request) {
 
 	// LEGACY: the server holds the issuer key, so it signs both parts and
 	// broadcasts in this one call, exactly as before M9.
+	clawTxid := tx.TxID()
 	for i := range utxos {
-		policySig, err := s.signer.SignPolicy(asset.ID, sighashes[i])
+		policySig, err := s.signer.SignPolicy(asset.ID, sighashes[i], PolicyContext{
+			Action: "clawback", AID: req.HolderAID, TxID: clawTxid, Reason: req.Reason, InputIndex: i,
+		})
 		if err != nil {
 			httpErr(w, 500, "%v", err)
 			return
@@ -590,6 +650,13 @@ func (s *Server) handleClawback(w http.ResponseWriter, r *http.Request) {
 	}
 	signed, err := s.wallet.SignRawTransactionWithWallet(hex.EncodeToString(tx.Serialize()))
 	if err != nil {
+		httpErr(w, 502, "%v", err)
+		return
+	}
+	// Safety gate (W-1): a sweep the node would reject is refused, unbroadcast.
+	if err := s.mempoolGate("clawback", signed.Hex, map[string]any{
+		"asset": asset.ID, "holder": req.HolderAID,
+	}); err != nil {
 		httpErr(w, 502, "%v", err)
 		return
 	}
@@ -673,10 +740,13 @@ func (s *Server) handleClawbackComplete(w http.ResponseWriter, r *http.Request) 
 		httpErr(w, 500, "%v", err)
 		return
 	}
+	clawTxid := tx.TxID()
 	for i, idx := range pc.Enclave {
 		var sh [32]byte
 		copy(sh[:], mustHexBytes(pc.Sighashes[i]))
-		policySig, err := s.signer.SignPolicy(pc.AssetID, sh)
+		policySig, err := s.signer.SignPolicy(pc.AssetID, sh, PolicyContext{
+			Action: "clawback", AID: pc.HolderAID, TxID: clawTxid, Reason: pc.Reason, InputIndex: idx,
+		})
 		if err != nil {
 			httpErr(w, 500, "%v", err)
 			return
@@ -685,6 +755,15 @@ func (s *Server) handleClawbackComplete(w http.ResponseWriter, r *http.Request) 
 	}
 	signed, err := s.wallet.SignRawTransactionWithWallet(hex.EncodeToString(tx.Serialize()))
 	if err != nil {
+		httpErr(w, 502, "%v", err)
+		return
+	}
+	// Safety gate (W-1): refuse before broadcast. The pending build is NOT
+	// consumed on refusal (MarkClawback below is what consumes it), so a
+	// rejected completion stays retryable with the identical stored tx.
+	if err := s.mempoolGate("clawback", signed.Hex, map[string]any{
+		"asset": pc.AssetID, "holder": pc.HolderAID,
+	}); err != nil {
 		httpErr(w, 502, "%v", err)
 		return
 	}

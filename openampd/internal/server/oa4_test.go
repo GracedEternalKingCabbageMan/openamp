@@ -5,9 +5,11 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/GracedEternalKingCabbageMan/openamp/openampd/internal/elements"
@@ -126,14 +128,32 @@ type oa4Node struct {
 	newAddr    string                       // getnewaddress
 	broadcast  string                       // sendrawtransaction return txid
 	sends      int                          // count of sendrawtransaction calls
+
+	// W-1 gate + W-5 confidential support.
+	mempoolReject    string            // non-empty: testmempoolaccept refuses with this reason
+	mempoolChecks    int               // count of testmempoolaccept calls
+	lastMempoolCheck string            // hex the gate submitted
+	lastBroadcast    string            // hex actually broadcast
+	confUnspent      []rpc.ConfUnspent // extra listunspent rows (blinded coins the wallets can unblind)
+	blechAddrs       map[string]string // blech32 addr -> scriptPubKey (per-call blinded addresses)
+	blechConf        map[string]string // blech32 addr -> confidential_key
+	blechSeq         int
+	blindCalled      bool // rawblindrawtransaction was invoked
+	// Atomic: the watch-reconcile tests read these while a background
+	// reconcile goroutine is still driving the handler.
+	rescans      atomic.Int32 // count of rescanblockchain calls
+	imports      atomic.Int32 // count of importaddress calls
+	blindImports atomic.Int32 // count of importblindingkey calls
 }
 
 func newOA4Node() *oa4Node {
 	return &oa4Node{
-		rawTxs:  map[string]string{},
-		scan:    map[string][]rpc.ScanUnspent{},
-		addrSpk: map[string]string{},
-		newAddr: "sqtestchangeaddr",
+		rawTxs:     map[string]string{},
+		scan:       map[string][]rpc.ScanUnspent{},
+		addrSpk:    map[string]string{},
+		newAddr:    "sqtestchangeaddr",
+		blechAddrs: map[string]string{},
+		blechConf:  map[string]string{},
 	}
 }
 
@@ -167,22 +187,83 @@ func (n *oa4Node) handler(w http.ResponseWriter, r *http.Request) {
 		}
 		reply(map[string]any{"success": true, "unspents": us})
 	case "listunspent":
-		reply(n.feeUnspent)
+		// Fee coins plus any blinded rows (enclave coins the watch wallet
+		// unblinds, the reissuance token, ...); one merged answer serves both
+		// the demo and watch wallet clients.
+		rows := make([]any, 0, len(n.feeUnspent)+len(n.confUnspent))
+		for _, u := range n.feeUnspent {
+			rows = append(rows, u)
+		}
+		for _, u := range n.confUnspent {
+			rows = append(rows, u)
+		}
+		reply(rows)
 	case "getnewaddress":
+		// A per-call blech32 request returns a fresh blinded address (OA-8);
+		// the plain form returns the ordinary (unblinded) wallet address.
+		if len(req.Params) > 1 {
+			var kind string
+			_ = json.Unmarshal(req.Params[1], &kind)
+			if kind == "blech32" {
+				n.blechSeq++
+				addr := fmt.Sprintf("tsqb-percall-%d", n.blechSeq)
+				n.blechAddrs[addr] = "0014" + fmt.Sprintf("%040x", 0xb0000+n.blechSeq)
+				n.blechConf[addr] = "02" + fmt.Sprintf("%064x", 0xc0000+n.blechSeq)
+				reply(addr)
+				return
+			}
+		}
 		reply(n.newAddr)
 	case "getaddressinfo":
 		var addr string
 		_ = json.Unmarshal(req.Params[0], &addr)
+		if spk, ok := n.blechAddrs[addr]; ok {
+			reply(map[string]any{"scriptPubKey": spk, "unconfidential": "", "confidential_key": n.blechConf[addr]})
+			return
+		}
 		reply(map[string]any{"scriptPubKey": n.addrSpk[addr], "unconfidential": ""})
 	case "gettxout":
 		// A non-null result marks the utxo unspent (utxoUnspent guard).
 		reply(map[string]any{"confirmations": 1})
+	case "decodescript":
+		reply(map[string]any{"address": "sqenclaveunconf"})
+	case "createblindedaddress":
+		reply("tsqb-enclave-confidential")
+	case "rawblindrawtransaction":
+		var hexTx string
+		_ = json.Unmarshal(req.Params[0], &hexTx)
+		n.blindCalled = true
+		reply(hexTx) // echo unchanged: structurally valid, round-trips
+	case "importaddress":
+		n.imports.Add(1)
+		reply(nil)
+	case "importblindingkey":
+		n.blindImports.Add(1)
+		reply(nil)
+	case "rescanblockchain":
+		n.rescans.Add(1)
+		reply(nil)
 	case "signrawtransactionwithwallet":
 		var hexTx string
 		_ = json.Unmarshal(req.Params[0], &hexTx)
 		reply(map[string]any{"hex": hexTx, "complete": true})
+	case "testmempoolaccept":
+		var txs []string
+		_ = json.Unmarshal(req.Params[0], &txs)
+		n.mempoolChecks++
+		if len(txs) == 1 {
+			n.lastMempoolCheck = txs[0]
+		}
+		if n.mempoolReject != "" {
+			reply([]any{map[string]any{"allowed": false, "reject-reason": n.mempoolReject}})
+			return
+		}
+		reply([]any{map[string]any{"allowed": true}})
 	case "sendrawtransaction":
 		n.sends++
+		var hexTx string
+		_ = json.Unmarshal(req.Params[0], &hexTx)
+		n.lastBroadcast = hexTx
 		reply(n.broadcast)
 	default:
 		reply(nil)

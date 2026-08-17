@@ -5,12 +5,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"log"
 	"sync"
 
 	"github.com/btcsuite/btcd/btcec/v2"
 
 	"github.com/GracedEternalKingCabbageMan/openamp/openampd/internal/elements"
 	"github.com/GracedEternalKingCabbageMan/openamp/openampd/internal/rpc"
+	"github.com/GracedEternalKingCabbageMan/openamp/openampd/internal/store"
 )
 
 // Confidential-asset support. Sequentia is transparent by default and
@@ -230,6 +232,72 @@ func (s *Server) enclaveConfNonce(assetID string, holderXonly [32]byte, enclaveS
 		return nil, err
 	}
 	return pub, nil
+}
+
+// startWatchReconcile launches the watch-wallet rescan reconcile (W-5c) in a
+// goroutine, at most once per process start. It never blocks request handling:
+// every import it performs is the same idempotent import the request paths do
+// on demand, so a request racing the reconcile just does the work first.
+func (s *Server) startWatchReconcile() {
+	s.watchReconcile.Do(func() { go s.reconcileWatchWallet() })
+}
+
+// reconcileWatchWallet re-imports the enclave script + blinding key of every
+// registered (holder, asset) pair of a confidential asset into the watch
+// wallet, then runs ONE rescanblockchain pass. The request paths import with
+// rescan=false (to keep them fast), so an enclave whose key arrived after its
+// funds — a restored data directory, a receipt while the daemon was down —
+// holds UTXOs the wallet has never seen; the rescan surfaces them. We cannot
+// tell which imports were "first" imports, so the pass runs whenever any
+// confidential pair exists at all: it is read-only against the chain and
+// bounded to once per process start by startWatchReconcile.
+func (s *Server) reconcileWatchWallet() {
+	type pair struct {
+		assetID string
+		spkHex  string
+		holderX [32]byte
+	}
+	var pairs []pair
+	s.st.View(func(st *store.State) {
+		for _, a := range st.Assets {
+			if !a.Confidential {
+				continue
+			}
+			for _, u := range st.Users {
+				tree, err := s.treeFor(u, a)
+				if err != nil {
+					continue
+				}
+				pairs = append(pairs, pair{a.ID, hex.EncodeToString(tree.ScriptPubKey()), elements.MustHex32(u.Pubkeys[0])})
+			}
+		}
+	})
+	if len(pairs) == 0 {
+		return // no confidential enclaves registered: nothing to import or rescan
+	}
+	imported := 0
+	for _, p := range pairs {
+		priv, pub, err := s.blindingKey(p.assetID, p.holderX)
+		if err != nil {
+			log.Printf("watch reconcile: blinding key for asset %s: %v", p.assetID, err)
+			continue
+		}
+		if err := s.importConfidentialEnclave(p.spkHex, priv, hex.EncodeToString(pub)); err != nil {
+			log.Printf("watch reconcile: import enclave %s (asset %s): %v", p.spkHex, p.assetID, err)
+			continue
+		}
+		imported++
+	}
+	w, err := s.watchClient()
+	if err != nil {
+		log.Printf("watch reconcile: watch wallet unavailable, rescan skipped: %v", err)
+		return
+	}
+	if err := w.RescanBlockchain(); err != nil {
+		log.Printf("watch reconcile: rescanblockchain: %v", err)
+		return
+	}
+	log.Printf("watch reconcile: re-imported %d/%d confidential enclaves, rescan complete", imported, len(pairs))
 }
 
 // utxoUnspent verifies a wallet-listed utxo is actually unspent in the global
