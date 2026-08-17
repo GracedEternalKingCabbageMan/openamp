@@ -188,6 +188,24 @@ type Unspent struct {
 	Asset        string  `json:"asset"`
 	ScriptPubKey string  `json:"scriptPubKey"`
 	Spendable    bool    `json:"spendable"`
+	// AmountBlinder is non-zero for a blinded wallet coin (the wallet unblinds
+	// the amount for display, but on chain the value is a commitment).
+	AmountBlinder string `json:"amountblinder"`
+}
+
+// Explicit reports whether this coin's on-chain value is explicit (a zero or
+// absent amount blinder). Fee funding always requires an explicit coin: an
+// explicit fee input is valid in every build, while a blinded fee input would
+// silently unbalance a fully explicit transaction (bad-txns-in-ne-out at the
+// node). Blinded wallet coins (per-call blech32 fee change from confidential
+// builds) are skipped by the fee pickers and await consolidation.
+func (u Unspent) Explicit() bool {
+	for _, c := range u.AmountBlinder {
+		if c != '0' {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *Client) ListUnspent(minConf int, asset string) ([]Unspent, error) {

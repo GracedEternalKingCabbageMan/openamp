@@ -103,7 +103,7 @@ func (s *Server) handleBurnBuild(w http.ResponseWriter, r *http.Request) {
 	}
 	var feeIn *rpcUnspentLite
 	for _, u := range feeUtxos {
-		if u.Spendable && sats(u.Amount) > s.cfg.FeeSats*2 {
+		if u.Spendable && u.Explicit() && sats(u.Amount) > s.cfg.FeeSats*2 {
 			feeIn = &rpcUnspentLite{u.TxID, u.Vout, sats(u.Amount)}
 			break
 		}
