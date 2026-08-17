@@ -21,7 +21,7 @@ Design document: [`doc/sequentia/openamp-design.md`](https://github.com/GracedEt
 
 - **Enclave outputs.** A restricted asset exists only in taproot outputs with a NUMS internal key (no key-path spend) and script leaves `<K_user> CHECKSIGVERIFY <K_policy> CHECKSIG` (transfer) and, if enabled at issuance, `<K_issuer> CHECKSIGVERIFY <K_policy> CHECKSIG` (clawback). Every spend therefore needs the policy server's signature in addition to the holder's: enforcement is server-side, not consensus-side.
 - **The asset ID commits to the policy key.** The issuance contract JSON (which names `K_policy`) is hashed into the asset's issuance entropy, so anyone holding the contract can verify offline that a given asset ID is governed by a given policy key. No registry state, no consensus lookup. Format: [`spec/contract-v1.md`](spec/contract-v1.md).
-- **Policy key backend.** On-chain, `K_policy` is always a single x-only key, so the signing backend is swappable without any chain migration. The committed backend is `LocalKeySigner` (one software key per asset, stored in a 0600 file): appropriate for testnet and demos only. The `PolicySigner` interface in `openampd/internal/server/signer.go` is the seam for a production FROST threshold (or MPC/HSM) backend, where `K_policy` is the FROST group public key and signing runs a t-of-n quorum off-chain. That backend is designed for but **not yet implemented in this repository**.
+- **Policy key backend.** On-chain, `K_policy` is always a single x-only key, so the signing backend is swappable without any chain migration. Two backends ship, selected with `-signer`: `local` (default; one software key per asset in a 0600 file) and `frost` (a 2-of-3 threshold Schnorr quorum whose group public key IS `K_policy`, so no address, asset id, or wallet changes when you switch). Under `frost`, no single share can sign, every partial is verified before aggregation, and assets issued under `local` keep working through a per-asset fallback. Key generation currently uses a trusted dealer; a DKG replaces it behind the same seam without changing the group key.
 - **Confidentiality is opt-in per transfer.** Sequentia is transparent by default with opt-in confidentiality, and OpenAMP follows: an asset is never "a confidential asset" — any holder may receive or move ANY restricted asset confidentially in a given transaction. `POST /v1/transfers` takes `"confidential": true` to blind that transfer's enclave outputs (amounts and asset tags hidden on-chain); `GET /address?confidential=1` returns the blinded (blech32) enclave address; issuance and reissue accept `"confidential": true` meaning only "blind this mint transaction". An enclave can hold a mix of explicit and blinded coins, and every read (balances, holders, supply) unifies both views. The policy server derives and holds the per-(holder, asset) blinding keys in a node watch wallet, so the issuer sees and reports every holding and outside observers see nothing: confidentiality is privacy from outsiders only, never from the issuer. No confidential-transaction crypto is reimplemented: the node's `rawblindrawtransaction`/unblind machinery does the work, and the holder still only signs the returned sighashes.
 - **Fees (Rule 1).** A restricted asset never appears in a fee output, so it can never be swept into a block producer's coinbase. The policy server refuses to co-sign such a transaction, and Sequentia's default-deny fee-asset whitelist makes it non-paying at every producer regardless. Holders still pay costs in the restricted asset via fee conversion (the issuer takes a fee-equivalent slice into its own enclave and attaches the real fee in an ordinary asset, atomically in the same transaction), or the server sponsors the fee, or the sender self-pays in an ordinary asset with no issuer involvement.
 - **Transparency log.** Every registration, rule change, freeze, transfer approval, refusal, and clawback is appended to a hash-chained public log (`GET /v1/log`); clawbacks are logged before they are signed. The issuer can anchor the log head on-chain in an OP_RETURN (`POST /v1/issuer/anchor`).
@@ -112,6 +112,8 @@ Witness stack for an enclave input, bottom to top: `<policy sig> <user sig> <lea
 | `POST /v1/issuer/clawback` | Claw back a holder's enclave UTXOs |
 | `GET /v1/issuer/holders?asset=<id>` | Ownership report |
 | `POST /v1/issuer/anchor` | Anchor the transparency-log head on-chain |
+| `POST /v1/issuer/rotate-blinding` | Rotate an asset's blinding-key epoch and re-import every holder's key |
+| `POST /v1/issuer/consolidate` | Sweep blinded fee-asset change into an explicit coin |
 
 If no issuer token is configured, every issuer request is rejected (401).
 
@@ -234,6 +236,7 @@ Run against a node:
   -issuertoken <long-random-token> \
   -feeasset <display hex of the fee asset> \
   -demoissuer                     # testnet demos only: issuer keys server-side
+  -signer frost                   # 2-of-3 threshold policy key (default: local)
 ```
 
 | Flag | Default | Meaning |
@@ -247,6 +250,7 @@ Run against a node:
 | `-feeasset` | chain policy asset | display hex of the ordinary asset openampd pays fees in |
 | `-feesats` | `1000` | flat fee attached to server-funded transactions, in fee-asset atoms |
 | `-demoissuer` | off | hold issuer keys server-side (testnet demo only) |
+| `-signer` | `local` | policy-key backend: `local` (one key per asset) or `frost` (2-of-3 threshold quorum) |
 | `-follow` | `2s` | chain follower poll interval |
 
 Production deployment (systemd unit, Caddy reverse proxy, secrets handling): [`deploy/DEPLOY.md`](deploy/DEPLOY.md).
