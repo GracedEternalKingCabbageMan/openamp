@@ -84,19 +84,24 @@ type Asset struct {
 	// externally, so the server never holds the issuer key for this asset. Absent
 	// or false = the legacy server-held issuer key and the single-call clawback,
 	// so records issued before M9 stay byte-compatible.
-	IssuerExternal bool          `json:"issuer_external,omitempty"`
-	IssuerAID    string          `json:"issuer_aid"`
-	Clawback     bool            `json:"clawback"`
-	BurnAllowed  bool            `json:"burn_allowed"`
-	Confidential bool            `json:"confidential"`
-	IssueTxid    string          `json:"issue_txid"`
-	Rules        Rules           `json:"rules"`
+	IssuerExternal bool   `json:"issuer_external,omitempty"`
+	IssuerAID      string `json:"issuer_aid"`
+	Clawback       bool   `json:"clawback"`
+	BurnAllowed    bool   `json:"burn_allowed"`
+	Confidential   bool   `json:"confidential"`
+	IssueTxid      string `json:"issue_txid"`
+	Rules          Rules  `json:"rules"`
 	// Reissuance material (OA-6), recorded at issuance so a later DR mint can
 	// re-derive the asset entropy and locate the reissuance token. Both are
 	// display-hex. Absent on assets issued before OA-6 (reissue is refused for
 	// them), so existing records are byte-compatible.
 	Entropy string `json:"entropy,omitempty"` // final asset entropy
 	Token   string `json:"token,omitempty"`   // reissuance token id
+	// Enforcement records the issuance-time enforcement election (OpenDAMP M2).
+	// Absent (or "") = cosign, the only model this daemon can issue today, so
+	// nothing ever writes "cosign" explicitly and every stored record stays
+	// byte-compatible. A future damp asset (M1/M3) persists "damp" here.
+	Enforcement string `json:"enforcement,omitempty"`
 }
 
 // TransferRecord supports velocity accounting; entries above a reorged-out
@@ -166,10 +171,14 @@ type State struct {
 	// persists so the build survives a restart between build and complete, exactly
 	// like a pending transfer. Initialised on load.
 	PendingClawbacks map[string]*PendingClawback `json:"pending_clawbacks,omitempty"`
-	RecentBlocks []string          `json:"recent_blocks"` // newest last
-	Height       int64             `json:"height"`
-	LogHead      string            `json:"log_head"`
-	LogSeq       uint64            `json:"log_seq"`
+	// Snapshots maps an asset id to its published OpenDAMP policy snapshots in
+	// seq order (index == seq; the snapshot service enforces gapless append).
+	// Absent on documents written before M2; initialised on load.
+	Snapshots    map[string][]*StoredSnapshot `json:"snapshots,omitempty"`
+	RecentBlocks []string                     `json:"recent_blocks"` // newest last
+	Height       int64                        `json:"height"`
+	LogHead      string                       `json:"log_head"`
+	LogSeq       uint64                       `json:"log_seq"`
 }
 
 type Store struct {
@@ -219,7 +228,69 @@ func Open(dir string) (*Store, error) {
 	if s.state.PendingClawbacks == nil {
 		s.state.PendingClawbacks = map[string]*PendingClawback{}
 	}
+	if s.state.Snapshots == nil {
+		s.state.Snapshots = map[string][]*StoredSnapshot{}
+	}
 	return s, nil
+}
+
+// --- OpenDAMP policy snapshots (M2) -------------------------------------------
+
+// StoredSnapshot is one published policy snapshot for an asset. Canonical is
+// the snapshot's canonical JSON (sorted keys, compact, issuer_sig excluded);
+// Hash is SHA256 of those bytes (the content address); IssuerSig is the BIP340
+// signature over the tagged snapshot hash; IssuerPub is the x-only key the
+// signature was verified against, pinned so later seqs of the same asset must
+// chain under the same key.
+type StoredSnapshot struct {
+	Seq       uint64          `json:"seq"`
+	Pi        string          `json:"pi"`
+	Hash      string          `json:"hash"`
+	IssuerPub string          `json:"issuer_pub"`
+	Canonical json.RawMessage `json:"canonical"`
+	IssuerSig string          `json:"issuer_sig"`
+}
+
+// AppendSnapshot appends a snapshot for an asset, enforcing gapless sequence
+// numbers atomically (seq must equal the current count, so the first is 0).
+// The prev_pi linkage check runs in the handler; this seq check is what makes
+// concurrent posts race-safe.
+func (s *Store) AppendSnapshot(assetID string, ss *StoredSnapshot) error {
+	return s.Update(func(st *State) error {
+		if st.Snapshots == nil {
+			st.Snapshots = map[string][]*StoredSnapshot{}
+		}
+		if want := uint64(len(st.Snapshots[assetID])); ss.Seq != want {
+			return fmt.Errorf("snapshot seq must be %d (gapless), got %d", want, ss.Seq)
+		}
+		cp := *ss
+		st.Snapshots[assetID] = append(st.Snapshots[assetID], &cp)
+		return nil
+	})
+}
+
+// LatestSnapshot returns a copy of the asset's newest snapshot, if any.
+func (s *Store) LatestSnapshot(assetID string) (*StoredSnapshot, bool) {
+	var out *StoredSnapshot
+	s.View(func(st *State) {
+		if list := st.Snapshots[assetID]; len(list) > 0 {
+			cp := *list[len(list)-1]
+			out = &cp
+		}
+	})
+	return out, out != nil
+}
+
+// SnapshotAt returns a copy of the asset's snapshot with the exact seq, if any.
+func (s *Store) SnapshotAt(assetID string, seq uint64) (*StoredSnapshot, bool) {
+	var out *StoredSnapshot
+	s.View(func(st *State) {
+		if list := st.Snapshots[assetID]; seq < uint64(len(list)) {
+			cp := *list[seq]
+			out = &cp
+		}
+	})
+	return out, out != nil
 }
 
 // --- reissuance idempotency (OA-6) -------------------------------------------
@@ -342,8 +413,8 @@ type PendingClawback struct {
 	AssetID   string    `json:"asset_id"`
 	HolderAID string    `json:"holder_aid"`
 	Atoms     uint64    `json:"atoms"`
-	Enclave   []int     `json:"enclave"`   // L_claw input indices the issuer signs
-	Sighashes []string  `json:"sighashes"` // hex 32-byte sighashes, aligned with Enclave
+	Enclave   []int     `json:"enclave"`    // L_claw input indices the issuer signs
+	Sighashes []string  `json:"sighashes"`  // hex 32-byte sighashes, aligned with Enclave
 	IssuerPub string    `json:"issuer_pub"` // x-only hex of the external issuer key
 	Reason    string    `json:"reason"`
 	Created   time.Time `json:"created"`

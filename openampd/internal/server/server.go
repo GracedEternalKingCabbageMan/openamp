@@ -11,6 +11,7 @@
 //	POST /v1/cosign                     raw co-sign for self-built transactions
 //	GET  /v1/assets, /v1/assets/{id}    contracts and terms
 //	GET  /v1/supply                     chain-derived circulating supply
+//	GET  /v1/snapshots                  OpenDAMP policy snapshots (latest or ?seq=n)
 //	GET  /v1/log                        transparency log
 //
 // Issuer surface (Bearer token):
@@ -23,6 +24,7 @@
 //	POST /v1/issuer/clawback/{id}/complete  submit the external issuer's signatures -> broadcast
 //	POST /v1/issuer/burn                build a redeem burn (OA-5), holder-signed
 //	POST /v1/issuer/reissue             reissue more into a target enclave (OA-6)
+//	POST /v1/issuer/snapshots           publish a signed OpenDAMP policy snapshot
 //	GET  /v1/issuer/holders             ownership report
 //	POST /v1/issuer/anchor              anchor the transparency log on-chain
 package server
@@ -123,6 +125,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /v1/assets", s.handleAssets)
 	mux.HandleFunc("GET /v1/assets/{id}", s.handleAsset)
 	mux.HandleFunc("GET /v1/supply", s.handleSupply)
+	mux.HandleFunc("GET /v1/snapshots", s.handleSnapshotGet)
 	mux.HandleFunc("GET /v1/log", s.handleLog)
 
 	mux.HandleFunc("POST /v1/issuer/assets", s.issuerAuth(s.handleIssue))
@@ -133,6 +136,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /v1/issuer/clawback/{id}/complete", s.issuerAuth(s.handleClawbackComplete))
 	mux.HandleFunc("POST /v1/issuer/burn", s.issuerAuth(s.handleBurnBuild))
 	mux.HandleFunc("POST /v1/issuer/reissue", s.issuerAuth(s.handleReissue))
+	mux.HandleFunc("POST /v1/issuer/snapshots", s.issuerAuth(s.handleSnapshotPost))
 	mux.HandleFunc("GET /v1/issuer/holders", s.issuerAuth(s.handleHolders))
 	mux.HandleFunc("POST /v1/issuer/anchor", s.issuerAuth(s.handleAnchor))
 	return mux
