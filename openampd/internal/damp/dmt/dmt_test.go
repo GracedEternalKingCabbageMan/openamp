@@ -1,6 +1,7 @@
 package dmt
 
 import (
+	"crypto/sha256"
 	"encoding/hex"
 	"testing"
 )
@@ -245,3 +246,132 @@ func TestManyKeysBuildAndProve(t *testing.T) {
 }
 
 func sliceOf(h [32]byte) []byte { return h[:] }
+
+func sha256sum(b []byte) Key {
+	h := sha256.Sum256(b)
+	var k Key
+	copy(k[:], h[:])
+	return k
+}
+
+// ---------------------------------------------------------------- blacklist
+
+const (
+	// Independently recomputed from SPEC-dmt-v1.md; the Rust implementation
+	// pins the same literals.
+	wantIntervalGuards = "1fd8164b6e61192e120f01ca504c786a6e193abe0265104c1303a9b1e09afc39"
+	wantIntervalPad    = "507647244d0d51f754f23c5f23c4f9e6a84eeabd0524bd20fe2d932f539be8d4"
+	wantEmptyBLRoot    = "009a25ef01f6cade2d114b8315aab47bf5599e3a1386c2f1d414f0e8d6dbf301"
+)
+
+func kb(t *testing.T, b byte) Key {
+	t.Helper()
+	var k Key
+	k[0] = b
+	k[31] = b
+	return k
+}
+
+func TestBlacklistGoldenVectors(t *testing.T) {
+	if got := hex.EncodeToString(sliceOf(IntervalLeafHash(GuardLo, GuardHi))); got != wantIntervalGuards {
+		t.Errorf("interval(GuardLo,GuardHi) = %s, want %s", got, wantIntervalGuards)
+	}
+	if got := hex.EncodeToString(sliceOf(IntervalLeafHash(GuardHi, GuardHi))); got != wantIntervalPad {
+		t.Errorf("interval(GuardHi,GuardHi) = %s, want %s", got, wantIntervalPad)
+	}
+	tree, err := NewIntervalTree(nil)
+	if err != nil {
+		t.Fatalf("NewIntervalTree(nil): %v", err)
+	}
+	if got := hex.EncodeToString(sliceOf(tree.Root())); got != wantEmptyBLRoot {
+		t.Errorf("empty blacklist root = %s, want %s", got, wantEmptyBLRoot)
+	}
+}
+
+func TestListedKeysAreUnprovableAndUnlistedOnesAreNot(t *testing.T) {
+	listed := []Key{kb(t, 10), kb(t, 20), kb(t, 30)}
+	tree, err := NewIntervalTree(listed)
+	if err != nil {
+		t.Fatalf("NewIntervalTree: %v", err)
+	}
+	root := tree.Root()
+	// A listed key has no proof. That is the freeze.
+	for _, k := range listed {
+		if _, ok := tree.ProveAbsent(k); ok {
+			t.Errorf("listed key %x must not be provable absent", k)
+		}
+	}
+	for _, k := range []Key{kb(t, 1), kb(t, 15), kb(t, 25), kb(t, 99)} {
+		p, ok := tree.ProveAbsent(k)
+		if !ok {
+			t.Fatalf("unlisted key %x must be provable", k)
+		}
+		if !VerifyAbsent(root, k, p) {
+			t.Errorf("non-membership proof for %x does not verify", k)
+		}
+	}
+}
+
+func TestIntervalCannotBeStretchedOrEdited(t *testing.T) {
+	tree, err := NewIntervalTree([]Key{kb(t, 20)})
+	if err != nil {
+		t.Fatalf("NewIntervalTree: %v", err)
+	}
+	root := tree.Root()
+	p, ok := tree.ProveAbsent(kb(t, 10))
+	if !ok {
+		t.Fatal("expected a proof")
+	}
+	// Containment is strict, so the interval below a listed key does not cover it.
+	if VerifyAbsent(root, kb(t, 20), p) {
+		t.Error("an interval must not cover its own endpoint")
+	}
+	// Editing an endpoint changes the leaf, so the path no longer reaches the root.
+	edited := *p
+	edited.Hi = kb(t, 99)
+	if VerifyAbsent(root, kb(t, 50), &edited) {
+		t.Error("an edited interval must not verify")
+	}
+}
+
+func TestEmptyBlacklistProvesEverythingAbsent(t *testing.T) {
+	tree, err := NewIntervalTree(nil)
+	if err != nil {
+		t.Fatalf("NewIntervalTree: %v", err)
+	}
+	p, ok := tree.ProveAbsent(kb(t, 7))
+	if !ok {
+		t.Fatal("expected a proof")
+	}
+	if p.Lo != GuardLo || p.Hi != GuardHi {
+		t.Errorf("expected the guard-to-guard interval, got (%x, %x)", p.Lo, p.Hi)
+	}
+	if !VerifyAbsent(tree.Root(), kb(t, 7), p) {
+		t.Error("proof must verify")
+	}
+}
+
+func TestLeafDomainsAreSeparate(t *testing.T) {
+	// A whitelist membership proof must not be replayable as a blacklist
+	// non-membership proof. The leading domain byte is what prevents it.
+	if LeafHash(kb(t, 1)) == IntervalLeafHash(kb(t, 1), kb(t, 1)) {
+		t.Fatal("whitelist and blacklist leaf domains must differ")
+	}
+}
+
+func TestOutpointKeyIsTxidThenBigEndianVout(t *testing.T) {
+	var txid [32]byte
+	for i := range txid {
+		txid[i] = 0xab
+	}
+	got := OutpointKey(txid, 256)
+	// Recomputed inline: SHA256(txid || 00 00 01 00).
+	want := func() Key {
+		b, _ := hex.DecodeString("00000100")
+		h := sha256sum(append(append([]byte{}, txid[:]...), b...))
+		return h
+	}()
+	if got != want {
+		t.Errorf("OutpointKey = %x, want %x", got, want)
+	}
+}

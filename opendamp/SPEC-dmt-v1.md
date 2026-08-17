@@ -1,19 +1,24 @@
 # dmt-v1: the dense Merkle tree OpenDAMP covenants verify against
 
-Status: implemented and consensus-exercised (Rust: `src/dmt.rs`; Go mirror:
-`gomirror/dmt/`; golden vectors: `vectors/addresses.json` under `dmt_v1`).
+Status: implemented and consensus-exercised, both predicates (Rust:
+`src/dmt.rs`; Go mirror: `gomirror/dmt/`; golden vectors:
+`vectors/addresses.json` under `dmt_v1`).
 
-`dmt-v1` replaces the design document's `smt-v1` / `cmt-v1` placeholder for the
-whitelist predicate. The reason is covenant feasibility: a depth-256 sparse
+`dmt-v1` replaces the design document's `smt-v1` / `cmt-v1` placeholder for both
+the whitelist and the blacklist predicates. The reason is covenant feasibility: a depth-256 sparse
 Merkle tree costs 256 hash levels per proof inside the Simplicity program, and
 the verifier already scans up to seven outputs. A dense tree of depth 16 costs
 16 levels, which is what actually fits the Simplicity budget (see STATUS.md for
 the measured numbers).
 
-The tree is **sorted**, which is what makes non-membership provable by
-adjacency later without changing the format. Nothing in this version enforces
-non-membership on-chain; the ordering is specified now so that adding the
-blacklist predicate is a program change, not a format change.
+The tree is **sorted**, which is what makes non-membership provable. Two leaf
+domains share the same node hashing and depth:
+
+- **key leaves** (`0x00`), used by the whitelist, prove membership of a key;
+- **interval leaves** (`0x02`), used by the blacklist, prove *non*-membership of
+  a key by exhibiting the gap that contains it (section 7).
+
+Both predicates are enforced in-covenant.
 
 ## 1. Parameters
 
@@ -53,9 +58,15 @@ job, and keeping it a bare SHA-256 is what the `sha_256_ctx_8_*` jets compute
 most cheaply.
 
 ```
-leaf(key)        = SHA256( 0x00 || key )                    (33 bytes hashed)
-node(left,right) = SHA256( 0x01 || left || right )          (65 bytes hashed)
+leaf(key)         = SHA256( 0x00 || key )                   (33 bytes hashed)
+node(left,right)  = SHA256( 0x01 || left || right )         (65 bytes hashed)
+interval(lo,hi)   = SHA256( 0x02 || lo || hi )              (65 bytes hashed)
 ```
+
+The domain byte is what keeps the two leaf kinds apart: a whitelist membership
+proof can never be replayed as a blacklist non-membership proof, or the other
+way round, even if the two roots were somehow equal. Both implementations assert
+this.
 
 `node` is **positional**: it does NOT sort its children. (Contrast the taproot
 `TapBranch/elements` hash used for the covenant tree itself, which does sort.)
@@ -145,17 +156,71 @@ Note the slots: sorting is on the key bytes, so carol precedes bob. A mirror
 that sorts on anything else (insertion order, hex string of the display form)
 will produce a different root and every proof will fail at consensus.
 
-## 7. Non-membership (specified, not yet enforced)
+## 7. The blacklist tree: non-membership by interval
 
-An adjacency proof for a key `x` absent from the tree is: the two keys `l` and
-`r` occupying adjacent slots `s` and `s+1` with `l < x < r`, plus a membership
-proof for each. Because the guards bracket the range, such a pair always exists
-for any `x` not in the tree. The covenant would check `l < x`, `x < r`,
-`slot(r) == slot(s) + 1`, and both membership proofs.
+The blacklist is a second dmt-v1 tree, at the same depth, whose leaves are the
+**gaps between** listed keys rather than the keys themselves. Listing
+`k_1 < ... < k_n` (sorted, unique, neither guard) produces exactly `n+1` interval
+leaves, in this slot order:
 
-This is **not implemented in the covenant** in this version, and no blacklist
-root is committed in pi — see STATUS.md, degradation (a). The format above is
-fixed so that enabling it later does not invalidate published snapshots.
+```
+slot 0        = interval(GUARD_LO, k_1)
+slot i        = interval(k_i, k_{i+1})        for 1 <= i <= n-1
+slot n        = interval(k_n, GUARD_HI)
+slot n+1 ..   = interval(GUARD_HI, GUARD_HI)  (padding)
+```
+
+An empty blacklist is the single leaf `interval(GUARD_LO, GUARD_HI)`.
+
+**Non-membership proof** of a key `k`: the covering interval `(lo, hi)` plus a
+16-level membership proof of its leaf, encoded exactly as in section 5.
+Verification is
+
+```
+require lo < k              (strict, unsigned bytewise)
+require k  < hi             (strict)
+fold the 16 levels starting from interval(lo, hi) and require the root
+```
+
+**Why this and not an adjacency proof over slot indices.** The obvious
+construction — prove two membership leaves and show their slots are consecutive
+— needs the proof *index* reconstructed and incremented inside the covenant. A
+dense tree gives no cheap handle on that (the index lives only as a 16-bit
+direction bitmap, and SimplicityHL's folds do not expose the loop counter), and
+it costs two folds instead of one. Carrying adjacency inside the leaf makes
+non-membership a single ordinary membership proof: measured at 928 WU per
+regulated input against roughly double for the alternative.
+
+**Why a listed key cannot be proven absent.** A listed key is an interval
+*endpoint*, and both comparisons are strict. The interval below `k_i` ends at
+`k_i` (so `k < hi` fails) and the one above starts at `k_i` (so `lo < k` fails).
+No other leaf contains it, and forging one is a Merkle forgery. That is the
+freeze.
+
+**Why the padding is inert.** `interval(GUARD_HI, GUARD_HI)` really is in the
+tree and really has a valid path, but `GUARD_HI < k < GUARD_HI` is unsatisfiable,
+so it authorises nothing.
+
+### The outpoint policy key
+
+```
+k_out = SHA256( txid || BE32(vout) )
+```
+
+`txid` is in **internal (consensus) byte order** — the bytes the
+`input_prev_outpoint` jet yields — not the reversed order txids are displayed
+in. `BE32` is the 4-byte big-endian index, which is what `sha_256_ctx_8_add_4`
+writes. Getting either wrong produces proofs that verify off-chain and fail at
+consensus.
+
+Golden vectors, agreed by the Rust implementation, the Go mirror and an
+independent Python recomputation:
+
+```
+interval(GUARD_LO, GUARD_HI) = 1fd8164b6e61192e120f01ca504c786a6e193abe0265104c1303a9b1e09afc39
+interval(GUARD_HI, GUARD_HI) = 507647244d0d51f754f23c5f23c4f9e6a84eeabd0524bd20fe2d932f539be8d4
+root(empty blacklist)        = 009a25ef01f6cade2d114b8315aab47bf5599e3a1386c2f1d414f0e8d6dbf301
+```
 
 ## 8. Versioning
 

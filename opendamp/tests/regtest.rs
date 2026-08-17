@@ -8,13 +8,21 @@
 //! /home/aejkohl/Sequentia/src/sequentiad, else src/elementsd. The matching
 //! *-cli binary must sit next to it.
 //!
-//! Proves, in order, printing every txid:
+//! Proves, printing every txid:
 //!   1. issue A and V, fund C_U(alice) and C_V(pi0 = whitelist {alice,bob})
 //!   2. alice -> bob transfer with no third party: builds, broadcasts, confirms
 //!   3. confinement refusal: A to a plain address is rejected by the node
-//!   4. whitelist refusal: carol fails locally; a forged proof is rejected by the node
+//!   4. recipient whitelist: carol has no proof; a reused proof is rejected;
+//!      and the policy version is bound into the verifier address
 //!   5. issuer update to pi1 (adds carol), then alice -> carol succeeds
+//!   7. THE FREEZE: an update removing alice stops alice SPENDING - her stale
+//!      proof cannot be pruned and its unpruned form is refused, claiming bob's
+//!      whitelisted identity for her input is refused, bob is unaffected, and a
+//!      further update restores her
+//!   8. BLACKLIST: an update listing one of alice's outpoints stops that UTXO
+//!      alone, and lifting the listing frees it again
 //!   6. halt: V to a plain address; afterwards no transfer can satisfy input 0
+//!      (last, because it ends every transfer)
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -26,7 +34,7 @@ use opendamp::elements::pset::serialize::Serialize;
 use opendamp::elements::{AssetId, BlockHash, OutPoint, Script, Txid};
 use opendamp::hexutil::hex;
 use opendamp::net::Net;
-use opendamp::programs::{self, AssetParams, SlotWitness};
+use opendamp::programs::{self, AssetParams};
 use opendamp::txbuild::{
     attach_simplicity, attach_verifier, build_transfer, complete_issuer_op, complete_transfer, covenant_env,
     p2tr_keypath_spk, sig_all_digest, sign_bip340, sign_fee_input, Ctx, IssuerReq, TransferReq,
@@ -242,11 +250,12 @@ fn splice_verifier(
     net: &Net,
     ctx: &Ctx,
     good: &TransferReq,
+    good_sender_sk: &[u8; 32],
     bad: &TransferReq,
     sender_sk: &[u8; 32],
     fee_sk: &[u8; 32],
 ) -> opendamp::elements::Transaction {
-    let (good_tx, _) = complete_transfer(ctx, good, sender_sk, fee_sk, true)
+    let (good_tx, _) = complete_transfer(ctx, good, good_sender_sk, fee_sk, true)
         .expect("the good-shape transfer must validate");
 
     let built = build_transfer(ctx, bad).expect("bad skeleton builds");
@@ -265,7 +274,84 @@ fn splice_verifier(
     tx
 }
 
+/// Attach a verifier witness that the covenant does NOT accept, without
+/// pruning.
+///
+/// This is the whole remaining option open to a spender whose policy proof is
+/// bad, and the reason it is worth testing: `satisfy_with_env(.., Some(env))`
+/// prunes, pruning replays the program, and a failing check makes pruning
+/// itself fail (asserted in `bad_witness_cannot_be_pruned`). So a bad proof
+/// cannot be turned into a pruned program at all, and the only submittable form
+/// still carries its FAIL nodes - which consensus refuses outright. Both doors
+/// are therefore shut, and this exercises the second one against the node.
+fn attach_unpruned_verifier(
+    net: &Net,
+    ctx: &Ctx,
+    req: &TransferReq,
+    slots: &opendamp::txbuild::VerifierSlots,
+    sender_sk: &[u8; 32],
+    fee_sk: &[u8; 32],
+) -> opendamp::elements::Transaction {
+    let built = build_transfer(ctx, req).expect("skeleton builds");
+    let mut tx = built.tx.clone();
+    let (_, u_cb) = opendamp::tapscript::cu_spend_info(ctx.u_cmr(), &req.sender);
+    for idx in &built.user_inputs {
+        let env = covenant_env(net, &built.tx, &built.prevouts, *idx, ctx.u_cmr(), u_cb.clone());
+        let digest = sig_all_digest(&env);
+        let (sig, _) = sign_bip340(sender_sk, &digest).unwrap();
+        let w = programs::user_witness(&req.sender, &sig).unwrap();
+        // U enforces custody, not policy, so the owner's own input still passes.
+        attach_simplicity(&mut tx, *idx, &ctx.user, w, Some(&env), &u_cb)
+            .expect("U is satisfied regardless of policy");
+    }
+    let (_, p_cb, _) = cv_spend_info(ctx.p_cmr(), ctx.g_cmr());
+    attach_verifier(&mut tx, &ctx.verifier, slots, None, &p_cb)
+        .expect("assembles unpruned");
+    sign_fee_input(net, &mut tx, &built.prevouts, built.fee_input, fee_sk).unwrap();
+    tx
+}
+
+/// Slots carrying a STALE membership proof: the realistic attempt by a holder
+/// who was removed from the whitelist and still has the proof that worked under
+/// the previous policy version.
+fn stale_slots(
+    frozen_ctx: &Ctx,
+    stale_ctx: &Ctx,
+    built: &opendamp::txbuild::BuiltTransfer,
+) -> opendamp::txbuild::VerifierSlots {
+    let mut slots = opendamp::txbuild::VerifierSlots::default();
+    for (out_idx, owner) in &built.a_outputs {
+        let proof = stale_ctx
+            .wl_tree
+            .prove(&owner.serialize())
+            .or_else(|| frozen_ctx.wl_tree.prove(&owner.serialize()))
+            .expect("recipient is provable under one of the two policies");
+        slots.outputs[*out_idx - 1] = Some((*owner, proof));
+    }
+    for (in_idx, owner, outpoint) in &built.a_inputs {
+        let proof = stale_ctx
+            .wl_tree
+            .prove(&owner.serialize())
+            .expect("the stale policy did include this owner");
+        let k = opendamp::txbuild::outpoint_policy_key(outpoint);
+        let interval = stale_ctx
+            .bl_tree
+            .prove_absent(&k)
+            .or_else(|| frozen_ctx.bl_tree.prove_absent(&k))
+            .expect("some policy version leaves this outpoint unlisted");
+        slots.inputs[*in_idx - 1] = Some((*owner, proof, interval));
+    }
+    slots
+}
+
 // -------------------------------------------------------------------- the test
+
+/// Chain state that every step advances: the live verifier output, each holder's
+/// regulated UTXO, and the fee stash.
+struct Utxo {
+    outpoint: OutPoint,
+    value: u64,
+}
 
 #[test]
 #[ignore = "spawns a Sequentia node; run with --ignored"]
@@ -281,17 +367,15 @@ fn regtest_end_to_end() {
     node.cli(&["createwallet", "w"]);
     let mine_addr = node.cli(&["getnewaddress"]);
     node.generate(101, &mine_addr);
-    // Pick up the genesis initialfreecoins (the wallet was created after the
-    // genesis block was connected, and block subsidy may be zero).
     node.cli(&["rescanblockchain"]);
-    let bal = node.cli(&["getbalance"]);
-    println!("wallet balance after rescan: {bal}");
 
+    // An unenforced 0xbe leaf is anyone-can-spend, so this is checked BEFORE a
+    // single covenant output is funded, not merely somewhere in the test.
     let dep = node.cli_json(&["getdeploymentinfo"]);
     assert_eq!(
         dep["deployments"]["simplicity"]["active"].as_bool(),
         Some(true),
-        "simplicity must be active on this chain"
+        "simplicity must be active before funding any covenant address"
     );
 
     let genesis = node.cli(&["getblockhash", "0"]);
@@ -306,314 +390,461 @@ fn regtest_end_to_end() {
 
     // --- 1. issue A and V
     let issue_a = node.cli_json(&[
-        "-named",
-        "issueasset",
-        "assetamount=1000",
-        "tokenamount=0",
-        "blind=false",
-        &fee_arg,
+        "-named", "issueasset", "assetamount=1000", "tokenamount=0", "blind=false", &fee_arg,
     ]);
     let asset_a = asset_from_display(issue_a["asset"].as_str().unwrap());
-    // q = 100,000 atoms of V; the whole V issuance is exactly q.
     let q: u64 = 100_000;
     let issue_v = node.cli_json(&[
-        "-named",
-        "issueasset",
-        "assetamount=0.00100000",
-        "tokenamount=0",
-        "blind=false",
-        &fee_arg,
+        "-named", "issueasset", "assetamount=0.00100000", "tokenamount=0", "blind=false", &fee_arg,
     ]);
     let asset_v = asset_from_display(issue_v["asset"].as_str().unwrap());
     node.generate(1, &mine_addr);
     println!("asset A {asset_a}");
     println!("asset V {asset_v}");
 
-    // --- keys and policy pi0 = whitelist {alice, bob}
     let (alice_sk, alice) = key(1);
-    let (_bob_sk, bob) = key(2);
+    let (bob_sk, bob) = key(2);
     let (_carol_sk, carol) = key(4);
     let (issuer_sk, issuer) = key(9);
     let (fee_sk, fee_key) = key(3);
 
-    let params = AssetParams {
-        asset_a,
-        asset_v,
-        q,
+    let params = AssetParams { asset_a, asset_v, q };
+    let ctx = |wl: &[XOnlyPublicKey], bl: &[[u8; 32]]| {
+        Ctx::new(net, params, issuer, wl, bl).expect("policy compiles")
     };
-    let ctx0 = Ctx::new(net, params, issuer, &[alice, bob]).expect("ctx0");
 
+    // pi0: whitelist {alice, bob}, empty blacklist.
+    let ctx0 = ctx(&[alice, bob], &[]);
     let cu_alice = ctx0.cu_info(&alice);
+    let cu_bob = ctx0.cu_info(&bob);
+    let cu_carol = ctx0.cu_info(&carol);
     let cv0 = ctx0.cv_info();
-    let cu_alice_addr = cu_alice.address(net.address_params).to_string();
-    let cv0_addr = cv0.address(net.address_params).to_string();
     let fee_spk = p2tr_keypath_spk(&fee_key);
     let fee_addr = opendamp::elements::Address::from_script(&fee_spk, None, net.address_params)
         .unwrap()
         .to_string();
-    println!("C_U(alice) {cu_alice_addr}");
-    println!("C_V(pi0)   {cv0_addr}");
+    println!("U CMR {}", ctx0.u_cmr());
+    println!("P CMR (pi0) {}", ctx0.p_cmr());
+    println!("G CMR {}", ctx0.g_cmr());
+    println!("C_U(alice) {}", cu_alice.address(net.address_params));
+    println!("C_V(pi0)   {}", cv0.address(net.address_params));
 
-    // --- fund C_U(alice), C_V(pi0), and the fee stash
+    // --- fund
     let a_hex = issue_a["asset"].as_str().unwrap();
     let v_hex = issue_v["asset"].as_str().unwrap();
+    let cu_alice_addr = cu_alice.address(net.address_params).to_string();
+    let cv0_addr = cv0.address(net.address_params).to_string();
     let fund_a = node.cli(&[
-        "-named",
-        "sendtoaddress",
-        &format!("address={cu_alice_addr}"),
-        "amount=5.0",
-        &format!("assetlabel={a_hex}"),
-        &fee_label_arg,
+        "-named", "sendtoaddress", &format!("address={cu_alice_addr}"), "amount=5.0",
+        &format!("assetlabel={a_hex}"), &fee_label_arg,
     ]);
     let fund_v = node.cli(&[
-        "-named",
-        "sendtoaddress",
-        &format!("address={cv0_addr}"),
-        "amount=0.00100000",
-        &format!("assetlabel={v_hex}"),
-        &fee_label_arg,
+        "-named", "sendtoaddress", &format!("address={cv0_addr}"), "amount=0.00100000",
+        &format!("assetlabel={v_hex}"), &fee_label_arg,
     ]);
     let fund_fee = node.cli(&[
-        "-named",
-        "sendtoaddress",
-        &format!("address={fee_addr}"),
-        "amount=1.0",
-        &fee_label_arg,
+        "-named", "sendtoaddress", &format!("address={fee_addr}"), "amount=1.0", &fee_label_arg,
     ]);
     node.generate(1, &mine_addr);
-    println!("funded: A->C_U(alice) {fund_a}");
-    println!("        V->C_V(pi0)   {fund_v}");
-    println!("        fee stash     {fund_fee}");
+    println!("PROOF 1: funded A->C_U(alice) {fund_a}, V->C_V(pi0) {fund_v}, fee {fund_fee}");
 
-    let (alice_op, alice_atoms) = node.find_vout(&fund_a, &cu_alice.script_pubkey);
-    let (verifier_op, v_atoms) = node.find_vout(&fund_v, &cv0.script_pubkey);
+    let (op, atoms) = node.find_vout(&fund_a, &cu_alice.script_pubkey);
+    let mut alice_a = Utxo { outpoint: op, value: atoms };
+    let (op, v_atoms) = node.find_vout(&fund_v, &cv0.script_pubkey);
     assert_eq!(v_atoms, q, "verifier funding must be exactly q");
-    let (fee_op, fee_atoms) = node.find_vout(&fund_fee, &fee_spk);
-
+    let mut verifier_op = op;
+    let (op, atoms) = node.find_vout(&fund_fee, &fee_spk);
+    let mut fee = Utxo { outpoint: op, value: atoms };
     let fee_amount: u64 = 50_000;
 
-    // --- 2. transfer alice -> bob, no third party
-    let req = TransferReq {
-        sender: alice,
-        sender_utxos: vec![(alice_op, alice_atoms)],
-        recipient: bob,
-        amount: 200_000_000, // 2.0 of A
+    // A transfer request against the current chain state.
+    let make_req = |sender: XOnlyPublicKey,
+                    utxo: &Utxo,
+                    recipient: XOnlyPublicKey,
+                    amount: u64,
+                    verifier_op: OutPoint,
+                    fee: &Utxo| TransferReq {
+        sender,
+        sender_utxos: vec![(utxo.outpoint, utxo.value)],
+        recipient,
+        amount,
         verifier_outpoint: verifier_op,
-        fee_utxo: (fee_op, policy_asset, fee_atoms),
+        fee_utxo: (fee.outpoint, policy_asset, fee.value),
         fee_key,
         fee_amount,
         fee_change_spk: fee_spk.clone(),
         recipient_spk_override: None,
     };
+
+    // --- 2. alice -> bob, no third party signature
+    let req = make_req(alice, &alice_a, bob, 200_000_000, verifier_op, &fee);
     let (tx, report) = complete_transfer(&ctx0, &req, &alice_sk, &fee_sk, true)
-        .expect("transfer builds and satisfies covenants locally");
+        .expect("transfer satisfies U and P");
     println!(
-        "transfer budget: verifier witness {} B ({} B pad), cost {} milli-WU = {} WU, \
-         budget {} WU, headroom {} WU; user witnesses {:?} B",
-        report.verifier_witness,
-        report.verifier_pad,
-        report.verifier_cost,
-        report.verifier_weight(),
-        report.verifier_budget(),
+        "BUDGET: verifier witness {} B ({} B pad), cost {} milli-WU = {} WU, \
+         budget {} WU, headroom {} WU ({}%); user witnesses {:?} B; tx {} B",
+        report.verifier_witness, report.verifier_pad, report.verifier_cost,
+        report.verifier_weight(), report.verifier_budget(),
         report.verifier_budget() as i64 - report.verifier_weight() as i64,
-        report.user_witnesses,
+        (report.verifier_budget() - report.verifier_weight()) * 100 / report.verifier_budget(),
+        report.user_witnesses, tx_hex(&tx).len() / 2,
     );
-    let txid2 = node.cli(&["sendrawtransaction", &tx_hex(&tx)]);
+    let txid = node.cli(&["sendrawtransaction", &tx_hex(&tx)]);
     node.generate(1, &mine_addr);
-    let conf = node.cli_json(&["getrawtransaction", &txid2, "1"]);
-    assert!(conf["blockhash"].as_str().is_some(), "transfer confirmed");
-    println!("PROOF 2: alice->bob transfer confirmed: {txid2}");
+    assert!(
+        node.cli_json(&["getrawtransaction", &txid, "1"])["blockhash"].as_str().is_some(),
+        "transfer must confirm"
+    );
+    println!("PROOF 2: alice->bob transfer, no third party: {txid}");
 
-    // Chain state moved: new verifier outpoint and alice's change.
-    let verifier_op2 = OutPoint::new(Txid::from_str(&txid2).unwrap(), 0);
-    let (alice_change_op, alice_change_atoms) = node.find_vout(&txid2, &cu_alice.script_pubkey);
-    let (fee_op2, fee_atoms2) = node.find_vout(&txid2, &fee_spk);
+    verifier_op = OutPoint::new(Txid::from_str(&txid).unwrap(), 0);
+    let (o, v) = node.find_vout(&txid, &cu_alice.script_pubkey);
+    alice_a = Utxo { outpoint: o, value: v };
+    let (o, v) = node.find_vout(&txid, &cu_bob.script_pubkey);
+    let bob_a = Utxo { outpoint: o, value: v };
+    let (o, v) = node.find_vout(&txid, &fee_spk);
+    fee = Utxo { outpoint: o, value: v };
 
-    // --- 3. confinement refusal: A to a plain address
-    //
-    // A transaction the covenant rejects cannot be pruned (pruning needs a
-    // successful run) and an UNpruned Simplicity program is refused for
-    // containing FAIL nodes, which would prove nothing about the rule. So the
-    // verifier's witness is taken from a well-formed spend of the same shape
-    // and spliced in: P(pi) has no signature and no tx-dependent witness data,
-    // so a spliced witness is exactly "a valid, FAIL-free P(pi) run against
-    // this transaction". The user input is signed for the bad transaction and
-    // passes on its own (U checks custody, not confinement), so the only check
-    // that can fail is the verifier's output scan.
-    let plain_spk = p2tr_keypath_spk(&bob);
-    let ctx1 = Ctx::new(net, params, issuer, &[alice, bob, carol]).expect("ctx1");
-    let good_shape = TransferReq {
-        sender: alice,
-        sender_utxos: vec![(alice_change_op, alice_change_atoms)],
-        recipient: bob,
-        amount: 100_000_000,
-        verifier_outpoint: verifier_op2,
-        fee_utxo: (fee_op2, policy_asset, fee_atoms2),
-        fee_key,
-        fee_amount,
-        fee_change_spk: fee_spk.clone(),
-        recipient_spk_override: None,
-    };
+    // --- 3. confinement: A to a plain address
+    let good = make_req(alice, &alice_a, bob, 100_000_000, verifier_op, &fee);
     let bad = TransferReq {
-        recipient_spk_override: Some(plain_spk.clone()),
-        ..clone_req(&good_shape)
+        recipient_spk_override: Some(p2tr_keypath_spk(&bob)),
+        ..clone_req(&good)
     };
-    // Locally the verifier refuses outright.
     let local = complete_transfer(&ctx0, &bad, &alice_sk, &fee_sk, true);
-    assert!(local.is_err(), "confinement violation must fail locally");
     println!(
         "PROOF 3a: builder/BitMachine refuses an unconfined A output: {}",
         local.err().map(|e| e.to_string()).unwrap_or_default()
     );
-
-    let bad_tx = splice_verifier(&node, &net, &ctx0, &good_shape, &bad, &alice_sk, &fee_sk);
+    let bad_tx = splice_verifier(&node, &net, &ctx0, &good, &alice_sk, &bad, &alice_sk, &fee_sk);
     let reason = reject_reason(&node, &bad_tx);
     println!("PROOF 3b: node rejects the unconfined A output: {reason}");
-    assert!(
-        reason.contains("Assertion failed") || reason.contains("Jet failed"),
-        "the node must fail the confinement assertion, not something incidental: {reason}"
-    );
+    assert!(reason.contains("Assertion failed"), "must fail the confinement assertion: {reason}");
 
-    // --- 4. whitelist refusal for carol
-    let to_carol = TransferReq {
-        recipient: carol,
-        ..clone_req(&good_shape)
-    };
-    let local = complete_transfer(&ctx0, &to_carol, &alice_sk, &fee_sk, true);
-    let local_err = local.err().map(|e| e.to_string()).unwrap_or_default();
-    assert!(
-        local_err.contains("not in the whitelist"),
-        "builder must refuse carol: {local_err}"
-    );
-    println!("PROOF 4a: builder refuses carol (no proof exists under pi0): {local_err}");
+    // --- 4. RECIPIENT whitelist
+    let to_carol = TransferReq { recipient: carol, ..clone_req(&good) };
+    let err = complete_transfer(&ctx0, &to_carol, &alice_sk, &fee_sk, true)
+        .err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(err.contains("not in the whitelist"), "builder must refuse carol: {err}");
+    println!("PROOF 4a: builder refuses carol as recipient (no proof exists under pi0): {err}");
 
-    // 4b. The attack that matters: reuse bob's genuine membership proof to pay
-    // carol. The proof is bound to the output script (the covenant recomputes
-    // C_U(Y) from the SAME witness key it proves membership for), so this is a
-    // consensus failure, not a builder policy.
-    let bad_tx = splice_verifier(&node, &net, &ctx0, &good_shape, &to_carol, &alice_sk, &fee_sk);
+    let bad_tx = splice_verifier(&node, &net, &ctx0, &good, &alice_sk, &to_carol, &alice_sk, &fee_sk);
     let reason = reject_reason(&node, &bad_tx);
     println!("PROOF 4b: node rejects bob's proof reused to pay carol: {reason}");
-    assert!(
-        reason.contains("Assertion failed") || reason.contains("Jet failed"),
-        "must fail the recipient/proof binding: {reason}"
-    );
+    assert!(reason.contains("Assertion failed"), "must fail recipient binding: {reason}");
 
-    // 4c. And the policy version is bound into the address: P(pi1) cannot spend
-    // C_V(pi0), because pi1's whitelist root changes P's CMR and therefore the
-    // taproot output key.
+    // --- 5. issuer update pi0 -> pi1 (adds carol), then alice -> carol
+    let ctx1 = ctx(&[alice, bob, carol], &[]);
+    assert_ne!(ctx0.cv_info().script_pubkey, ctx1.cv_info().script_pubkey);
+    let upd = IssuerReq {
+        verifier_outpoint: verifier_op,
+        halt_spk: None,
+        fee_utxo: (fee.outpoint, policy_asset, fee.value),
+        fee_key,
+        fee_amount,
+        fee_change_spk: fee_spk.clone(),
+    };
+    let tx = complete_issuer_op(&ctx0, Some(&ctx1), &upd, &issuer_sk, &fee_sk).expect("update");
+    let txid = node.cli(&["sendrawtransaction", &tx_hex(&tx)]);
+    node.generate(1, &mine_addr);
+    println!("PROOF 5a: issuer update pi0->pi1 (adds carol): {txid}");
+    verifier_op = OutPoint::new(Txid::from_str(&txid).unwrap(), 0);
+    let (o, v) = node.find_vout(&txid, &fee_spk);
+    fee = Utxo { outpoint: o, value: v };
+
+    // 4c. The policy version is bound into the verifier ADDRESS. Take the fully
+    // valid pi1 transfer and swap only input 0's Simplicity program (and its
+    // CMR) for P(pi0)'s. Nothing else changes - same control block, same
+    // signatures - so the sole defect is that the leaf no longer hashes into
+    // C_V(pi1)'s output key. The taproot commitment is checked before the
+    // program runs, so this is unambiguous.
     assert_ne!(
         ctx0.cv_info().script_pubkey,
         ctx1.cv_info().script_pubkey,
         "a policy update must move the verifier to a new address"
     );
-    let built = build_transfer(&ctx0, &to_carol).expect("skeleton builds");
-    let mut wrong_policy = built.tx.clone();
-    let (_, u_cb) = opendamp::tapscript::cu_spend_info(ctx0.u_cmr(), &alice);
-    for idx in &built.user_inputs {
-        let env = covenant_env(&net, &built.tx, &built.prevouts, *idx, ctx0.u_cmr(), u_cb.clone());
-        let digest = sig_all_digest(&env);
-        let (sig, _) = sign_bip340(&alice_sk, &digest).unwrap();
-        let w = programs::user_witness(&alice, &sig).unwrap();
-        attach_simplicity(&mut wrong_policy, *idx, &ctx0.user, w, Some(&env), &u_cb).unwrap();
-    }
-    // Carol IS a member of pi1's tree, so P(pi1) runs successfully...
-    let mut slots: [SlotWitness; 7] = Default::default();
-    for (out_idx, owner) in &built.a_outputs {
-        let proof = ctx1.wl_tree.prove(&owner.serialize()).expect("member of pi1");
-        slots[*out_idx - 1] = Some((*owner, proof));
-    }
+    let probe = make_req(alice, &alice_a, carol, 100_000_000, verifier_op, &fee);
+    let (tx, _) = complete_transfer(&ctx1, &probe, &alice_sk, &fee_sk, true)
+        .expect("alice->carol under pi1");
+
+    let built = build_transfer(&ctx1, &probe).expect("skeleton");
+    let slots = opendamp::txbuild::verifier_slots(&ctx1, &built).expect("all keys in pi1");
+    let mut swapped = tx.clone();
     let (_, p1_cb, _) = cv_spend_info(ctx1.p_cmr(), ctx1.g_cmr());
-    let p1_env = covenant_env(&net, &built.tx, &built.prevouts, 0, ctx1.p_cmr(), p1_cb.clone());
-    attach_verifier(&mut wrong_policy, &ctx1.verifier, &slots, Some(&p1_env), &p1_cb)
-        .expect("P(pi1) is satisfied by a carol payment");
-    sign_fee_input(&net, &mut wrong_policy, &built.prevouts, built.fee_input, &fee_sk).unwrap();
-    // ...but the output it is spending commits to pi0.
-    let reason = reject_reason(&node, &wrong_policy);
-    println!("PROOF 4c: node rejects P(pi1) spending C_V(pi0): {reason}");
+    // P(pi0)'s program under P(pi1)'s control block: unpruned, because P(pi0)
+    // cannot be satisfied by a payment to carol at all.
+    attach_verifier(&mut swapped, &ctx0.verifier, &slots, None, &p1_cb)
+        .expect("assembles");
+    let reason = reject_reason(&node, &swapped);
+    println!("PROOF 4c: node rejects P(pi0) spending C_V(pi1): {reason}");
     assert!(
-        reason.contains("Witness program hash mismatch"),
+        reason.contains("mismatch"),
         "the policy version must be bound into the verifier address: {reason}"
     );
 
-    // --- 5. issuer update to pi1 (whitelists carol), then alice -> carol
+    let txid = node.cli(&["sendrawtransaction", &tx_hex(&tx)]);
+    node.generate(1, &mine_addr);
+    println!("PROOF 5b: alice->carol under pi1: {txid}");
+    verifier_op = OutPoint::new(Txid::from_str(&txid).unwrap(), 0);
+    let (o, v) = node.find_vout(&txid, &cu_alice.script_pubkey);
+    alice_a = Utxo { outpoint: o, value: v };
+    let (o, v) = node.find_vout(&txid, &fee_spk);
+    fee = Utxo { outpoint: o, value: v };
+    let _ = node.find_vout(&txid, &cu_carol.script_pubkey);
+
+    // ================= 7. THE FREEZE: remove the SPENDER from the whitelist
+    let ctx2 = ctx(&[bob, carol], &[]); // alice removed
     let upd = IssuerReq {
-        verifier_outpoint: verifier_op2,
+        verifier_outpoint: verifier_op,
         halt_spk: None,
-        fee_utxo: (fee_op2, policy_asset, fee_atoms2),
+        fee_utxo: (fee.outpoint, policy_asset, fee.value),
         fee_key,
         fee_amount,
         fee_change_spk: fee_spk.clone(),
     };
-    let upd_tx =
-        complete_issuer_op(&ctx0, Some(&ctx1), &upd, &issuer_sk, &fee_sk).expect("issuer update");
-    let txid5 = node.cli(&["sendrawtransaction", &tx_hex(&upd_tx)]);
+    let tx = complete_issuer_op(&ctx1, Some(&ctx2), &upd, &issuer_sk, &fee_sk).expect("freeze");
+    let txid = node.cli(&["sendrawtransaction", &tx_hex(&tx)]);
     node.generate(1, &mine_addr);
-    println!("PROOF 5a: issuer policy update pi0->pi1 confirmed: {txid5}");
+    println!("PROOF 7a: issuer update pi1->pi2 REMOVING alice (the freeze): {txid}");
+    verifier_op = OutPoint::new(Txid::from_str(&txid).unwrap(), 0);
+    let (o, v) = node.find_vout(&txid, &fee_spk);
+    fee = Utxo { outpoint: o, value: v };
 
-    let verifier_op3 = OutPoint::new(Txid::from_str(&txid5).unwrap(), 0);
-    let (fee_op3, fee_atoms3) = node.find_vout(&txid5, &fee_spk);
-    let to_carol_now = TransferReq {
-        sender: alice,
-        sender_utxos: vec![(alice_change_op, alice_change_atoms)],
-        recipient: carol,
-        amount: 100_000_000,
-        verifier_outpoint: verifier_op3,
-        fee_utxo: (fee_op3, policy_asset, fee_atoms3),
+    // Alice tries to spend her own coins. She is the owner, she signs correctly,
+    // and the recipient is whitelisted - only she is not.
+    let frozen = make_req(alice, &alice_a, carol, alice_a.value, verifier_op, &fee);
+    let err = complete_transfer(&ctx2, &frozen, &alice_sk, &fee_sk, true)
+        .err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(
+        err.contains("frozen") || err.contains("not in the whitelist"),
+        "the builder must refuse a frozen owner: {err}"
+    );
+    println!("PROOF 7b: alice cannot spend - no owner proof exists under pi2: {err}");
+
+    // Her stale proof from pi1 is the realistic attempt. It cannot be pruned...
+    let built = build_transfer(&ctx2, &frozen).expect("skeleton");
+    let stale = stale_slots(&ctx2, &ctx1, &built);
+    let (_, p_cb, _) = cv_spend_info(ctx2.p_cmr(), ctx2.g_cmr());
+    let p_env = covenant_env(&net, &built.tx, &built.prevouts, 0, ctx2.p_cmr(), p_cb.clone());
+    let mut probe_tx = built.tx.clone();
+    let pruned = attach_verifier(&mut probe_tx, &ctx2.verifier, &stale, Some(&p_env), &p_cb);
+    assert!(pruned.is_err(), "a stale proof must not satisfy the new whitelist root");
+    println!(
+        "PROOF 7c: alice's stale pi1 proof fails the pi2 whitelist fold: {}",
+        pruned.err().unwrap()
+    );
+
+    // ...so the only submittable form keeps its FAIL nodes, and the node
+    // refuses that outright. Both doors shut.
+    let unpruned = attach_unpruned_verifier(&net, &ctx2, &frozen, &stale, &alice_sk, &fee_sk);
+    let reason = reject_reason(&node, &unpruned);
+    println!("PROOF 7d: node rejects the only submittable form of it: {reason}");
+    assert!(reason.contains("FAIL node"), "expected a FAIL-node refusal: {reason}");
+
+    // And claiming to be a whitelisted owner does not work either: the owner key
+    // is bound to the input's script. Bob's spend of his own coin is valid under
+    // pi2 and has the identical shape, so its verifier witness splices cleanly.
+    let bobs_good = make_req(bob, &bob_a, carol, bob_a.value, verifier_op, &fee);
+    let alices_bad = make_req(alice, &alice_a, carol, alice_a.value, verifier_op, &fee);
+    let bad_tx = splice_verifier(&node, &net, &ctx2, &bobs_good, &bob_sk, &alices_bad, &alice_sk, &fee_sk);
+    let reason = reject_reason(&node, &bad_tx);
+    println!("PROOF 7e: node rejects bob's whitelisted identity used for alice's input: {reason}");
+    assert!(reason.contains("Assertion failed"), "must fail the owner binding: {reason}");
+
+    // Bob, who is still whitelisted, is unaffected by alice's freeze.
+    let (tx, _) = complete_transfer(&ctx2, &bobs_good, &bob_sk, &fee_sk, true)
+        .expect("bob is not frozen");
+    let txid = node.cli(&["sendrawtransaction", &tx_hex(&tx)]);
+    node.generate(1, &mine_addr);
+    println!("PROOF 7f: bob still spends under pi2 - the freeze is per holder: {txid}");
+    verifier_op = OutPoint::new(Txid::from_str(&txid).unwrap(), 0);
+    let (o, v) = node.find_vout(&txid, &fee_spk);
+    fee = Utxo { outpoint: o, value: v };
+
+    // Lift the freeze.
+    let ctx3 = ctx(&[alice, bob, carol], &[]);
+    let upd = IssuerReq {
+        verifier_outpoint: verifier_op,
+        halt_spk: None,
+        fee_utxo: (fee.outpoint, policy_asset, fee.value),
         fee_key,
         fee_amount,
         fee_change_spk: fee_spk.clone(),
-        recipient_spk_override: None,
     };
-    let (tx5, _) = complete_transfer(&ctx1, &to_carol_now, &alice_sk, &fee_sk, true)
-        .expect("alice->carol under pi1");
-    let txid5b = node.cli(&["sendrawtransaction", &tx_hex(&tx5)]);
+    let tx = complete_issuer_op(&ctx2, Some(&ctx3), &upd, &issuer_sk, &fee_sk).expect("unfreeze");
+    let txid = node.cli(&["sendrawtransaction", &tx_hex(&tx)]);
     node.generate(1, &mine_addr);
-    println!("PROOF 5b: alice->carol transfer under pi1 confirmed: {txid5b}");
+    println!("PROOF 7g: issuer update pi2->pi3 restoring alice: {txid}");
+    verifier_op = OutPoint::new(Txid::from_str(&txid).unwrap(), 0);
+    let (o, v) = node.find_vout(&txid, &fee_spk);
+    fee = Utxo { outpoint: o, value: v };
 
-    let verifier_op4 = OutPoint::new(Txid::from_str(&txid5b).unwrap(), 0);
-    let (fee_op4, fee_atoms4) = node.find_vout(&txid5b, &fee_spk);
-    let (alice_change_op2, alice_change_atoms2) = node.find_vout(&txid5b, &cu_alice.script_pubkey);
+    let thawed = make_req(alice, &alice_a, carol, 50_000_000, verifier_op, &fee);
+    let (tx, _) = complete_transfer(&ctx3, &thawed, &alice_sk, &fee_sk, true)
+        .expect("alice spends again once re-whitelisted");
+    let txid = node.cli(&["sendrawtransaction", &tx_hex(&tx)]);
+    node.generate(1, &mine_addr);
+    println!("PROOF 7h: alice spends again under pi3 - the freeze is reversible: {txid}");
+    verifier_op = OutPoint::new(Txid::from_str(&txid).unwrap(), 0);
+    let (o, v) = node.find_vout(&txid, &cu_alice.script_pubkey);
+    alice_a = Utxo { outpoint: o, value: v };
+    let (o, v) = node.find_vout(&txid, &fee_spk);
+    fee = Utxo { outpoint: o, value: v };
 
-    // --- 6. halt: V leaves the covenant; transfers stop
+    // ================= 8. BLACKLIST BY OUTPOINT: freeze one UTXO, not a holder
+    let frozen_key = opendamp::txbuild::outpoint_policy_key(&alice_a.outpoint);
+    let ctx4 = ctx(&[alice, bob, carol], &[frozen_key]);
+    println!(
+        "blacklisting outpoint {} (policy key {})",
+        alice_a.outpoint,
+        hex(&frozen_key)
+    );
+    let upd = IssuerReq {
+        verifier_outpoint: verifier_op,
+        halt_spk: None,
+        fee_utxo: (fee.outpoint, policy_asset, fee.value),
+        fee_key,
+        fee_amount,
+        fee_change_spk: fee_spk.clone(),
+    };
+    let tx = complete_issuer_op(&ctx3, Some(&ctx4), &upd, &issuer_sk, &fee_sk).expect("blacklist");
+    let txid = node.cli(&["sendrawtransaction", &tx_hex(&tx)]);
+    node.generate(1, &mine_addr);
+    println!("PROOF 8a: issuer update pi3->pi4 blacklisting alice's outpoint: {txid}");
+    verifier_op = OutPoint::new(Txid::from_str(&txid).unwrap(), 0);
+    let (o, v) = node.find_vout(&txid, &fee_spk);
+    fee = Utxo { outpoint: o, value: v };
+
+    let listed = make_req(alice, &alice_a, carol, 10_000_000, verifier_op, &fee);
+    let err = complete_transfer(&ctx4, &listed, &alice_sk, &fee_sk, true)
+        .err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(
+        err.contains("blacklisted"),
+        "the builder must refuse a listed outpoint: {err}"
+    );
+    println!("PROOF 8b: alice cannot spend the listed outpoint - no interval covers it: {err}");
+
+    // The pre-blacklist interval proof is stale in exactly the same way.
+    let built = build_transfer(&ctx4, &listed).expect("skeleton");
+    let stale = stale_slots(&ctx4, &ctx3, &built);
+    let (_, p_cb, _) = cv_spend_info(ctx4.p_cmr(), ctx4.g_cmr());
+    let p_env = covenant_env(&net, &built.tx, &built.prevouts, 0, ctx4.p_cmr(), p_cb.clone());
+    let mut probe_tx = built.tx.clone();
+    let pruned = attach_verifier(&mut probe_tx, &ctx4.verifier, &stale, Some(&p_env), &p_cb);
+    assert!(pruned.is_err(), "a stale interval proof must not satisfy the new blacklist root");
+    println!(
+        "PROOF 8c: the pre-freeze interval proof fails the pi4 blacklist root: {}",
+        pruned.err().unwrap()
+    );
+    let unpruned = attach_unpruned_verifier(&net, &ctx4, &listed, &stale, &alice_sk, &fee_sk);
+    let reason = reject_reason(&node, &unpruned);
+    println!("PROOF 8d: node rejects the only submittable form of it: {reason}");
+    assert!(reason.contains("FAIL node"), "expected a FAIL-node refusal: {reason}");
+
+    // Lift the outpoint freeze; the very same UTXO moves again.
+    let ctx5 = ctx(&[alice, bob, carol], &[]);
+    let upd = IssuerReq {
+        verifier_outpoint: verifier_op,
+        halt_spk: None,
+        fee_utxo: (fee.outpoint, policy_asset, fee.value),
+        fee_key,
+        fee_amount,
+        fee_change_spk: fee_spk.clone(),
+    };
+    let tx = complete_issuer_op(&ctx4, Some(&ctx5), &upd, &issuer_sk, &fee_sk).expect("unlist");
+    let txid = node.cli(&["sendrawtransaction", &tx_hex(&tx)]);
+    node.generate(1, &mine_addr);
+    println!("PROOF 8e: issuer update pi4->pi5 lifting the outpoint freeze: {txid}");
+    verifier_op = OutPoint::new(Txid::from_str(&txid).unwrap(), 0);
+    let (o, v) = node.find_vout(&txid, &fee_spk);
+    fee = Utxo { outpoint: o, value: v };
+
+    let unlisted = make_req(alice, &alice_a, carol, 10_000_000, verifier_op, &fee);
+    let (tx, _) = complete_transfer(&ctx5, &unlisted, &alice_sk, &fee_sk, true)
+        .expect("the unlisted outpoint spends");
+    let txid = node.cli(&["sendrawtransaction", &tx_hex(&tx)]);
+    node.generate(1, &mine_addr);
+    println!("PROOF 8f: the same outpoint spends once unlisted: {txid}");
+    verifier_op = OutPoint::new(Txid::from_str(&txid).unwrap(), 0);
+    let (o, v) = node.find_vout(&txid, &cu_alice.script_pubkey);
+    alice_a = Utxo { outpoint: o, value: v };
+    let (o, v) = node.find_vout(&txid, &fee_spk);
+    fee = Utxo { outpoint: o, value: v };
+
+    // ================= 6. HALT (last: it ends all transfers)
     let halt = IssuerReq {
-        verifier_outpoint: verifier_op4,
-        halt_spk: Some(plain_spk.clone()),
-        fee_utxo: (fee_op4, policy_asset, fee_atoms4),
+        verifier_outpoint: verifier_op,
+        halt_spk: Some(p2tr_keypath_spk(&bob)),
+        fee_utxo: (fee.outpoint, policy_asset, fee.value),
         fee_key,
         fee_amount,
         fee_change_spk: fee_spk.clone(),
     };
-    let halt_tx = complete_issuer_op(&ctx1, None, &halt, &issuer_sk, &fee_sk).expect("halt");
-    let txid6 = node.cli(&["sendrawtransaction", &tx_hex(&halt_tx)]);
+    let tx = complete_issuer_op(&ctx5, None, &halt, &issuer_sk, &fee_sk).expect("halt");
+    let txid = node.cli(&["sendrawtransaction", &tx_hex(&tx)]);
     node.generate(1, &mine_addr);
-    println!("PROOF 6a: halt confirmed (V now at a plain address): {txid6}");
+    println!("PROOF 6a: halt - V leaves the covenant: {txid}");
+    let halted_op = OutPoint::new(Txid::from_str(&txid).unwrap(), 0);
+    let (o, v) = node.find_vout(&txid, &fee_spk);
+    fee = Utxo { outpoint: o, value: v };
 
-    // A transfer pointing at the halted outpoint cannot satisfy input 0: the
-    // UTXO is no longer C_V, so the Simplicity witness fails outright.
-    let halted_op = OutPoint::new(Txid::from_str(&txid6).unwrap(), 0);
-    let (fee_op5, fee_atoms5) = node.find_vout(&txid6, &fee_spk);
-    let post_halt = TransferReq {
-        sender: alice,
-        sender_utxos: vec![(alice_change_op2, alice_change_atoms2)],
-        recipient: bob,
-        amount: 50_000_000,
-        verifier_outpoint: halted_op,
-        fee_utxo: (fee_op5, policy_asset, fee_atoms5),
-        fee_key,
-        fee_amount,
-        fee_change_spk: fee_spk.clone(),
-        recipient_spk_override: None,
-    };
-    let (tx6, _) = complete_transfer(&ctx1, &post_halt, &alice_sk, &fee_sk, false)
+    let post = make_req(alice, &alice_a, carol, 10_000_000, halted_op, &fee);
+    let (tx, _) = complete_transfer(&ctx5, &post, &alice_sk, &fee_sk, false)
         .expect("assembles unvalidated");
-    let accept = node.cli_json(&[
-        "testmempoolaccept",
-        &format!("[\"{}\"]", tx_hex(&tx6)),
-    ]);
-    assert_eq!(accept[0]["allowed"].as_bool(), Some(false));
-    let reason = accept[0]["reject-reason"].as_str().unwrap_or("").to_string();
-    println!("PROOF 6b: post-halt transfer rejected by node: {reason}");
+    let reason = reject_reason(&node, &tx);
+    println!("PROOF 6b: node rejects any transfer after the halt: {reason}");
 
     println!("ALL REGTEST PROOFS COMPLETE");
+    let _ = (alice_a.value, bob_a.value, cu_carol.script_pubkey);
+}
+
+/// Pruning replays the program, so a witness the covenant rejects cannot be
+/// pruned at all. That is what closes the second door in proofs 7 and 8: with no
+/// pruned form available, the only submittable program still carries its FAIL
+/// nodes, which consensus refuses. Asserted here so the argument is tested and
+/// not merely asserted in prose.
+#[test]
+fn bad_witness_cannot_be_pruned() {
+    let (_, alice) = key(1);
+    let (_, bob) = key(2);
+    let (_, issuer) = key(9);
+    let (_, fee_key) = key(3);
+    let net = Net::regtest(BlockHash::from_str(&format!("{:064x}", 7u8)).unwrap());
+    let params = AssetParams {
+        asset_a: AssetId::from_slice(&[0xaa; 32]).unwrap(),
+        asset_v: AssetId::from_slice(&[0xbb; 32]).unwrap(),
+        q: 1000,
+    };
+    let ctx = Ctx::new(net, params, issuer, &[alice, bob], &[]).unwrap();
+    let outpoint = |b: u8, v: u32| {
+        OutPoint::new(Txid::from_str(&format!("{:064x}", b as u128)).unwrap(), v)
+    };
+    let req = TransferReq {
+        sender: alice,
+        sender_utxos: vec![(outpoint(0x11, 1), 50_000)],
+        recipient: bob,
+        amount: 20_000,
+        verifier_outpoint: outpoint(0x22, 0),
+        fee_utxo: (outpoint(0x33, 0), AssetId::from_slice(&[0xcc; 32]).unwrap(), 10_000),
+        fee_key,
+        fee_amount: 400,
+        fee_change_spk: Script::from(vec![0x51]),
+        recipient_spk_override: None,
+    };
+    let built = build_transfer(&ctx, &req).unwrap();
+    let mut slots = opendamp::txbuild::verifier_slots(&ctx, &built).unwrap();
+    // Alice's key with BOB's membership proof: the script check still passes, so
+    // only the whitelist fold can reject it.
+    let bobs_proof = ctx.wl_tree.prove(&bob.serialize()).unwrap();
+    if let Some((k, _, iv)) = slots.inputs[0].clone() {
+        slots.inputs[0] = Some((k, bobs_proof, iv));
+    }
+    let (_, p_cb, _) = cv_spend_info(ctx.p_cmr(), ctx.g_cmr());
+    let env = covenant_env(&net, &built.tx, &built.prevouts, 0, ctx.p_cmr(), p_cb.clone());
+    let mut tx = built.tx.clone();
+    let pruned = attach_verifier(&mut tx, &ctx.verifier, &slots, Some(&env), &p_cb);
+    assert!(
+        pruned.is_err(),
+        "a witness with a mismatched membership proof must not prune"
+    );
 }

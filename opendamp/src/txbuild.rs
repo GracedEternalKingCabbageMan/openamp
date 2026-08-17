@@ -27,8 +27,11 @@ use crate::programs::{
 };
 use crate::tapscript::{cu_spend_info, cv_spend_info, CovenantSpendInfo};
 
-/// Maximum outputs the verifier program scans (its N_max).
-pub const N_MAX_OUTPUTS: usize = 8;
+/// Maximum inputs and outputs the verifier program tolerates. It asserts both
+/// bounds, so a transaction exceeding either cannot be spent at all - an
+/// unscanned input or output would otherwise escape the covenant.
+pub const N_MAX_OUTPUTS: usize = programs::N_OUT_SLOTS + 1;
+pub const N_MAX_INPUTS: usize = programs::N_IN_SLOTS + 1;
 
 /// Everything derived from the per-asset constants and one policy version.
 pub struct Ctx {
@@ -36,28 +39,34 @@ pub struct Ctx {
     pub params: AssetParams,
     pub issuer_key: XOnlyPublicKey,
     pub wl_tree: dmt::Tree,
+    pub bl_tree: dmt::IntervalTree,
     pub user: CompiledProgram,
     pub verifier: CompiledProgram,
     pub issuer: CompiledProgram,
 }
 
 impl Ctx {
+    /// `bl_outpoint_keys` are the blacklisted outpoints' policy keys
+    /// (`dmt::outpoint_key`), not the outpoints themselves.
     pub fn new(
         net: Net,
         params: AssetParams,
         issuer_key: XOnlyPublicKey,
         wl_keys: &[XOnlyPublicKey],
+        bl_outpoint_keys: &[[u8; 32]],
     ) -> Result<Self, String> {
         let wl_tree = dmt::Tree::new(wl_keys.iter().map(|k| k.serialize()).collect())?;
+        let bl_tree = dmt::IntervalTree::new(bl_outpoint_keys.to_vec())?;
         let user = compile_user(&params)?;
         let u_cmr = user.commit().cmr();
-        let verifier = compile_verifier(&params, u_cmr, &wl_tree.root())?;
+        let verifier = compile_verifier(&params, u_cmr, &wl_tree.root(), &bl_tree.root())?;
         let issuer = compile_issuer(&issuer_key)?;
         Ok(Ctx {
             net,
             params,
             issuer_key,
             wl_tree,
+            bl_tree,
             user,
             verifier,
             issuer,
@@ -152,6 +161,10 @@ pub struct BuiltTransfer {
     pub a_outputs: Vec<(usize, XOnlyPublicKey)>,
     /// Input indexes of the sender's C_U inputs.
     pub user_inputs: Vec<usize>,
+    /// (input index, owner key, outpoint) for every input carrying asset A. The
+    /// verifier proves each owner is whitelisted and each outpoint unlisted, so
+    /// the builder has to know both.
+    pub a_inputs: Vec<(usize, XOnlyPublicKey, OutPoint)>,
     /// Input index of the fee UTXO.
     pub fee_input: usize,
 }
@@ -186,7 +199,9 @@ pub fn build_transfer(ctx: &Ctx, req: &TransferReq) -> Result<BuiltTransfer, Str
         cv.script_pubkey.clone(),
     )];
     let mut user_inputs = Vec::new();
+    let mut a_inputs = Vec::new();
     for (op, v) in &req.sender_utxos {
+        a_inputs.push((inputs.len(), req.sender, *op));
         user_inputs.push(inputs.len());
         inputs.push(plain_input(*op));
         prevouts.push(explicit_out(
@@ -244,9 +259,19 @@ pub fn build_transfer(ctx: &Ctx, req: &TransferReq) -> Result<BuiltTransfer, Str
         tx,
         prevouts,
         a_outputs,
+        a_inputs,
         user_inputs,
         fee_input,
     })
+}
+
+/// The blacklist policy key of an outpoint. `OutPoint`'s txid is stored in
+/// internal byte order, which is exactly what the covenant hashes.
+pub fn outpoint_policy_key(outpoint: &OutPoint) -> [u8; 32] {
+    dmt::outpoint_key(
+        &outpoint.txid.to_byte_array(),
+        outpoint.vout,
+    )
 }
 
 /// Script pubkey of a P2TR key-path output for `internal_key` (no tree).
@@ -359,11 +384,11 @@ pub fn attach_simplicity(
 pub fn attach_verifier(
     tx: &mut Transaction,
     program: &CompiledProgram,
-    slots: &[SlotWitness; 7],
+    slots: &VerifierSlots,
     env: Option<&ElementsEnv<Arc<Transaction>>>,
     control_block: &simplicityhl::elements::taproot::ControlBlock,
 ) -> Result<(usize, usize, u32), String> {
-    let witness = programs::verifier_witness(slots)?;
+    let witness = programs::verifier_witness(&slots.outputs, &slots.inputs)?;
     let node = satisfy_program(program, witness, env)?;
     let (program_bytes, witness_bytes) = node.to_vec_with_witness();
     let cmr = node.cmr();
@@ -400,18 +425,48 @@ fn cost_milliweight(cost: simplicityhl::simplicity::Cost) -> u32 {
         .unwrap_or(0)
 }
 
-/// Build the verifier witness slots for the built transfer's A outputs.
-pub fn verifier_slots(ctx: &Ctx, built: &BuiltTransfer) -> Result<[SlotWitness; 7], String> {
-    let mut slots: [SlotWitness; 7] = Default::default();
+/// The verifier's per-slot witness: recipient proofs for outputs 1..7 and owner
+/// proofs for inputs 1..7.
+#[derive(Default)]
+pub struct VerifierSlots {
+    pub outputs: [SlotWitness; programs::N_OUT_SLOTS],
+    pub inputs: [programs::InputSlotWitness; programs::N_IN_SLOTS],
+}
+
+/// Build the verifier witness slots for a transfer: every A output needs its
+/// recipient's membership proof, and every A input needs its owner's.
+pub fn verifier_slots(ctx: &Ctx, built: &BuiltTransfer) -> Result<VerifierSlots, String> {
+    let mut slots = VerifierSlots::default();
     for (out_idx, owner) in &built.a_outputs {
-        if *out_idx == 0 || *out_idx > 7 {
-            return Err(format!("A output at unsupported index {out_idx}"));
+        if *out_idx == 0 || *out_idx > programs::N_OUT_SLOTS {
+            return Err(format!(
+                "A output at index {out_idx}; the covenant scans 1..={}",
+                programs::N_OUT_SLOTS
+            ));
         }
         let proof = ctx
             .wl_tree
             .prove(&owner.serialize())
             .ok_or_else(|| format!("recipient key {owner} is not in the whitelist"))?;
-        slots[*out_idx - 1] = Some((*owner, proof));
+        slots.outputs[*out_idx - 1] = Some((*owner, proof));
+    }
+    for (in_idx, owner, outpoint) in &built.a_inputs {
+        if *in_idx == 0 || *in_idx > programs::N_IN_SLOTS {
+            return Err(format!(
+                "A input at index {in_idx}; the covenant scans 1..={} \
+                 (at most {} regulated inputs per transfer)",
+                programs::N_IN_SLOTS,
+                programs::N_IN_SLOTS - 1
+            ));
+        }
+        let proof = ctx.wl_tree.prove(&owner.serialize()).ok_or_else(|| {
+            format!("owner key {owner} is not in the whitelist: these coins are frozen")
+        })?;
+        let k = outpoint_policy_key(outpoint);
+        let interval = ctx.bl_tree.prove_absent(&k).ok_or_else(|| {
+            format!("outpoint {outpoint} is blacklisted: these coins are frozen")
+        })?;
+        slots.inputs[*in_idx - 1] = Some((*owner, proof, interval));
     }
     Ok(slots)
 }
@@ -527,11 +582,22 @@ pub fn complete_transfer(
         verifier_slots(ctx, &built)?
     } else {
         // Invalid-tx path: fill what we can, leave the rest None.
-        let mut slots: [SlotWitness; 7] = Default::default();
+        let mut slots = VerifierSlots::default();
         for (out_idx, owner) in &built.a_outputs {
-            if (1..=7).contains(out_idx) {
+            if (1..=programs::N_OUT_SLOTS).contains(out_idx) {
                 if let Some(proof) = ctx.wl_tree.prove(&owner.serialize()) {
-                    slots[*out_idx - 1] = Some((*owner, proof));
+                    slots.outputs[*out_idx - 1] = Some((*owner, proof));
+                }
+            }
+        }
+        for (in_idx, owner, outpoint) in &built.a_inputs {
+            if (1..=programs::N_IN_SLOTS).contains(in_idx) {
+                let k = outpoint_policy_key(outpoint);
+                if let (Some(proof), Some(interval)) = (
+                    ctx.wl_tree.prove(&owner.serialize()),
+                    ctx.bl_tree.prove_absent(&k),
+                ) {
+                    slots.inputs[*in_idx - 1] = Some((*owner, proof, interval));
                 }
             }
         }

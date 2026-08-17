@@ -12,7 +12,13 @@
  *      current input (script-hash equality)
  *   3. at least one input among 1..8 carries explicit asset A (that input is a
  *      C_U by the confinement induction, so a holder authorised the spend)
- *   4. num_outputs <= N_max (= 8); for every output 1..N_max-1 that exists:
+ *   3b. num_inputs <= N_max_inputs (= 4); for every input 1..3 carrying A:
+ *      - the input's script must equal C_U(X_i) for a witness-supplied X_i
+ *      - X_i must be a member of the committed whitelist (this is the FREEZE:
+ *        removing a key stops that holder spending, not merely receiving)
+ *      - the input's outpoint must NOT be in the committed blacklist, proven by
+ *        exhibiting the interval leaf that strictly contains its policy key
+ *   4. num_outputs <= N_max_outputs (= 6); for every output 1..5 that exists:
  *      - its asset id must be explicit (design doc 2.4; a fee output is
  *        explicit by definition, so this subsumes the fee carve-out)
  *      - if it carries A it must pay C_U(Y_i) for the witness-supplied
@@ -28,7 +34,8 @@
  *   ASSET_V  - u256 asset id of V (internal byte order)
  *   AMOUNT_Q - u64 verifier amount in atoms
  *   U_CMR    - u256 CMR of the user program U for this asset
- *   WL_ROOT  - u256 dmt-v1 root of the recipient whitelist (policy pi)
+ *   WL_ROOT  - u256 dmt-v1 root of the owner/recipient whitelist (policy pi)
+ *   BL_ROOT  - u256 dmt-v1 root of the outpoint blacklist, over INTERVAL leaves
  *
  * Witness: for each output index i in 1..7 a slot W<i>, present (Some) iff
  * output i carries asset A: the recipient key and its 16-level membership
@@ -103,16 +110,6 @@ fn require_explicit_amount_eq(v: Amount1, expected: u64) {
     }
 }
 
-fn input_carries_a(i: u32) -> bool {
-    match jet::input_asset(i) {
-        None => false,
-        Some(a: Asset1) => match a {
-            Left(conf: (u1, u256)) => false,
-            Right(id: ExplicitAsset) => jet::eq_256(id, param::ASSET_A),
-        },
-    }
-}
-
 fn bool_or(a: bool, b: bool) -> bool {
     match a {
         true => true,
@@ -132,6 +129,130 @@ fn check_output(i: u32, w: Option<(Pubkey, [(u256, bool); 16])>) {
                     let (y, proof): (Pubkey, [(u256, bool); 16]) = unwrap(w);
                     assert!(jet::eq_256(cu_spk_hash(y), unwrap(jet::output_script_hash(i))));
                     require_wl_member(y, proof);
+                },
+            },
+        },
+    }
+}
+
+/* Lexicographic "less than" on 256-bit values.
+ *
+ * There is no lt_256 jet (comparison jets stop at 64 bits), so it is built from
+ * four 64-bit limbs, most significant first. Comparing only a prefix would be
+ * cheaper and would also be a hole: an attacker could search for a blacklist
+ * interval agreeing with the target key on the compared prefix. The full width
+ * is compared.
+ */
+fn lt_pair_64(a_hi: u64, a_lo: u64, b_hi: u64, b_lo: u64) -> bool {
+    match jet::lt_64(a_hi, b_hi) {
+        true => true,
+        false => match jet::eq_64(a_hi, b_hi) {
+            true => jet::lt_64(a_lo, b_lo),
+            false => false,
+        },
+    }
+}
+
+fn lt_128(a: u128, b: u128) -> bool {
+    let (a_hi, a_lo): (u64, u64) = <u128>::into(a);
+    let (b_hi, b_lo): (u64, u64) = <u128>::into(b);
+    lt_pair_64(a_hi, a_lo, b_hi, b_lo)
+}
+
+fn eq_128(a: u128, b: u128) -> bool {
+    let (a_hi, a_lo): (u64, u64) = <u128>::into(a);
+    let (b_hi, b_lo): (u64, u64) = <u128>::into(b);
+    match jet::eq_64(a_hi, b_hi) {
+        true => jet::eq_64(a_lo, b_lo),
+        false => false,
+    }
+}
+
+fn lt_256(a: u256, b: u256) -> bool {
+    let (a_hi, a_lo): (u128, u128) = <u256>::into(a);
+    let (b_hi, b_lo): (u128, u128) = <u256>::into(b);
+    match lt_128(a_hi, b_hi) {
+        true => true,
+        false => match eq_128(a_hi, b_hi) {
+            true => lt_128(a_lo, b_lo),
+            false => false,
+        },
+    }
+}
+
+/* dmt-v1 INTERVAL leaf: SHA256(0x02 || lo || hi).
+ *
+ * The blacklist tree stores gaps, not keys. Listing k_1 < ... < k_n produces the
+ * n+1 intervals (GUARD_LO, k_1), (k_1, k_2), ..., (k_n, GUARD_HI), and proving
+ * an outpoint absent means exhibiting the one interval that strictly contains
+ * it. That is a single membership proof with no slot arithmetic - the adjacency
+ * an outpoint-keyed non-membership proof needs is carried inside the leaf
+ * instead of being reconstructed from proof indices, for which the dense tree
+ * offers no cheap handle. A listed key is an interval ENDPOINT and the
+ * comparisons below are strict, so no interval can cover it.
+ */
+fn bl_interval_leaf(lo: u256, hi: u256) -> u256 {
+    let ctx: Ctx8 = jet::sha_256_ctx_8_init();
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_1(ctx, 0x02);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, lo);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, hi);
+    jet::sha_256_ctx_8_finalize(ctx)
+}
+
+/* The blacklist policy key of an input's outpoint: SHA256(txid || BE32(vout)).
+ * `input_prev_outpoint` yields the txid in internal byte order, and
+ * sha_256_ctx_8_add_4 writes the index big-endian, which is the spec's BE32. */
+fn outpoint_key(i: u32) -> u256 {
+    let (txid, vout): (u256, u32) = unwrap(jet::input_prev_outpoint(i));
+    let ctx: Ctx8 = jet::sha_256_ctx_8_init();
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, txid);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_4(ctx, vout);
+    jet::sha_256_ctx_8_finalize(ctx)
+}
+
+/* Require that input i's outpoint is NOT blacklisted. */
+fn require_bl_nonmember(i: u32, lo: u256, hi: u256, proof: [(u256, bool); 16]) {
+    let k: u256 = outpoint_key(i);
+    assert!(lt_256(lo, k));
+    assert!(lt_256(k, hi));
+    let root: u256 = array_fold::<wl_step, 16>(proof, bl_interval_leaf(lo, hi));
+    assert!(jet::eq_256(root, param::BL_ROOT));
+}
+
+/* Scan one input slot in 1..N_max_inputs.
+ *
+ * Returns whether the input carried asset A, which also serves check 3 (at
+ * least one regulated input), so the old separate `input_carries_a` sweep is
+ * subsumed here rather than paid for twice.
+ *
+ * The owner key is recoverable exactly the way U recovers its own: an A input
+ * is a C_U(X) output, so the witness supplies X and the covenant recomputes
+ * C_U(X) and requires it to equal the input's actual script. That binds X to
+ * the input, and the membership proof then binds X to the whitelist. Together
+ * they make removing a key stop that holder SPENDING, not merely receiving.
+ */
+fn check_input(i: u32, w: Option<(Pubkey, [(u256, bool); 16], u256, u256, [(u256, bool); 16])>) -> bool {
+    match jet::input_asset(i) {
+        None => false, // beyond num_inputs; nothing to check
+        Some(a: Asset1) => match a {
+            // Asset ids must be explicit on every scanned input, not only on
+            // outputs. Skipping a blinded input would leave a hole exactly the
+            // size of the freeze: a coin of A behind an asset commitment would
+            // pass unchecked. The confinement induction already forbids such a
+            // UTXO existing, but relying on that here would make the freeze
+            // depend on an argument rather than on a check.
+            Left(conf: (u1, u256)) => panic!(),
+            Right(id: ExplicitAsset) => match jet::eq_256(id, param::ASSET_A) {
+                false => false,
+                true => {
+                    let (x, owner_proof, bl_lo, bl_hi, bl_proof): (Pubkey, [(u256, bool); 16], u256, u256, [(u256, bool); 16]) = unwrap(w);
+                    // The owner is who this input's script says it is...
+                    assert!(jet::eq_256(cu_spk_hash(x), unwrap(jet::input_script_hash(i))));
+                    // ...that owner is whitelisted (the freeze)...
+                    require_wl_member(x, owner_proof);
+                    // ...and this particular outpoint is not frozen individually.
+                    require_bl_nonmember(i, bl_lo, bl_hi, bl_proof);
+                    true
                 },
             },
         },
@@ -163,8 +284,8 @@ fn main() {
     // the template registry pins. Padding through the taproot annex (what
     // rust-simplicity's Cost::get_padding produces) is NOT usable here: the
     // annex is non-standard on this network and would not relay.
-    let budget_pad: [u256; 384] = witness::BUDGET_PAD;
-    assert!(array_fold::<absorb, 384>(budget_pad, true));
+    let budget_pad: [u256; 512] = witness::BUDGET_PAD;
+    assert!(array_fold::<absorb, 512>(budget_pad, true));
 
     // 1. own position and identity
     assert!(jet::eq_32(jet::current_index(), 0));
@@ -178,23 +299,29 @@ fn main() {
     require_explicit_amount_eq(v0, param::AMOUNT_Q);
     assert!(jet::eq_256(unwrap(jet::output_script_hash(0)), jet::current_script_hash()));
 
-    // 3. at least one regulated input (the C_U that authorises this spend)
-    let found: bool = bool_or(input_carries_a(1),
-                     bool_or(input_carries_a(2),
-                     bool_or(input_carries_a(3),
-                     bool_or(input_carries_a(4),
-                     bool_or(input_carries_a(5),
-                     bool_or(input_carries_a(6),
-                             input_carries_a(7)))))));
+    // 3. bounded OWNER scan over inputs 1..3 (N_max_inputs = 4). Every input
+    // carrying A must belong to a whitelisted owner. The bound is asserted, not
+    // assumed: without `num_inputs <= N_max_inputs` an eighth regulated input
+    // would sit past the scan and spend unchecked.
+    //
+    // This is the freeze. A holder removed from the whitelist can no longer
+    // satisfy the covenant for their own inputs, so their balance stops moving.
+    assert!(jet::lt_32(jet::num_inputs(), 5));
+    let found: bool = bool_or(check_input(1, witness::I1),
+                     bool_or(check_input(2, witness::I2),
+                             check_input(3, witness::I3)));
+    // At least one regulated input: it is a C_U, which independently required
+    // its owner's signature, so only holders can advance the verifier output.
     assert!(found);
 
-    // 4. bounded confinement scan over outputs 1..7 (N_max = 8)
-    assert!(jet::lt_32(jet::num_outputs(), 9));
+    // 4. bounded confinement scan over outputs 1..5 (N_max_outputs = 6).
+    // Six outputs cover the shape a transfer actually needs: the verifier
+    // recreation, up to two payments, sender change, fee-asset change and the
+    // fee output. The bound is asserted, not assumed.
+    assert!(jet::lt_32(jet::num_outputs(), 7));
     check_output(1, witness::W1);
     check_output(2, witness::W2);
     check_output(3, witness::W3);
     check_output(4, witness::W4);
     check_output(5, witness::W5);
-    check_output(6, witness::W6);
-    check_output(7, witness::W7);
 }

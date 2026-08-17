@@ -118,10 +118,10 @@ fn default_network() -> String {
 #[derive(serde::Deserialize)]
 struct Predicates {
     whitelist: Whitelist,
-    /// Present in a full snapshot but NOT enforced in-covenant in this build;
-    /// see STATUS.md. Kept so a snapshot round-trips unchanged.
     #[serde(default)]
-    blacklist: Option<serde_json::Value>,
+    blacklist: Option<Blacklist>,
+    /// Carried in the snapshot and committed in pi, but no program reads it; see
+    /// STATUS.md.
     #[serde(default)]
     limit: Option<u64>,
 }
@@ -129,6 +129,33 @@ struct Predicates {
 #[derive(serde::Deserialize)]
 struct Whitelist {
     entries: Vec<String>,
+}
+
+/// Blacklisted outpoints. `entries` are outpoints in the form the operator sees
+/// them (display-order txid plus vout); `keys` accepts pre-hashed policy keys for
+/// a registrar that would rather not republish raw outpoints.
+#[derive(serde::Deserialize, Default)]
+struct Blacklist {
+    #[serde(default)]
+    entries: Vec<OutPointRef>,
+    #[serde(default)]
+    keys: Vec<String>,
+}
+
+impl Blacklist {
+    fn policy_keys(&self) -> Result<Vec<[u8; 32]>, String> {
+        let mut out = Vec::new();
+        for e in &self.entries {
+            let op = outpoint(&e.txid, e.vout)?;
+            out.push(opendamp::txbuild::outpoint_policy_key(&op));
+        }
+        for k in &self.keys {
+            out.push(unhex32(k)?);
+        }
+        out.sort_unstable();
+        out.dedup();
+        Ok(out)
+    }
 }
 
 fn xonly(s: &str) -> Result<XOnlyPublicKey, String> {
@@ -162,31 +189,25 @@ fn load_snapshot(path: &str) -> Result<(Snapshot, Ctx), String> {
         .iter()
         .map(|s| xonly(s))
         .collect::<Result<_, _>>()?;
-    // A snapshot may carry a blacklist, but nothing in this build enforces one
-    // in-covenant (STATUS.md, degradation (a)). Saying so out loud is the point:
-    // an operator who publishes a blacklist and believes it binds has a false
-    // sense of a freeze.
-    if snap
-        .predicates
-        .blacklist
-        .as_ref()
-        .is_some_and(|b| !b.is_null())
-    {
+    let bl = match &snap.predicates.blacklist {
+        Some(b) => b.policy_keys()?,
+        None => Vec::new(),
+    };
+    if snap.predicates.limit.is_some() {
         eprintln!(
-            "warning: this snapshot carries a blacklist, which this build does NOT \
-             enforce in the covenant. Listed outpoints remain spendable. See STATUS.md."
+            "warning: this snapshot sets a transfer limit, which no program in this \
+             build reads. It is committed in pi but NOT enforced. See STATUS.md."
         );
     }
-    let ctx = Ctx::new(net, params, issuer, &wl)?;
+    let ctx = Ctx::new(net, params, issuer, &wl, &bl)?;
     Ok((snap, ctx))
 }
 
-/// pi for this snapshot. The blacklist commitment is intentionally the empty
-/// hash: nothing in this build enforces it in-covenant, so committing to a
-/// root would claim enforcement that does not exist (STATUS.md).
+/// pi for this snapshot. Both tree roots are committed, because both are read by
+/// P(pi) and therefore enforced by consensus.
 fn pi_of(snap: &Snapshot, ctx: &Ctx) -> [u8; 32] {
     let rules = opendamp::policy::rules_root(
-        None,
+        Some(ctx.bl_tree.root()),
         Some(ctx.wl_tree.root()),
         snap.predicates.limit,
         None,
@@ -318,6 +339,7 @@ fn cmd_derive(args: &Args) -> Result<(), String> {
     println!("q              {}", ctx.params.q);
     println!("policy seq     {}", snap.seq);
     println!("whitelist root {}", hex(&ctx.wl_tree.root()));
+    println!("blacklist root {}", hex(&ctx.bl_tree.root()));
     println!("pi             {}", hex(&pi_of(&snap, &ctx)));
     println!("U   CMR        {}", ctx.u_cmr());
     println!("P   CMR        {}", ctx.p_cmr());
@@ -350,6 +372,8 @@ fn cmd_registry(args: &Args) -> Result<(), String> {
             "seq": snap.seq,
             "pi": hex(&pi_of(&snap, &ctx)),
             "whitelist_root": hex(&ctx.wl_tree.root()),
+            "blacklist_root": hex(&ctx.bl_tree.root()),
+            "blacklisted_outpoints": ctx.bl_tree.keys.len(),
         },
         "programs": {
             format!("opendamp/user/v1/{}", ctx.params.asset_a): {
@@ -436,6 +460,9 @@ fn cmd_vectors(args: &Args) -> Result<(), String> {
             "seq": snap.seq,
             "whitelist_entries": snap.predicates.whitelist.entries,
             "whitelist_root": hex(&ctx.wl_tree.root()),
+            "blacklist_root": hex(&ctx.bl_tree.root()),
+            "blacklisted_outpoint_keys": ctx.bl_tree.keys.iter()
+                .map(|k| hex(k)).collect::<Vec<_>>(),
             "pi": hex(&pi_of(&snap, &ctx)),
         },
         "programs": {
@@ -447,6 +474,7 @@ fn cmd_vectors(args: &Args) -> Result<(), String> {
             "g_tapleaf_hash": hex(&g_leaf),
             "budget_pad_words": programs::BUDGET_PAD_WORDS,
             "n_max_outputs": opendamp::txbuild::N_MAX_OUTPUTS,
+            "n_max_inputs": opendamp::txbuild::N_MAX_INPUTS,
         },
         "user_covenants": owners,
         "verifier_covenant": {
@@ -466,6 +494,9 @@ fn cmd_vectors(args: &Args) -> Result<(), String> {
             "leaf_of_guard_lo": hex(&dmt::leaf_hash(&dmt::GUARD_LO)),
             "leaf_of_guard_hi": hex(&dmt::leaf_hash(&dmt::GUARD_HI)),
             "empty_root": hex(&dmt::Tree::new(vec![])?.root()),
+            "interval_leaf_of_guards": hex(&dmt::interval_leaf_hash(&dmt::GUARD_LO, &dmt::GUARD_HI)),
+            "interval_pad_leaf": hex(&dmt::interval_leaf_hash(&dmt::GUARD_HI, &dmt::GUARD_HI)),
+            "empty_blacklist_root": hex(&dmt::IntervalTree::new(vec![])?.root()),
         },
     });
     let text = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
@@ -506,15 +537,37 @@ fn cmd_transfer_build(args: &Args) -> Result<(), String> {
     // Membership proofs are resolved here too, so a missing snapshot entry is a
     // build-time error rather than a mystery at broadcast.
     let slots = opendamp::txbuild::verifier_slots(&ctx, &built)?;
-    let proofs: Vec<serde_json::Value> = slots
+    let describe = |slots: &[opendamp::programs::SlotWitness], kind: &str| {
+        slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| {
+                s.as_ref().map(|(key, proof)| {
+                    serde_json::json!({
+                        kind: i + 1,
+                        "key": hex(&key.serialize()),
+                        "dmt_index": proof.index,
+                    })
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let output_proofs = describe(&slots.outputs, "output");
+    let input_proofs: Vec<serde_json::Value> = slots
+        .inputs
         .iter()
         .enumerate()
         .filter_map(|(i, s)| {
-            s.as_ref().map(|(key, proof)| {
+            s.as_ref().map(|(key, owner_proof, interval)| {
                 serde_json::json!({
-                    "output": i + 1,
-                    "recipient": hex(&key.serialize()),
-                    "dmt_index": proof.index,
+                    "input": i + 1,
+                    "owner": hex(&key.serialize()),
+                    "dmt_index": owner_proof.index,
+                    "blacklist_interval": {
+                        "lo": hex(&interval.lo),
+                        "hi": hex(&interval.hi),
+                        "dmt_index": interval.proof.index,
+                    },
                 })
             })
         })
@@ -526,7 +579,10 @@ fn cmd_transfer_build(args: &Args) -> Result<(), String> {
             .map(|(i, k)| serde_json::json!({"output": i, "owner": hex(&k.serialize())}))
             .collect::<Vec<_>>(),
         "user_inputs": sighashes,
-        "whitelist_proofs": proofs,
+        "whitelist_proofs": {
+            "recipients": output_proofs,
+            "owners": input_proofs,
+        },
         "fee_input": built.fee_input,
     });
     println!(

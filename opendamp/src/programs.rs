@@ -81,6 +81,7 @@ pub fn compile_verifier(
     params: &AssetParams,
     u_cmr: simplicityhl::simplicity::Cmr,
     wl_root: &[u8; 32],
+    bl_root: &[u8; 32],
 ) -> Result<CompiledProgram, String> {
     let mut cmr_bytes = [0u8; 32];
     cmr_bytes.copy_from_slice(u_cmr.as_ref());
@@ -90,6 +91,7 @@ pub fn compile_verifier(
         "AMOUNT_Q": u64_value(params.q),
         "U_CMR": u256_value(&cmr_bytes),
         "WL_ROOT": u256_value(wl_root),
+        "BL_ROOT": u256_value(bl_root),
     }))?;
     CompiledProgram::new(VERIFIER_SOURCE, args, false)
 }
@@ -124,15 +126,27 @@ pub fn issuer_witness(sig: &[u8; 64]) -> Result<WitnessValues, String> {
     from_json(&v)
 }
 
-/// One verifier output-slot witness: the recipient key and its dmt-v1
-/// membership proof, or `None` for a slot whose output does not carry A.
+/// One verifier slot witness: a key and its dmt-v1 membership proof, or `None`
+/// for a slot whose output/input does not carry A.
 pub type SlotWitness = Option<(XOnlyPublicKey, crate::dmt::Proof)>;
+
+/// One verifier INPUT slot witness: the owner key, its whitelist membership
+/// proof, and the blacklist interval proof for the input's outpoint.
+pub type InputSlotWitness = Option<(XOnlyPublicKey, crate::dmt::Proof, crate::dmt::IntervalProof)>;
+
+/// Output slots the verifier scans: outputs 1..=N_OUT_SLOTS, so
+/// N_max_outputs = N_OUT_SLOTS + 1. MUST match `programs/verifier.simf`.
+pub const N_OUT_SLOTS: usize = 5;
+
+/// Input slots the verifier scans: inputs 1..=N_IN_SLOTS, so
+/// N_max_inputs = N_IN_SLOTS + 1. MUST match `programs/verifier.simf`.
+pub const N_IN_SLOTS: usize = 3;
 
 /// Number of 32-byte words in the verifier program's BUDGET_PAD array. MUST
 /// match the `[u256; N]` declaration and the `array_fold::<absorb, N>` bound in
 /// `programs/verifier.simf`: the pad is part of the program and therefore of
 /// its CMR.
-pub const BUDGET_PAD_WORDS: usize = 384;
+pub const BUDGET_PAD_WORDS: usize = 512;
 
 /// Pad size in bytes.
 pub const BUDGET_PAD_LEN: usize = BUDGET_PAD_WORDS * 32;
@@ -140,8 +154,21 @@ pub const BUDGET_PAD_LEN: usize = BUDGET_PAD_WORDS * 32;
 /// Witness values for a P(pi) spend. The BUDGET_PAD array is inert; it exists
 /// so the witness stack buys enough Simplicity execution budget for the
 /// output scan (see the comment on BUDGET_PAD in verifier.simf).
-pub fn verifier_witness(slots: &[SlotWitness; 7]) -> Result<WitnessValues, String> {
-    let ty = "Option<(Pubkey, [(u256, bool); 16])>";
+fn proof_literal(proof: &crate::dmt::Proof) -> String {
+    let levels: Vec<String> = proof
+        .levels()
+        .iter()
+        .map(|(sib, is_right)| format!("(0x{}, {})", crate::hexutil::hex(sib), is_right))
+        .collect();
+    format!("[{}]", levels.join(", "))
+}
+
+pub fn verifier_witness(
+    out_slots: &[SlotWitness; N_OUT_SLOTS],
+    in_slots: &[InputSlotWitness; N_IN_SLOTS],
+) -> Result<WitnessValues, String> {
+    let out_ty = "Option<(Pubkey, [(u256, bool); 16])>";
+    let in_ty = "Option<(Pubkey, [(u256, bool); 16], u256, u256, [(u256, bool); 16])>";
     let mut map = serde_json::Map::new();
     let zero_word = format!("0x{}", "00".repeat(32));
     let pad_items = vec![zero_word; BUDGET_PAD_WORDS].join(", ");
@@ -152,27 +179,35 @@ pub fn verifier_witness(slots: &[SlotWitness; 7]) -> Result<WitnessValues, Strin
             "type": format!("[u256; {BUDGET_PAD_WORDS}]"),
         }),
     );
-    for (i, slot) in slots.iter().enumerate() {
+    for (i, slot) in out_slots.iter().enumerate() {
         let value = match slot {
             None => "None".to_string(),
-            Some((key, proof)) => {
-                let levels: Vec<String> = proof
-                    .levels()
-                    .iter()
-                    .map(|(sib, is_right)| {
-                        format!("(0x{}, {})", crate::hexutil::hex(sib), is_right)
-                    })
-                    .collect();
-                format!(
-                    "Some((0x{}, [{}]))",
-                    crate::hexutil::hex(&key.serialize()),
-                    levels.join(", ")
-                )
-            }
+            Some((key, proof)) => format!(
+                "Some((0x{}, {}))",
+                crate::hexutil::hex(&key.serialize()),
+                proof_literal(proof)
+            ),
         };
         map.insert(
             format!("W{}", i + 1),
-            serde_json::json!({ "value": value, "type": ty }),
+            serde_json::json!({ "value": value, "type": out_ty }),
+        );
+    }
+    for (i, slot) in in_slots.iter().enumerate() {
+        let value = match slot {
+            None => "None".to_string(),
+            Some((key, owner_proof, interval)) => format!(
+                "Some((0x{}, {}, 0x{}, 0x{}, {}))",
+                crate::hexutil::hex(&key.serialize()),
+                proof_literal(owner_proof),
+                crate::hexutil::hex(&interval.lo),
+                crate::hexutil::hex(&interval.hi),
+                proof_literal(&interval.proof)
+            ),
+        };
+        map.insert(
+            format!("I{}", i + 1),
+            serde_json::json!({ "value": value, "type": in_ty }),
         );
     }
     from_json(&serde_json::Value::Object(map))

@@ -263,3 +263,180 @@ func (t *Tree) Adjacent(key Key) (lo, hi Key, loProof, hiProof *Proof, ok bool) 
 	}
 	return lo, hi, loProof, hiProof, true
 }
+
+// ---------------------------------------------------------------- blacklist
+
+// IntervalLeafHash returns SHA256(0x02 || lo || hi), the leaf of the blacklist
+// tree.
+//
+// The blacklist stores the GAPS between listed keys rather than the keys
+// themselves. Listing k_1 < ... < k_n yields the n+1 intervals
+// (GuardLo, k_1), (k_1, k_2), ..., (k_n, GuardHi), and proving a key absent means
+// exhibiting the single interval that strictly contains it. That keeps
+// non-membership to one membership proof with no slot arithmetic, which is what
+// makes it affordable inside the covenant; a listed key is an interval endpoint
+// and the containment test is strict, so no interval can cover it.
+//
+// The leaf domain byte differs from a whitelist leaf's (0x00), so a whitelist
+// proof can never be replayed as a blacklist proof or the other way round.
+func IntervalLeafHash(lo, hi Key) [32]byte {
+	h := sha256.New()
+	h.Write([]byte{0x02})
+	h.Write(lo[:])
+	h.Write(hi[:])
+	var out [32]byte
+	copy(out[:], h.Sum(nil))
+	return out
+}
+
+// OutpointKey returns the blacklist policy key of an outpoint:
+// SHA256(txid || BE32(vout)). txidInternal must be in internal (consensus) byte
+// order - the order the input_prev_outpoint jet yields, NOT the reversed order
+// txids are displayed in.
+func OutpointKey(txidInternal [32]byte, vout uint32) Key {
+	h := sha256.New()
+	h.Write(txidInternal[:])
+	var be [4]byte
+	be[0] = byte(vout >> 24)
+	be[1] = byte(vout >> 16)
+	be[2] = byte(vout >> 8)
+	be[3] = byte(vout)
+	h.Write(be[:])
+	var out Key
+	copy(out[:], h.Sum(nil))
+	return out
+}
+
+// IntervalProof is a non-membership proof: the covering interval plus the
+// membership proof of its leaf.
+type IntervalProof struct {
+	Lo    Key
+	Hi    Key
+	Proof Proof
+}
+
+// IntervalTree is the blacklist tree over a set of listed keys.
+type IntervalTree struct {
+	keys   []Key
+	levels [][][32]byte
+	pad    [][32]byte
+}
+
+// NewIntervalTree builds the blacklist tree over the listed keys, in any order.
+func NewIntervalTree(keys []Key) (*IntervalTree, error) {
+	sorted := make([]Key, len(keys))
+	copy(sorted, keys)
+	sort.Slice(sorted, func(i, j int) bool {
+		return bytes.Compare(sorted[i][:], sorted[j][:]) < 0
+	})
+	for i := 1; i < len(sorted); i++ {
+		if sorted[i] == sorted[i-1] {
+			return nil, fmt.Errorf("%w: %x", ErrDuplicate, sorted[i])
+		}
+	}
+	for _, k := range sorted {
+		if k == GuardLo || k == GuardHi {
+			return nil, fmt.Errorf("%w: %x", ErrGuard, k)
+		}
+	}
+	// n listed keys produce n+1 interval leaves.
+	if len(sorted)+1 > Slots {
+		return nil, fmt.Errorf("dmt-v1: blacklist capacity is %d keys", Slots-1)
+	}
+
+	pad := make([][32]byte, Depth+1)
+	pad[0] = IntervalLeafHash(GuardHi, GuardHi)
+	for j := 0; j < Depth; j++ {
+		pad[j+1] = NodeHash(pad[j], pad[j])
+	}
+
+	level0 := make([][32]byte, 0, len(sorted)+1)
+	lo := GuardLo
+	for _, k := range sorted {
+		level0 = append(level0, IntervalLeafHash(lo, k))
+		lo = k
+	}
+	level0 = append(level0, IntervalLeafHash(lo, GuardHi))
+
+	levels := make([][][32]byte, Depth+1)
+	levels[0] = level0
+	for j := 0; j < Depth; j++ {
+		prev := levels[j]
+		next := make([][32]byte, 0, (len(prev)+1)/2)
+		for i := 0; i < len(prev); i += 2 {
+			left := prev[i]
+			right := pad[j]
+			if i+1 < len(prev) {
+				right = prev[i+1]
+			}
+			next = append(next, NodeHash(left, right))
+		}
+		levels[j+1] = next
+	}
+	return &IntervalTree{keys: sorted, levels: levels, pad: pad}, nil
+}
+
+// Keys returns the sorted listed keys.
+func (t *IntervalTree) Keys() []Key {
+	out := make([]Key, len(t.keys))
+	copy(out, t.keys)
+	return out
+}
+
+// Root returns the blacklist root, which the covenant carries as BL_ROOT.
+func (t *IntervalTree) Root() [32]byte {
+	return t.levels[Depth][0]
+}
+
+func (t *IntervalTree) nodeAt(level, idx int) [32]byte {
+	if idx < len(t.levels[level]) {
+		return t.levels[level][idx]
+	}
+	return t.pad[level]
+}
+
+// ProveAbsent proves key is NOT listed. It returns false when the key IS
+// listed, which is the point: a frozen outpoint cannot be given a proof.
+func (t *IntervalTree) ProveAbsent(key Key) (*IntervalProof, bool) {
+	if key == GuardLo || key == GuardHi {
+		return nil, false
+	}
+	i := sort.Search(len(t.keys), func(i int) bool {
+		return bytes.Compare(t.keys[i][:], key[:]) >= 0
+	})
+	if i < len(t.keys) && t.keys[i] == key {
+		return nil, false // listed
+	}
+	lo := GuardLo
+	if i > 0 {
+		lo = t.keys[i-1]
+	}
+	hi := GuardHi
+	if i < len(t.keys) {
+		hi = t.keys[i]
+	}
+	p := Proof{Index: uint16(i)}
+	idx := i
+	for j := 0; j < Depth; j++ {
+		p.Siblings[j] = t.nodeAt(j, idx^1)
+		idx >>= 1
+	}
+	return &IntervalProof{Lo: lo, Hi: hi, Proof: p}, true
+}
+
+// VerifyAbsent checks a non-membership proof exactly as the covenant does:
+// strict containment, then the Merkle path over the interval leaf.
+func VerifyAbsent(root [32]byte, key Key, p *IntervalProof) bool {
+	if bytes.Compare(p.Lo[:], key[:]) >= 0 || bytes.Compare(key[:], p.Hi[:]) >= 0 {
+		return false
+	}
+	node := IntervalLeafHash(p.Lo, p.Hi)
+	for j := 0; j < Depth; j++ {
+		if (p.Proof.Index>>uint(j))&1 == 1 {
+			node = NodeHash(p.Proof.Siblings[j], node)
+		} else {
+			node = NodeHash(node, p.Proof.Siblings[j])
+		}
+	}
+	return node == root
+}

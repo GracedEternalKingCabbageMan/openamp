@@ -3,6 +3,8 @@ package damp
 import (
 	"encoding/hex"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -235,5 +237,126 @@ func TestSnapshotMinimal(t *testing.T) {
 	}
 	if hex.EncodeToString(pi2[:]) == s.Pi {
 		t.Fatal("enabled-but-empty predicate must commit differently from absent")
+	}
+}
+
+// --- dmt-v1: the consensus-bearing snapshot format ---------------------------
+
+// TestSnapshotDMTv1MatchesVectors is the important one: a dmt-v1 snapshot's pi
+// must be the pi the DEPLOYED covenant is instantiated with, so this builds one
+// from opendamp/vectors/addresses.json (asset, verifier asset, q, whitelist) and
+// requires Validate to accept the vectors' own pi. If the two constructions ever
+// diverge, this server would publish a policy no covenant answers to and every
+// transfer would fail at consensus.
+func TestSnapshotDMTv1MatchesVectors(t *testing.T) {
+	path := filepath.Join("..", "..", "..", "opendamp", "vectors", "addresses.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Skipf("opendamp vectors unavailable (%v)", err)
+	}
+	var v struct {
+		Asset          string `json:"asset"`
+		VerifierAsset  string `json:"verifier_asset"`
+		VerifierAmount uint64 `json:"verifier_amount"`
+		Policy         struct {
+			Pi               string   `json:"pi"`
+			Seq              uint64   `json:"seq"`
+			WhitelistRoot    string   `json:"whitelist_root"`
+			WhitelistEntries []string `json:"whitelist_entries"`
+		} `json:"policy"`
+	}
+	if err := json.Unmarshal(raw, &v); err != nil {
+		t.Fatalf("parse vectors: %v", err)
+	}
+	s := &Snapshot{
+		V: 1, Asset: v.Asset, VerifierAsset: v.VerifierAsset, Q: v.VerifierAmount,
+		Pi: v.Policy.Pi, Seq: v.Policy.Seq, PrevPi: nil, Tree: TreeDMTv1,
+		Predicates: Predicates{
+			Whitelist: PredicateList{Root: v.Policy.WhitelistRoot, Entries: v.Policy.WhitelistEntries},
+		},
+	}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("a dmt-v1 snapshot built from the vectors must validate: %v", err)
+	}
+	got, err := s.ComputePi()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hex.EncodeToString(got[:]) != v.Policy.Pi {
+		t.Fatalf("dmt-v1 pi = %x, the covenant is instantiated with %s", got, v.Policy.Pi)
+	}
+	// The whitelist root must be recomputed from the entries, so a declared root
+	// that does not match its own list is refused rather than published.
+	bad := *s
+	bad.Predicates.Whitelist.Root = strings.Repeat("22", 32)
+	if err := bad.Validate(); err == nil {
+		t.Fatal("a dmt-v1 whitelist root that does not match its entries must be refused")
+	}
+}
+
+// TestSnapshotDMTv1RefusesUnenforcedPredicates: the covenant reads no blacklist
+// and no height windows, so a dmt-v1 snapshot carrying either is refused rather
+// than published with the slot silently committed empty. An issuer who publishes
+// a blacklist and believes it binds has a false sense of a freeze.
+func TestSnapshotDMTv1RefusesUnenforcedPredicates(t *testing.T) {
+	base := func() *Snapshot {
+		wl := rep(0x55)
+		root, err := WhitelistRoot([][32]byte{wl})
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := &Snapshot{
+			V: 1, Asset: strings.Repeat("11", 32), VerifierAsset: strings.Repeat("99", 32),
+			Q: 1, Seq: 0, Tree: TreeDMTv1,
+			Predicates: Predicates{
+				Whitelist: PredicateList{Root: hex.EncodeToString(root[:]), Entries: []string{hex.EncodeToString(wl[:])}},
+			},
+		}
+		pi, err := s.ComputePi()
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.Pi = hex.EncodeToString(pi[:])
+		return s
+	}
+	if err := base().Validate(); err != nil {
+		t.Fatalf("the plain dmt-v1 shape must validate: %v", err)
+	}
+
+	withBl := base()
+	blRoot, blEntry := rep(0x77), rep(0x88)
+	withBl.Predicates.Blacklist = PredicateList{Root: hex.EncodeToString(blRoot[:]), Entries: []string{hex.EncodeToString(blEntry[:])}}
+	if err := withBl.Validate(); err == nil || !strings.Contains(err.Error(), "must not carry a blacklist") {
+		t.Fatalf("a dmt-v1 blacklist must be refused, got %v", err)
+	}
+
+	withWin := base()
+	withWin.Predicates.Windows = []Window{{Class: "regS", From: 1, Until: 2}}
+	if err := withWin.Validate(); err == nil || !strings.Contains(err.Error(), "must not carry height windows") {
+		t.Fatalf("dmt-v1 height windows must be refused, got %v", err)
+	}
+}
+
+// TestSnapshotSMTv1StillWorks: adding dmt-v1 changed nothing about the M2
+// document format. The golden snapshot is the pinned smt-v1 shape.
+func TestSnapshotSMTv1StillWorks(t *testing.T) {
+	s := goldenSnapshot(t)
+	if s.Tree != TreeSMTv1 {
+		t.Fatal("the golden snapshot is the smt-v1 shape")
+	}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("smt-v1 validation regressed: %v", err)
+	}
+	c, err := s.CanonicalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(c) != goldenSnapCanonical {
+		t.Fatalf("smt-v1 canonical bytes drifted:\n got: %s\nwant: %s", c, goldenSnapCanonical)
+	}
+	// And an unknown tree is still refused, now naming both supported values.
+	s.Tree = "cmt-v1"
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "dmt-v1") || !strings.Contains(err.Error(), "smt-v1") {
+		t.Fatalf("an unknown tree must be refused naming both supported values, got %v", err)
 	}
 }
