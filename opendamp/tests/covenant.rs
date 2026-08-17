@@ -56,6 +56,7 @@ fn transfer_req(_ctx: &Ctx, sender: XOnlyPublicKey, recipient: XOnlyPublicKey) -
         fee_key,
         fee_amount: 400,
         fee_change_spk: Script::from(vec![0x51]),
+        locktime: 0,
         recipient_spk_override: None,
     }
 }

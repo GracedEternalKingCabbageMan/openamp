@@ -71,19 +71,43 @@ func LoadProgramRegistry(path string) (*ProgramRegistry, error) {
 	return reg, nil
 }
 
-// WhitelistRoot is the dmt-v1 root over the holder keys permitted to RECEIVE
-// the asset. Note the scope honestly: the covenant checks recipients, so
-// removing a key stops it receiving, not spending (opendamp/STATUS.md).
-func WhitelistRoot(ownerKeys [][32]byte) ([32]byte, error) {
-	keys := make([]dmt.Key, 0, len(ownerKeys))
-	for _, k := range ownerKeys {
-		keys = append(keys, dmt.Key(k))
+// WhitelistEntry is one approved holder and the height bounds that bind it.
+// SendAfter is the lockup (the holder cannot own a regulated INPUT below that
+// height, which is what makes removing a key a freeze), RecvAfter the receive
+// window (cannot be paid below it, the Reg S pattern). Zero means unbounded.
+// The bounds live IN the leaf, so the same proof that shows a key is approved
+// shows which windows bind it, and shortening your own lockup changes the leaf
+// so the path stops reaching the root.
+type WhitelistEntry struct {
+	Key       [32]byte
+	SendAfter uint32
+	RecvAfter uint32
+}
+
+// WhitelistRoot is the dmt-v1 root over the approved holders. The covenant
+// checks both the owners of regulated inputs and the recipients of regulated
+// outputs, so removing a key stops that holder spending as well as receiving.
+func WhitelistRootWithWindows(entries []WhitelistEntry) ([32]byte, error) {
+	es := make([]dmt.Entry, 0, len(entries))
+	for _, e := range entries {
+		es = append(es, dmt.Entry{Key: dmt.Key(e.Key), SendAfter: e.SendAfter, RecvAfter: e.RecvAfter})
 	}
-	tree, err := dmt.New(keys)
+	tree, err := dmt.New(es)
 	if err != nil {
 		return [32]byte{}, err
 	}
 	return tree.Root(), nil
+}
+
+// WhitelistRoot is WhitelistRootWithWindows for the common case of holders with
+// no height bounds, which is every holder until an issuer sets a lockup or a
+// receive window.
+func WhitelistRoot(keys [][32]byte) ([32]byte, error) {
+	es := make([]WhitelistEntry, 0, len(keys))
+	for _, k := range keys {
+		es = append(es, WhitelistEntry{Key: k})
+	}
+	return WhitelistRootWithWindows(es)
 }
 
 // BlacklistRoot is the dmt-v1 INTERVAL root over the outpoint keys a policy

@@ -225,6 +225,7 @@ fn clone_req(r: &TransferReq) -> TransferReq {
         fee_key: r.fee_key,
         fee_amount: r.fee_amount,
         fee_change_spk: r.fee_change_spk.clone(),
+        locktime: r.locktime,
         recipient_spk_override: r.recipient_spk_override.clone(),
     }
 }
@@ -258,7 +259,8 @@ fn splice_verifier(
     let (good_tx, _) = complete_transfer(ctx, good, good_sender_sk, fee_sk, true)
         .expect("the good-shape transfer must validate");
 
-    let built = build_transfer(ctx, bad).expect("bad skeleton builds");
+    let built = opendamp::txbuild::build_transfer_unchecked(ctx, bad)
+        .expect("bad skeleton builds");
     let mut tx = built.tx.clone();
     let (_, u_cb) = opendamp::tapscript::cu_spend_info(ctx.u_cmr(), &bad.sender);
     for idx in &built.user_inputs {
@@ -473,6 +475,7 @@ fn regtest_end_to_end() {
         fee_key,
         fee_amount,
         fee_change_spk: fee_spk.clone(),
+        locktime: 0,
         recipient_spk_override: None,
     };
 
@@ -771,6 +774,163 @@ fn regtest_end_to_end() {
     let (o, v) = node.find_vout(&txid, &fee_spk);
     fee = Utxo { outpoint: o, value: v };
 
+    // ================= 9. TRANSFER LIMIT
+    // pi6 keeps everyone whitelisted but caps what may leave a sender's hands
+    // in one transfer.
+    let limit: u64 = 20_000_000; // 0.2 of A
+    let entries = |wl: &[XOnlyPublicKey]| -> Vec<opendamp::dmt::Entry> {
+        wl.iter()
+            .map(|k| opendamp::dmt::Entry::unrestricted(k.serialize()))
+            .collect()
+    };
+    let ctx6 = Ctx::with_policy(
+        net, params, issuer, entries(&[alice, bob, carol]), &[], limit,
+    )
+    .expect("pi6 compiles");
+    let upd = IssuerReq {
+        verifier_outpoint: verifier_op,
+        halt_spk: None,
+        fee_utxo: (fee.outpoint, policy_asset, fee.value),
+        fee_key,
+        fee_amount,
+        fee_change_spk: fee_spk.clone(),
+    };
+    let tx = complete_issuer_op(&ctx5, Some(&ctx6), &upd, &issuer_sk, &fee_sk).expect("limit");
+    let txid = node.cli(&["sendrawtransaction", &tx_hex(&tx)]);
+    node.generate(1, &mine_addr);
+    println!("PROOF 9a: issuer update pi5->pi6 setting a transfer limit of {limit}: {txid}");
+    verifier_op = OutPoint::new(Txid::from_str(&txid).unwrap(), 0);
+    let (o, v) = node.find_vout(&txid, &fee_spk);
+    fee = Utxo { outpoint: o, value: v };
+
+    // Over the limit: refused.
+    let over = make_req(alice, &alice_a, carol, limit + 1, verifier_op, &fee);
+    let err = complete_transfer(&ctx6, &over, &alice_sk, &fee_sk, true)
+        .err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(err.contains("transfer limit"), "the builder must refuse an over-limit payment: {err}");
+    println!("PROOF 9b: a payment of {} is refused: {err}", limit + 1);
+
+    // The node refuses it too. A valid same-shape spend exists (pay exactly the
+    // limit), so the verifier witness splices and the only failing check is the
+    // limit bound itself.
+    let at_limit = make_req(alice, &alice_a, carol, limit, verifier_op, &fee);
+    let bad_tx = splice_verifier(&node, &net, &ctx6, &at_limit, &alice_sk, &over, &alice_sk, &fee_sk);
+    let reason = reject_reason(&node, &bad_tx);
+    println!("PROOF 9c: node rejects the over-limit payment: {reason}");
+    assert!(reason.contains("Assertion failed"), "must fail the limit bound: {reason}");
+
+    // Exactly at the limit: accepted. Note the change output is far larger than
+    // the limit, which is the point - change does not count.
+    let (tx, _) = complete_transfer(&ctx6, &at_limit, &alice_sk, &fee_sk, true)
+        .expect("a payment equal to the limit must be allowed");
+    let txid = node.cli(&["sendrawtransaction", &tx_hex(&tx)]);
+    node.generate(1, &mine_addr);
+    println!(
+        "PROOF 9d: a payment of exactly {limit} confirms, with {} of change that does \
+         NOT count toward it: {txid}",
+        alice_a.value - limit
+    );
+    verifier_op = OutPoint::new(Txid::from_str(&txid).unwrap(), 0);
+    let (o, v) = node.find_vout(&txid, &cu_alice.script_pubkey);
+    alice_a = Utxo { outpoint: o, value: v };
+    let (o, v) = node.find_vout(&txid, &fee_spk);
+    fee = Utxo { outpoint: o, value: v };
+
+    // ================= 10. HEIGHT WINDOWS
+    // pi7 gives carol a RECEIVE window (the Reg S pattern) and alice a LOCKUP,
+    // both at a height a few blocks ahead.
+    let here = node.cli_json(&["getblockcount"]).as_u64().unwrap() as u32;
+    let bound = here + 5;
+    let windowed = vec![
+        opendamp::dmt::Entry { key: alice.serialize(), send_after: bound, recv_after: 0 },
+        opendamp::dmt::Entry::unrestricted(bob.serialize()),
+        opendamp::dmt::Entry { key: carol.serialize(), send_after: 0, recv_after: bound },
+    ];
+    let ctx7 = Ctx::with_policy(
+        net, params, issuer, windowed, &[], opendamp::programs::NO_LIMIT,
+    )
+    .expect("pi7 compiles");
+    let upd = IssuerReq {
+        verifier_outpoint: verifier_op,
+        halt_spk: None,
+        fee_utxo: (fee.outpoint, policy_asset, fee.value),
+        fee_key,
+        fee_amount,
+        fee_change_spk: fee_spk.clone(),
+    };
+    let tx = complete_issuer_op(&ctx6, Some(&ctx7), &upd, &issuer_sk, &fee_sk).expect("windows");
+    let txid = node.cli(&["sendrawtransaction", &tx_hex(&tx)]);
+    node.generate(1, &mine_addr);
+    println!(
+        "PROOF 10a: issuer update pi6->pi7 at chain height {here}: alice locked up and \
+         carol unable to receive until height {bound}: {txid}"
+    );
+    verifier_op = OutPoint::new(Txid::from_str(&txid).unwrap(), 0);
+    let (o, v) = node.find_vout(&txid, &fee_spk);
+    fee = Utxo { outpoint: o, value: v };
+
+    // Claiming no height at all: the builder refuses, naming the height needed.
+    let no_height = make_req(alice, &alice_a, carol, 10_000_000, verifier_op, &fee);
+    let err = complete_transfer(&ctx7, &no_height, &alice_sk, &fee_sk, true)
+        .err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(err.contains(&bound.to_string()), "the builder must name the height needed: {err}");
+    println!("PROOF 10b: without a locktime the transfer is refused: {err}");
+
+    // Claiming the height honestly: the covenant is satisfied, but CONSENSUS
+    // will not accept the transaction until the chain reaches it. That is the
+    // whole reduction - the covenant cannot read the height, so it makes the
+    // spender commit to one that consensus itself polices. Both halves are
+    // needed and this is the second one.
+    let mut claimed = make_req(alice, &alice_a, carol, 10_000_000, verifier_op, &fee);
+    claimed.locktime = bound;
+    let (tx, _) = complete_transfer(&ctx7, &claimed, &alice_sk, &fee_sk, true)
+        .expect("the covenant is satisfied by a locktime at the bound");
+    let reason = reject_reason(&node, &tx);
+    println!(
+        "PROOF 10c: at height {}, consensus rejects the claim as premature: {reason}",
+        node.cli_json(&["getblockcount"]).as_u64().unwrap()
+    );
+    assert!(
+        reason.contains("non-final") || reason.to_lowercase().contains("locktime"),
+        "expected a locktime refusal: {reason}"
+    );
+
+    // Now mine past the bound, so a LOWER locktime is no longer premature. That
+    // isolates the covenant's half of the reduction: understating the height is
+    // refused by P(pi) itself, not by the mempool's finality rule.
+    node.generate(6, &mine_addr);
+    let now = node.cli_json(&["getblockcount"]).as_u64().unwrap();
+    let mut understated = make_req(alice, &alice_a, carol, 10_000_000, verifier_op, &fee);
+    understated.locktime = bound - 3;
+    let err = complete_transfer(&ctx7, &understated, &alice_sk, &fee_sk, true)
+        .err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(err.contains(&bound.to_string()), "the builder must refuse it: {err}");
+    println!("PROOF 10d: builder refuses an understated height: {err}");
+
+    let bad_tx = splice_verifier(
+        &node, &net, &ctx7, &claimed, &alice_sk, &understated, &alice_sk, &fee_sk,
+    );
+    let reason = reject_reason(&node, &bad_tx);
+    println!(
+        "PROOF 10e: at height {now} a locktime of {} is perfectly minable, and the \
+         node still rejects it on the covenant's window: {reason}",
+        bound - 3
+    );
+    assert!(
+        reason.contains("Assertion failed") || reason.contains("Jet failed"),
+        "must fail the window check, not the finality rule: {reason}"
+    );
+
+    // The honest transaction, unchanged, now confirms.
+    let txid = node.cli(&["sendrawtransaction", &tx_hex(&tx)]);
+    node.generate(1, &mine_addr);
+    println!("PROOF 10f: at height {now} the SAME honest transaction confirms: {txid}");
+    verifier_op = OutPoint::new(Txid::from_str(&txid).unwrap(), 0);
+    let (o, v) = node.find_vout(&txid, &cu_alice.script_pubkey);
+    alice_a = Utxo { outpoint: o, value: v };
+    let (o, v) = node.find_vout(&txid, &fee_spk);
+    fee = Utxo { outpoint: o, value: v };
+
     // ================= 6. HALT (last: it ends all transfers)
     let halt = IssuerReq {
         verifier_outpoint: verifier_op,
@@ -780,7 +940,7 @@ fn regtest_end_to_end() {
         fee_amount,
         fee_change_spk: fee_spk.clone(),
     };
-    let tx = complete_issuer_op(&ctx5, None, &halt, &issuer_sk, &fee_sk).expect("halt");
+    let tx = complete_issuer_op(&ctx7, None, &halt, &issuer_sk, &fee_sk).expect("halt");
     let txid = node.cli(&["sendrawtransaction", &tx_hex(&tx)]);
     node.generate(1, &mine_addr);
     println!("PROOF 6a: halt - V leaves the covenant: {txid}");
@@ -789,7 +949,7 @@ fn regtest_end_to_end() {
     fee = Utxo { outpoint: o, value: v };
 
     let post = make_req(alice, &alice_a, carol, 10_000_000, halted_op, &fee);
-    let (tx, _) = complete_transfer(&ctx5, &post, &alice_sk, &fee_sk, false)
+    let (tx, _) = complete_transfer(&ctx7, &post, &alice_sk, &fee_sk, false)
         .expect("assembles unvalidated");
     let reason = reject_reason(&node, &tx);
     println!("PROOF 6b: node rejects any transfer after the halt: {reason}");
@@ -829,6 +989,7 @@ fn bad_witness_cannot_be_pruned() {
         fee_key,
         fee_amount: 400,
         fee_change_spk: Script::from(vec![0x51]),
+        locktime: 0,
         recipient_spk_override: None,
     };
     let built = build_transfer(&ctx, &req).unwrap();

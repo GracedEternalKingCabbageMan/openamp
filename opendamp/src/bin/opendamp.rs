@@ -91,7 +91,16 @@ impl Args {
 /// The subset of the design doc's `snapshot/v1` this tool consumes, plus the
 /// chain selector it needs to derive addresses and sighashes.
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Snapshot {
+    #[serde(default, rename = "v")]
+    _v: Option<u32>,
+    /// Accepted so a published snapshot round-trips, but not used: this build
+    /// derives nothing from the previous policy version. Named rather than
+    /// swallowed, because `deny_unknown_fields` would otherwise reject a
+    /// perfectly well-formed snapshot.
+    #[serde(default, rename = "prev_pi")]
+    _prev_pi: Option<serde_json::Value>,
     asset: String,
     verifier_asset: String,
     q: u64,
@@ -115,26 +124,71 @@ fn default_network() -> String {
     "testnet".to_string()
 }
 
+/// `deny_unknown_fields` throughout is deliberate. A snapshot must never be able
+/// to state a rule this build does not enforce: silently ignoring an unknown
+/// predicate would let an issuer publish a policy that does not bind and believe
+/// it does. Unrecognised fields are a hard error, not a warning.
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Predicates {
     whitelist: Whitelist,
     #[serde(default)]
     blacklist: Option<Blacklist>,
-    /// Carried in the snapshot and committed in pi, but no program reads it; see
-    /// STATUS.md.
+    /// Maximum total payable to owners other than the sender in one transfer.
+    /// Enforced by P(pi); `null` means no limit.
     #[serde(default)]
     limit: Option<u64>,
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Whitelist {
-    entries: Vec<String>,
+    entries: Vec<WhitelistEntry>,
+}
+
+/// A whitelist entry: a bare key string for an unrestricted holder, or an object
+/// carrying the holder's height windows.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum WhitelistEntry {
+    Bare(String),
+    Windowed {
+        key: String,
+        /// Lockup: the holder cannot SPEND until this height is proven.
+        #[serde(default)]
+        send_after: u32,
+        /// Receive window (Reg S): the holder cannot RECEIVE until this height.
+        #[serde(default)]
+        recv_after: u32,
+    },
+}
+
+impl WhitelistEntry {
+    fn key_str(&self) -> &str {
+        match self {
+            WhitelistEntry::Bare(k) => k,
+            WhitelistEntry::Windowed { key, .. } => key,
+        }
+    }
+
+    fn to_entry(&self) -> Result<dmt::Entry, String> {
+        let key = xonly(self.key_str())?.serialize();
+        Ok(match self {
+            WhitelistEntry::Bare(_) => dmt::Entry::unrestricted(key),
+            WhitelistEntry::Windowed { send_after, recv_after, .. } => dmt::Entry {
+                key,
+                send_after: *send_after,
+                recv_after: *recv_after,
+            },
+        })
+    }
 }
 
 /// Blacklisted outpoints. `entries` are outpoints in the form the operator sees
 /// them (display-order txid plus vout); `keys` accepts pre-hashed policy keys for
 /// a registrar that would rather not republish raw outpoints.
 #[derive(serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct Blacklist {
     #[serde(default)]
     entries: Vec<OutPointRef>,
@@ -182,29 +236,31 @@ fn load_snapshot(path: &str) -> Result<(Snapshot, Ctx), String> {
         q: snap.q,
     };
     let issuer = xonly(&snap.issuer_update_key)?;
-    let wl: Vec<XOnlyPublicKey> = snap
+    let wl: Vec<dmt::Entry> = snap
         .predicates
         .whitelist
         .entries
         .iter()
-        .map(|s| xonly(s))
+        .map(|e| e.to_entry())
         .collect::<Result<_, _>>()?;
     let bl = match &snap.predicates.blacklist {
         Some(b) => b.policy_keys()?,
         None => Vec::new(),
     };
-    if snap.predicates.limit.is_some() {
-        eprintln!(
-            "warning: this snapshot sets a transfer limit, which no program in this \
-             build reads. It is committed in pi but NOT enforced. See STATUS.md."
+    let limit = snap.predicates.limit.unwrap_or(opendamp::programs::NO_LIMIT);
+    if limit == 0 {
+        return Err(
+            "a transfer limit of 0 would forbid every payment; omit `limit` for no limit"
+                .into(),
         );
     }
-    let ctx = Ctx::new(net, params, issuer, &wl, &bl)?;
+    let ctx = Ctx::with_policy(net, params, issuer, wl, &bl, limit)?;
     Ok((snap, ctx))
 }
 
-/// pi for this snapshot. Both tree roots are committed, because both are read by
-/// P(pi) and therefore enforced by consensus.
+/// pi for this snapshot. Every commitment here is read by P(pi), so nothing in
+/// pi claims a rule that does not bind: the whitelist root also carries the
+/// height windows, since they live in its leaves.
 fn pi_of(snap: &Snapshot, ctx: &Ctx) -> [u8; 32] {
     let rules = opendamp::policy::rules_root(
         Some(ctx.bl_tree.root()),
@@ -222,6 +278,7 @@ fn pi_of(snap: &Snapshot, ctx: &Ctx) -> [u8; 32] {
 // ------------------------------------------------------------- transfer request
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RequestFile {
     sender: String,
     #[serde(default)]
@@ -232,6 +289,10 @@ struct RequestFile {
     recipient: Option<String>,
     #[serde(default)]
     amount: u64,
+    /// nLockTime the transfer commits to, which is how a height window is
+    /// satisfied. Omit for 0 (no height claimed).
+    #[serde(default)]
+    locktime: u32,
     verifier_outpoint: OutPointRef,
     fee: FeeRef,
 }
@@ -297,6 +358,7 @@ fn to_transfer_req(r: &RequestFile) -> Result<TransferReq, String> {
         fee_key: xonly(&r.fee.key)?,
         fee_amount: r.fee.amount,
         fee_change_spk: Script::from(unhex(&r.fee.change_spk)?),
+        locktime: r.locktime,
         recipient_spk_override: None,
     })
 }
@@ -324,7 +386,7 @@ fn owner_list<'a>(args: &'a Args, snap: &'a Snapshot) -> Vec<&'a str> {
             .whitelist
             .entries
             .iter()
-            .map(String::as_str)
+            .map(WhitelistEntry::key_str)
             .collect()
     } else {
         owners
@@ -340,6 +402,14 @@ fn cmd_derive(args: &Args) -> Result<(), String> {
     println!("policy seq     {}", snap.seq);
     println!("whitelist root {}", hex(&ctx.wl_tree.root()));
     println!("blacklist root {}", hex(&ctx.bl_tree.root()));
+    println!(
+        "transfer limit {}",
+        if ctx.limit == opendamp::programs::NO_LIMIT {
+            "none".to_string()
+        } else {
+            ctx.limit.to_string()
+        }
+    );
     println!("pi             {}", hex(&pi_of(&snap, &ctx)));
     println!("U   CMR        {}", ctx.u_cmr());
     println!("P   CMR        {}", ctx.p_cmr());
@@ -348,9 +418,17 @@ fn cmd_derive(args: &Args) -> Result<(), String> {
     println!("C_V(pi) spk    {}", hex(cv.script_pubkey.as_bytes()));
     println!("C_V(pi)        {}", cv.address(ctx.net.address_params));
     for o in owner_list(args, &snap) {
-        let cu = ctx.cu_info(&xonly(o)?);
+        let key = xonly(o)?;
+        let cu = ctx.cu_info(&key);
+        let e = ctx.wl_tree.entry_of(&key.serialize());
+        let windows = match e {
+            Some(e) if e.send_after != 0 || e.recv_after != 0 => {
+                format!(" [send_after {} recv_after {}]", e.send_after, e.recv_after)
+            }
+            _ => String::new(),
+        };
         println!(
-            "C_U({o}) {} (spk {})",
+            "C_U({o}) {} (spk {}){windows}",
             cu.address(ctx.net.address_params),
             hex(cu.script_pubkey.as_bytes())
         );
@@ -374,6 +452,7 @@ fn cmd_registry(args: &Args) -> Result<(), String> {
             "whitelist_root": hex(&ctx.wl_tree.root()),
             "blacklist_root": hex(&ctx.bl_tree.root()),
             "blacklisted_outpoints": ctx.bl_tree.keys.len(),
+            "transfer_limit": ctx.limit,
         },
         "programs": {
             format!("opendamp/user/v1/{}", ctx.params.asset_a): {
@@ -434,6 +513,8 @@ fn cmd_vectors(args: &Args) -> Result<(), String> {
             "address_testnet": cu.address(testnet_params).to_string(),
             "address_regtest": cu.address(regtest_params).to_string(),
             "dmt_whitelist_index": ctx.wl_tree.slot_of(&key.serialize()),
+            "send_after": ctx.wl_tree.entry_of(&key.serialize()).map(|e| e.send_after),
+            "recv_after": ctx.wl_tree.entry_of(&key.serialize()).map(|e| e.recv_after),
         }));
     }
 
@@ -458,11 +539,14 @@ fn cmd_vectors(args: &Args) -> Result<(), String> {
         "issuer_key": ctx.issuer_key.to_string(),
         "policy": {
             "seq": snap.seq,
-            "whitelist_entries": snap.predicates.whitelist.entries,
+            "whitelist_entries": ctx.wl_tree.entries.iter().map(|e| serde_json::json!({
+                "key": hex(&e.key), "send_after": e.send_after, "recv_after": e.recv_after,
+            })).collect::<Vec<_>>(),
             "whitelist_root": hex(&ctx.wl_tree.root()),
             "blacklist_root": hex(&ctx.bl_tree.root()),
             "blacklisted_outpoint_keys": ctx.bl_tree.keys.iter()
                 .map(|k| hex(k)).collect::<Vec<_>>(),
+            "transfer_limit": ctx.limit,
             "pi": hex(&pi_of(&snap, &ctx)),
         },
         "programs": {
@@ -491,8 +575,8 @@ fn cmd_vectors(args: &Args) -> Result<(), String> {
             "depth": dmt::DEPTH,
             "guard_lo": hex(&dmt::GUARD_LO),
             "guard_hi": hex(&dmt::GUARD_HI),
-            "leaf_of_guard_lo": hex(&dmt::leaf_hash(&dmt::GUARD_LO)),
-            "leaf_of_guard_hi": hex(&dmt::leaf_hash(&dmt::GUARD_HI)),
+            "leaf_of_guard_lo": hex(&dmt::leaf_hash(&dmt::Entry::unrestricted(dmt::GUARD_LO))),
+            "leaf_of_guard_hi": hex(&dmt::leaf_hash(&dmt::Entry::unrestricted(dmt::GUARD_HI))),
             "empty_root": hex(&dmt::Tree::new(vec![])?.root()),
             "interval_leaf_of_guards": hex(&dmt::interval_leaf_hash(&dmt::GUARD_LO, &dmt::GUARD_HI)),
             "interval_pad_leaf": hex(&dmt::interval_leaf_hash(&dmt::GUARD_HI, &dmt::GUARD_HI)),
@@ -546,7 +630,9 @@ fn cmd_transfer_build(args: &Args) -> Result<(), String> {
                     serde_json::json!({
                         kind: i + 1,
                         "key": hex(&key.serialize()),
-                        "dmt_index": proof.index,
+                        "dmt_index": proof.path.index,
+                        "send_after": proof.entry.send_after,
+                        "recv_after": proof.entry.recv_after,
                     })
                 })
             })
@@ -562,11 +648,13 @@ fn cmd_transfer_build(args: &Args) -> Result<(), String> {
                 serde_json::json!({
                     "input": i + 1,
                     "owner": hex(&key.serialize()),
-                    "dmt_index": owner_proof.index,
+                    "dmt_index": owner_proof.path.index,
+                    "send_after": owner_proof.entry.send_after,
+                    "recv_after": owner_proof.entry.recv_after,
                     "blacklist_interval": {
                         "lo": hex(&interval.lo),
                         "hi": hex(&interval.hi),
-                        "dmt_index": interval.proof.index,
+                        "dmt_index": interval.path.index,
                     },
                 })
             })

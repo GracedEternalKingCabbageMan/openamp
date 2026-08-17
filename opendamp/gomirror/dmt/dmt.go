@@ -12,6 +12,8 @@
 //     is a different function entirely.)
 //   - keys sort by unsigned bytewise comparison of the 32-byte key, not by
 //     insertion order and not by any display form.
+//   - a whitelist leaf commits the key AND its two height windows. Hashing the
+//     key alone produces a different root and every proof fails at consensus.
 package dmt
 
 import (
@@ -19,6 +21,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"sort"
 )
 
@@ -51,11 +54,35 @@ var (
 	}()
 )
 
-// LeafHash returns SHA256(0x00 || key).
-func LeafHash(key Key) [32]byte {
+// Entry is a whitelist entry: an approved key plus its two height windows.
+//
+// SendAfter is the lockup: the holder cannot own a regulated INPUT until the
+// transaction proves a locktime height at or above it. RecvAfter is the receive
+// window (the Reg S pattern): the holder cannot own a regulated OUTPUT until the
+// same bound is proven. Zero means unrestricted and costs nothing at consensus.
+//
+// The bounds live in the leaf, so the one membership proof that shows a key is
+// approved also shows which windows bind it.
+type Entry struct {
+	Key       Key
+	SendAfter uint32
+	RecvAfter uint32
+}
+
+// Unrestricted builds an entry with no height windows.
+func Unrestricted(key Key) Entry { return Entry{Key: key} }
+
+func putBE32(h io.Writer, v uint32) {
+	h.Write([]byte{byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)})
+}
+
+// LeafHash returns SHA256(0x00 || key || BE32(SendAfter) || BE32(RecvAfter)).
+func LeafHash(e Entry) [32]byte {
 	h := sha256.New()
 	h.Write([]byte{0x00})
-	h.Write(key[:])
+	h.Write(e.Key[:])
+	putBE32(h, e.SendAfter)
+	putBE32(h, e.RecvAfter)
 	var out [32]byte
 	copy(out[:], h.Sum(nil))
 	return out
@@ -73,12 +100,19 @@ func NodeHash(left, right [32]byte) [32]byte {
 	return out
 }
 
-// Proof is a membership proof: 16 sibling hashes bottom-up plus the leaf slot.
-// Bit j of Index (LSB first) is 1 exactly when the running node at level j is
-// the right child.
-type Proof struct {
+// Path is the Merkle path of a leaf: 16 sibling hashes bottom-up plus the leaf
+// slot. Bit j of Index (LSB first) is 1 exactly when the running node at level j
+// is the right child.
+type Path struct {
 	Siblings [Depth][32]byte
 	Index    uint16
+}
+
+// Proof is a whitelist membership proof: the entry proven plus its path. The
+// entry travels with the proof because the covenant rebuilds the leaf from it.
+type Proof struct {
+	Entry Entry
+	Path  Path
 }
 
 // Level pairs a sibling hash with whether the running node is the right child
@@ -88,8 +122,8 @@ type Level struct {
 	IsRight bool
 }
 
-// Levels returns the proof in covenant-witness order, bottom-up.
-func (p *Proof) Levels() [Depth]Level {
+// Levels returns the path in covenant-witness order, bottom-up.
+func (p *Path) Levels() [Depth]Level {
 	var out [Depth]Level
 	for j := 0; j < Depth; j++ {
 		out[j] = Level{
@@ -100,9 +134,8 @@ func (p *Proof) Levels() [Depth]Level {
 	return out
 }
 
-// Verify recomputes the root from key and proof and compares it with root.
-func Verify(root [32]byte, key Key, p *Proof) bool {
-	node := LeafHash(key)
+func (p *Path) fold(leaf [32]byte) [32]byte {
+	node := leaf
 	for j := 0; j < Depth; j++ {
 		if (p.Index>>uint(j))&1 == 1 {
 			node = NodeHash(p.Siblings[j], node)
@@ -110,14 +143,24 @@ func Verify(root [32]byte, key Key, p *Proof) bool {
 			node = NodeHash(node, p.Siblings[j])
 		}
 	}
-	return node == root
+	return node
+}
+
+// Verify recomputes the root from the proof and compares it with root. The key
+// must match the entry the proof carries, so a proof cannot be moved to a
+// different key.
+func Verify(root [32]byte, key Key, p *Proof) bool {
+	if p.Entry.Key != key {
+		return false
+	}
+	return p.Path.fold(LeafHash(p.Entry)) == root
 }
 
 // Tree is a built dmt-v1 tree over a set of real keys.
 type Tree struct {
-	keys   []Key        // sorted, unique, guards excluded
-	levels [][][32]byte // levels[0] = occupied leaf prefix; levels[Depth] = {root}
-	pad    [][32]byte   // pad[j] = hash of an all-GuardHi subtree of height j
+	entries []Entry      // sorted by key, unique, guards excluded
+	levels  [][][32]byte // levels[0] = occupied leaf prefix; levels[Depth] = {root}
+	pad     [][32]byte   // pad[j] = hash of an all-GuardHi subtree of height j
 }
 
 // ErrEmptyDuplicate and friends are returned by New for inputs that would make
@@ -127,22 +170,22 @@ var (
 	ErrGuard     = errors.New("dmt-v1: key collides with a guard value")
 )
 
-// New builds the tree over keys, in any order. Keys are sorted and must be
-// unique and distinct from both guards.
-func New(keys []Key) (*Tree, error) {
-	sorted := make([]Key, len(keys))
-	copy(sorted, keys)
+// New builds the tree over entries, in any order. Slot order is by key; keys
+// must be unique and distinct from both guards.
+func New(entries []Entry) (*Tree, error) {
+	sorted := make([]Entry, len(entries))
+	copy(sorted, entries)
 	sort.Slice(sorted, func(i, j int) bool {
-		return bytes.Compare(sorted[i][:], sorted[j][:]) < 0
+		return bytes.Compare(sorted[i].Key[:], sorted[j].Key[:]) < 0
 	})
 	for i := 1; i < len(sorted); i++ {
-		if sorted[i] == sorted[i-1] {
-			return nil, fmt.Errorf("%w: %x", ErrDuplicate, sorted[i])
+		if sorted[i].Key == sorted[i-1].Key {
+			return nil, fmt.Errorf("%w: %x", ErrDuplicate, sorted[i].Key)
 		}
 	}
-	for _, k := range sorted {
-		if k == GuardLo || k == GuardHi {
-			return nil, fmt.Errorf("%w: %x", ErrGuard, k)
+	for _, e := range sorted {
+		if e.Key == GuardLo || e.Key == GuardHi {
+			return nil, fmt.Errorf("%w: %x", ErrGuard, e.Key)
 		}
 	}
 	if len(sorted) > Capacity {
@@ -150,16 +193,16 @@ func New(keys []Key) (*Tree, error) {
 	}
 
 	pad := make([][32]byte, Depth+1)
-	pad[0] = LeafHash(GuardHi)
+	pad[0] = LeafHash(Unrestricted(GuardHi))
 	for j := 0; j < Depth; j++ {
 		pad[j+1] = NodeHash(pad[j], pad[j])
 	}
 
 	levels := make([][][32]byte, Depth+1)
 	level0 := make([][32]byte, 0, len(sorted)+1)
-	level0 = append(level0, LeafHash(GuardLo))
-	for _, k := range sorted {
-		level0 = append(level0, LeafHash(k))
+	level0 = append(level0, LeafHash(Unrestricted(GuardLo)))
+	for _, e := range sorted {
+		level0 = append(level0, LeafHash(e))
 	}
 	levels[0] = level0
 	for j := 0; j < Depth; j++ {
@@ -175,14 +218,28 @@ func New(keys []Key) (*Tree, error) {
 		}
 		levels[j+1] = next
 	}
-	return &Tree{keys: sorted, levels: levels, pad: pad}, nil
+	return &Tree{entries: sorted, levels: levels, pad: pad}, nil
 }
 
-// Keys returns the sorted real keys (guards excluded).
-func (t *Tree) Keys() []Key {
-	out := make([]Key, len(t.keys))
-	copy(out, t.keys)
+// Entries returns the sorted entries (guards excluded).
+func (t *Tree) Entries() []Entry {
+	out := make([]Entry, len(t.entries))
+	copy(out, t.entries)
 	return out
+}
+
+// EntryOf returns the committed entry for key, if approved.
+func (t *Tree) EntryOf(key Key) (Entry, bool) {
+	if key == GuardLo || key == GuardHi {
+		return Unrestricted(key), true
+	}
+	i := sort.Search(len(t.entries), func(i int) bool {
+		return bytes.Compare(t.entries[i].Key[:], key[:]) >= 0
+	})
+	if i < len(t.entries) && t.entries[i].Key == key {
+		return t.entries[i], true
+	}
+	return Entry{}, false
 }
 
 // Root returns the tree root.
@@ -197,12 +254,12 @@ func (t *Tree) SlotOf(key Key) (uint16, bool) {
 		return 0, true
 	}
 	if key == GuardHi {
-		return uint16(len(t.keys) + 1), true
+		return uint16(len(t.entries) + 1), true
 	}
-	i := sort.Search(len(t.keys), func(i int) bool {
-		return bytes.Compare(t.keys[i][:], key[:]) >= 0
+	i := sort.Search(len(t.entries), func(i int) bool {
+		return bytes.Compare(t.entries[i].Key[:], key[:]) >= 0
 	})
-	if i < len(t.keys) && t.keys[i] == key {
+	if i < len(t.entries) && t.entries[i].Key == key {
 		return uint16(i + 1), true
 	}
 	return 0, false
@@ -221,10 +278,14 @@ func (t *Tree) Prove(key Key) (*Proof, bool) {
 	if !ok {
 		return nil, false
 	}
-	p := &Proof{Index: slot}
+	entry, ok := t.EntryOf(key)
+	if !ok {
+		return nil, false
+	}
+	p := &Proof{Entry: entry, Path: Path{Index: slot}}
 	idx := int(slot)
 	for j := 0; j < Depth; j++ {
-		p.Siblings[j] = t.nodeAt(j, idx^1)
+		p.Path.Siblings[j] = t.nodeAt(j, idx^1)
 		idx >>= 1
 	}
 	return p, true
@@ -240,18 +301,18 @@ func (t *Tree) Adjacent(key Key) (lo, hi Key, loProof, hiProof *Proof, ok bool) 
 		return lo, hi, nil, nil, false
 	}
 	// Slot sequence including guards: 0=GuardLo, 1..n=keys, n+1=GuardHi.
-	i := sort.Search(len(t.keys), func(i int) bool {
-		return bytes.Compare(t.keys[i][:], key[:]) >= 0
+	i := sort.Search(len(t.entries), func(i int) bool {
+		return bytes.Compare(t.entries[i].Key[:], key[:]) >= 0
 	})
 	// i is the count of real keys below `key`, so the predecessor is slot i and
 	// the successor is slot i+1 in the guarded sequence.
 	lo = GuardLo
 	if i > 0 {
-		lo = t.keys[i-1]
+		lo = t.entries[i-1].Key
 	}
 	hi = GuardHi
-	if i < len(t.keys) {
-		hi = t.keys[i]
+	if i < len(t.entries) {
+		hi = t.entries[i].Key
 	}
 	loProof, ok = t.Prove(lo)
 	if !ok {
@@ -310,9 +371,9 @@ func OutpointKey(txidInternal [32]byte, vout uint32) Key {
 // IntervalProof is a non-membership proof: the covering interval plus the
 // membership proof of its leaf.
 type IntervalProof struct {
-	Lo    Key
-	Hi    Key
-	Proof Proof
+	Lo   Key
+	Hi   Key
+	Path Path
 }
 
 // IntervalTree is the blacklist tree over a set of listed keys.
@@ -415,13 +476,13 @@ func (t *IntervalTree) ProveAbsent(key Key) (*IntervalProof, bool) {
 	if i < len(t.keys) {
 		hi = t.keys[i]
 	}
-	p := Proof{Index: uint16(i)}
+	p := Path{Index: uint16(i)}
 	idx := i
 	for j := 0; j < Depth; j++ {
 		p.Siblings[j] = t.nodeAt(j, idx^1)
 		idx >>= 1
 	}
-	return &IntervalProof{Lo: lo, Hi: hi, Proof: p}, true
+	return &IntervalProof{Lo: lo, Hi: hi, Path: p}, true
 }
 
 // VerifyAbsent checks a non-membership proof exactly as the covenant does:
@@ -430,13 +491,5 @@ func VerifyAbsent(root [32]byte, key Key, p *IntervalProof) bool {
 	if bytes.Compare(p.Lo[:], key[:]) >= 0 || bytes.Compare(key[:], p.Hi[:]) >= 0 {
 		return false
 	}
-	node := IntervalLeafHash(p.Lo, p.Hi)
-	for j := 0; j < Depth; j++ {
-		if (p.Proof.Index>>uint(j))&1 == 1 {
-			node = NodeHash(p.Proof.Siblings[j], node)
-		} else {
-			node = NodeHash(node, p.Proof.Siblings[j])
-		}
-	}
-	return node == root
+	return p.Path.fold(IntervalLeafHash(p.Lo, p.Hi)) == root
 }

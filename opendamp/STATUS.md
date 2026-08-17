@@ -8,14 +8,16 @@ through issuance, registry validation) is not in scope.
 
 Nothing here is deployed to any live chain.
 
-**The headline: the DAMP core, the whitelist and the blacklist are all enforced
-by consensus. Removing a holder from the whitelist stops that holder SPENDING,
-and listing an outpoint stops that UTXO alone. The freeze is real, per-holder
-and per-outpoint, and both are reversible by a further policy update. All of it
-is proved against a real node (section 4).**
+**The headline: every predicate the design document specifies for the covenant is
+now enforced by consensus — confinement, the whitelist, the blacklist, the
+transfer limit and the height windows. Removing a holder from the whitelist stops
+that holder SPENDING; listing an outpoint stops that UTXO alone; a limit caps what
+leaves a sender in one transfer; a lockup or receive window binds to a height.
+Every one of them is proved against a real node (section 4).**
 
-Two predicates from the design document remain unenforced and are named in
-section 2: the transfer limit and the height windows.
+Section 2 is empty of unenforced covenant predicates. What remains off-chain is
+what the design document itself puts off-chain (velocity, holder caps), plus the
+non-covenant work listed in section 6.
 
 ## 1. Enforced by consensus (proved on elementsregtest)
 
@@ -50,6 +52,8 @@ coins; it is P(pi) that stops them.
    - its script must equal `C_U(X_i)` for the witness-supplied owner key `X_i`,
      which binds `X_i` to that input;
    - `X_i` must be a member of the committed whitelist — **this is the freeze**;
+   - `X_i`'s **lockup** must have expired (`check_lock_height(send_after)`);
+   - every regulated input must have the **same** owner (section 5);
    - the input's outpoint must **not** be in the committed blacklist, proven by
      exhibiting the dmt-v1 interval leaf that strictly contains
      `SHA256(txid || BE32(vout))` — **this is the per-outpoint freeze**;
@@ -60,8 +64,17 @@ coins; it is P(pi) that stops them.
    - the asset id must be **explicit**;
    - an output carrying A must pay `C_U(Y)` for the witness-supplied recipient
      key `Y`, rebuilt with the taproot-construction jets;
-   - that `Y` must carry a whitelist membership proof.
-5. **A is never a fee output.** Enforced by the same script equality as 4: a fee
+   - that `Y` must carry a whitelist membership proof;
+   - `Y`'s **receive window** must have opened (`check_lock_height(recv_after)`)
+     — the Reg S pattern.
+5. **Transfer limit.** The sum of every A output paying an owner *other than the
+   sender* must not exceed the committed limit, computed with an overflow check
+   so a wrapping sum cannot slip under it. Change — an output paying the sender
+   back — does not count and may keep a blinded value; a payment to anyone else
+   must expose an explicit value, or the limit could be evaded behind a value
+   commitment. Change is identified by **recipient key equal to the sender's**,
+   never by output position, which the spender chooses.
+6. **A is never a fee output.** Enforced by the same script equality as 4: a fee
    output has an empty scriptPubKey, whose hash can never equal a P2TR script's.
    Fee outputs in *other* assets pass, which is what the any-asset fee market
    requires.
@@ -117,16 +130,25 @@ Both doors are shut, and the regtest test walks through both.
 
 ## 2. NOT enforced
 
-- **Transfer limit** (design doc 3.4). A snapshot may carry `limit` and it enters
-  pi's `rules_root`, but no program reads it. The CLI warns when a snapshot sets
-  one.
-- **Height windows** (3.5). Not implemented.
-- **Velocity, holder caps** (3.6). Off-chain by design; unchanged.
+**No covenant predicate from the design document is unenforced.** Sections 3.2
+(blacklist), 3.3 (whitelist), 3.4 (transfer limit) and 3.5 (height windows) are
+all live, along with the confinement core of 2.1–2.3.
+
+What is deliberately outside the covenant:
+
+- **Velocity and holder caps** (design doc 3.6). These need global chain state a
+  covenant cannot see; the design document puts them with the registrar, and they
+  stay there.
 - **Confidential values.** The covenant requires explicit asset ids on every
-  input and output it scans; this build's transaction builder also produces
-  explicit values. Confidential *values* on non-A outputs are permitted by the
-  covenant but untested.
+  input and output it scans, and explicit *values* on limited payments. Blinded
+  values are permitted on change and on non-A outputs, and are untested here.
 - **Redemption.** No redemption branch, as the design document specifies for v1.
+
+And a rule the tooling now enforces rather than warns about: the snapshot parser
+uses `deny_unknown_fields` throughout, so a predicate this build cannot enforce is
+a **hard error**, not an ignored field. An issuer cannot publish a policy that
+does not bind. A `limit` of 0 is likewise refused, because it would forbid every
+payment and is almost certainly a mistake for "no limit" (which is `null`).
 
 ## 3. Budget: measured, not estimated
 
@@ -140,20 +162,20 @@ change), at `N_max_inputs = 4`, `N_max_outputs = 6`, `D = 16`:
 
 | quantity | value |
 |---|---|
-| P(pi) static cost | 16,267,739 milli-WU = **16,268 WU** |
-| P(pi) witness stack | **20,301 B** (16,384 B of it pad) |
-| P(pi) budget bought | **20,351 WU** |
-| headroom | **4,083 WU (20%)** |
+| P(pi) static cost | 21,831,549 milli-WU = **21,832 WU** |
+| P(pi) witness stack | **26,830 B** (22,528 B of it pad) |
+| P(pi) budget bought | **26,880 WU** |
+| headroom | **5,048 WU**, a 23% margin over cost |
 | U witness stack (per user input) | **633 B** |
 | U static cost | 228,208 milli-WU = 229 WU, against 683 WU bought |
-| finalized transfer size | ~21.5 kB |
+| finalized transfer size | ~28 kB |
 
 The consensus cap of 4,000,050 WU is nowhere near; the binding constraint is what
 the padding costs in fees and block space. Standard-transaction limits are
 satisfied — the 80-byte stack-item limit applies only to tapscript (leaf version
 0xc0), not to Simplicity leaves (0xbe).
 
-The 20% headroom is the **worst** case, measured with only one of three input
+That margin is the **worst** case, measured with only one of three input
 slots and two of five output slots carrying proofs. Cost is static, so filling
 more slots leaves it unchanged while each additional proof adds witness bytes and
 therefore budget: a fuller transfer has *more* headroom, not less.
@@ -163,16 +185,31 @@ arithmetic that stops holding fails a test rather than a node):
 
 | component | static cost |
 |---|---|
-| whole P(pi), unpruned | 16,434,845 milli-WU |
-| one OUTPUT slot (asset + C_U(Y) + whitelist fold) | 1,012,306 = **1,012 WU** |
-| one INPUT slot (asset + C_U(X) + whitelist fold + blacklist) | 2,015,401 = **2,015 WU** |
-| ...of which blacklist non-membership | 928,009 = 928 WU |
+| whole P(pi), unpruned | 21,998,655 milli-WU |
+| one OUTPUT slot (asset + amount + C_U(Y) + whitelist fold + window) | 1,441,203 = **1,441 WU** |
+| one INPUT slot (asset + C_U(X) + whitelist fold + window + blacklist) | 2,423,316 = **2,423 WU** |
+| ...of which blacklist non-membership | 928,521 = 929 WU |
 | ...of which the two 256-bit comparisons | 93,658 = 94 WU |
-| a dmt-v1 membership fold, D = 16 | 772,296 = 772 WU |
+| a dmt-v1 membership fold, D = 16 | 796,234 = 796 WU |
+| the transfer limit, marginal (single sender + change detection + sum + bound) | 73,756 = **74 WU** |
+| the height windows, marginal (lock jets + two words per leaf) | 184,312 = **184 WU** |
 
-A used output slot's witness is 561 B and a used input slot's is 1,153 B, each
-buying an equal number of WU back, so an output check costs ~450 WU net and an
-input check ~862 WU net.
+A used output slot's witness is 569 B and a used input slot's is 1,161 B, each
+buying an equal number of WU back, so an output check costs ~872 WU net and an
+input check ~1,262 WU net.
+
+### The last two predicates were cheap; landing them was not
+
+The limit and the windows cost **258 WU between them** — the windows because the
+bounds ride inside the whitelist leaf that was already being folded, so they add
+no Merkle work at all, and the limit because it is arithmetic rather than hashing.
+
+Landing them nonetheless raised P(pi) by 2,567 WU at equal pad (16,268 → 18,835
+WU before the pad was grown). The difference is restructuring, not enforcement:
+`check_output` now reads `output_amount` rather than only `output_asset`, returns
+a `u64`, and every whitelist slot's witness grew from a 2-tuple to a 4-tuple. Both
+figures are quoted because only one of them answers "what does this rule cost",
+and the other answers "what did this change cost".
 
 ### Why N_max_inputs = 4 and N_max_outputs = 6
 
@@ -201,7 +238,7 @@ Three approaches were tried; only the third works:
 2. **A bounded list (`List<u8, N>`)** is cost-neutral: the type's own static cost
    grows about as fast per byte of bound as the budget that byte buys. Measured:
    at bound 8192 the deficit was 9,714 B; at bound 32768, 33,999 B.
-3. **A fixed-size array, read on every execution.** `[u256; 512]` costs ~306
+3. **A fixed-size array, read on every execution.** `[u256; 704]` costs ~306
    milli-WU per byte and buys 1,000. It must be *read*: an unused witness is
    dropped by pruning (pinned by `tests/pruning.rs`: 32 B survives when one word
    is read, 1024 B when all are absorbed), and pruning is mandatory. `absorb`
@@ -233,31 +270,56 @@ run rather than being stable):
 
 | proof | result |
 |---|---|
-| 1. issue A and V, fund C_U(alice) and C_V(pi0 = wl {alice,bob}) | `832b28c0…`, `dc4191be…` |
-| 2. alice → bob, **no third party signature** | `5053f61da24ae941fcad2dce4d5bf6793aad4f39043fbdc51cb6120483d1ec1a` |
+| 1. issue A and V, fund C_U(alice) and C_V(pi0 = wl {alice,bob}) | `ebb2dbb6…`, `802f2535…` |
+| 2. alice → bob, **no third party signature** | `68ca9c7102408121d38cee47eda6ff317be7dae1ac8dc022d9c525380037676b` |
 | 3a. builder/BitMachine refuses an unconfined A output | `Jet failed during execution` |
 | 3b. **node** rejects it | `Assertion failed inside jet` |
 | 4a. builder refuses carol as recipient (no proof under pi0) | `not in the whitelist` |
 | 4b. **node** rejects bob's proof reused to pay carol | `Assertion failed inside jet` |
 | 4c. **node** rejects P(pi0) spending C_V(pi1) | `Witness program hash mismatch` |
-| 5a. issuer update pi0 → pi1 (adds carol) | `5b55399e3b14ad2dc0963b6d94960b7eb4be2b286b38d6fa60749f99ffff3a0d` |
-| 5b. alice → carol under pi1 | `a973068b20deba59555285d52221901a8b24ba0f1a0a2490324de79ca4c0ff61` |
-| **7a. issuer update pi1 → pi2 REMOVING alice (the freeze)** | `92ff15f49da08f81bec8d91f4083e81aab0bc2fd7fb2655aee9063b68f6cd78d` |
+| 5a. issuer update pi0 → pi1 (adds carol) | `99c830f28c896e75b7d60c67701ee041d83604443481ccaff0f82e4746e8dcf8` |
+| 5b. alice → carol under pi1 | `764fa7d031da324463a7f93c8aa028e0aad703b87c824761eb3ff9e8b2c9fee3` |
+| **7a. issuer update pi1 → pi2 REMOVING alice (the freeze)** | `b4c8d17a4ce28b4644bd759eb1e2031d976c3dcf49756305b481d6d8ccb261a9` |
 | 7b. alice cannot spend: no owner proof exists under pi2 | `owner key 1b84c556… is not in the whitelist: these coins are frozen` |
 | 7c. her stale pi1 proof fails the pi2 fold, so it cannot be pruned | `Jet failed during execution` |
 | 7d. **node** rejects the only submittable form of it | `Program has FAIL node` |
 | 7e. **node** rejects bob's whitelisted identity used for alice's input | `Assertion failed inside jet` |
-| 7f. bob still spends under pi2 — the freeze is per holder | `6e0b5fa3a05c9a39ee9d5c35c01b788424870a33a64bd40fd4c9bbd7e1486efd` |
-| 7g. issuer update pi2 → pi3 restoring alice | `3f306d9162d307ba0a374c5682b30654b19f3f08fe95ac52ad5d520577686d08` |
-| 7h. alice spends again — the freeze is reversible | `ce55c9da3aa3b88c83eafe13f63a3abfbd0c0caef6fe04cb7ea727b801cce496` |
-| **8a. issuer update pi3 → pi4 blacklisting one of alice's outpoints** | `8ccab87952f9c5bfbed8e06cf10e77e8cb9534b61a8f2888955dc6461d43f98e` |
+| 7f. bob still spends under pi2 — the freeze is per holder | `90b28afc4d6627855dd2d0c99c714a6c9eeed392925a7b759d2e4e9d96675f18` |
+| 7g. issuer update pi2 → pi3 restoring alice | `3ace58dc1da331d0ff90c9f7f5cffb93d6abba0dccbf57deb40f85c0796639c5` |
+| 7h. alice spends again — the freeze is reversible | `0b2d5b441a49bc43a87cbfeea64eacfadc0d613afb5cfd39a209198bb65fe4b5` |
+| **8a. issuer update pi3 → pi4 blacklisting one of alice's outpoints** | `1cf9bc14204f2a6f2aae4ce74e35e8d8e8209b0a0737c266c9d764a6fbf59804` |
 | 8b. alice cannot spend that outpoint: no interval covers it | `outpoint …:2 is blacklisted: these coins are frozen` |
 | 8c. the pre-freeze interval proof fails the pi4 root | `Jet failed during execution` |
 | 8d. **node** rejects the only submittable form of it | `Program has FAIL node` |
-| 8e. issuer update pi4 → pi5 lifting the listing | `be0876ffbb41079b3f391f5cb214de19d3237a2fc7304dc1e4f438876a2e5d5f` |
-| 8f. the same outpoint spends once unlisted | `e613247268f6308656ab0314bed04dda9a2cd2acc14c25d620ccc436e1062c30` |
-| 6a. halt: V to a plain address | `20a9a232cae9091589ccae98519b173aaed71b47d38d62825cb79a4a27e18c51` |
+| 8e. issuer update pi4 → pi5 lifting the listing | `51977fe15af5865f125d929eae57beb398866503abeb94261b0ece6d82f06b00` |
+| 8f. the same outpoint spends once unlisted | `bfb09d1251569e81a2de0e9ccd015af1cf1146e773753d628375a16d367f7d9f` |
+| **9a. issuer update pi5 → pi6 setting a transfer limit of 20,000,000** | `bba0f2659980361e6e8e0e7076b19489eb5984cc5daf71a747cf0b021e7080de` |
+| 9b. builder refuses a payment of limit + 1 | `pays 20000001 atoms to other owners, over the committed transfer limit` |
+| 9c. **node** rejects the over-limit payment | `Assertion failed inside jet` |
+| 9d. a payment of exactly the limit confirms, alongside 120,000,000 of change that does **not** count | `58bff41c29119eb09647ab278cc3a3c3f384279e549101dc2259ee7c620bdc32` |
+| **10a. issuer update pi6 → pi7 at height 115: alice locked up, carol unable to receive, until height 120** | `4ac9c86e09db8e56a2625a6afef005282e727abc0e2df63a0c0f7a3d4d88a630` |
+| 10b. builder refuses a transfer claiming no height | `needs locktime >= 120 (a height window applies)` |
+| 10c. **consensus** rejects an honest claim of height 120 made at height 116 | `non-final` |
+| 10d. builder refuses an understated height | `needs locktime >= 120 … asks for 117` |
+| 10e. **node** rejects an understated height that is otherwise perfectly minable | `Assertion failed inside jet` |
+| 10f. the same honest transaction confirms once the chain reaches the bound | `944b021ad8653311f8ac7c82590322194c4ad839075655f3bc4338b38bd2103c` |
+| 6a. halt: V to a plain address | `d4d312bb07ead240d91c80ae47b9ed82d1ae761e469b21433657d8bf4cb1fed8` |
 | 6b. **node** rejects any transfer after the halt | `Witness program hash mismatch` |
+
+### Both halves of the height reduction, separately
+
+A covenant cannot read the chain height, so the windows work in two steps and the
+test proves each on its own:
+
+- **10c** is consensus refusing a claim that has not come true: the covenant was
+  satisfied by a locktime of 120, and the node still would not take the
+  transaction at height 116.
+- **10e** is the covenant refusing an understated claim: at height 122 a locktime
+  of 117 is perfectly minable, so the mempool's finality rule has nothing to say,
+  and the transaction is rejected on `check_lock_height` alone.
+
+Neither half is sufficient by itself, which is why both are asserted rather than
+one being inferred from the other.
 
 ### On the refusal proofs, precisely
 
@@ -298,6 +360,21 @@ makes non-membership one ordinary membership proof: 928 WU per input instead of
 roughly double. Full construction, and why a listed key cannot be proven absent:
 `SPEC-dmt-v1.md` section 7.
 
+**All regulated inputs of a transfer must share one owner.** The transfer limit
+needs this twice over: a limit is per sender, and change is identified by the
+recipient key equalling the sender's, which presupposes a well-defined sender.
+Rather than make the rule conditional on a limit being set — two program shapes,
+and a subtle difference between them — it is unconditional. The cost is that two
+holders cannot co-spend into a single transfer. That is a stated v1 restriction,
+not an oversight, and it is cheap to lift later by making the check conditional.
+
+**Height windows live in the whitelist leaf, not a tree of their own.** A separate
+window tree would have meant a second membership fold per slot — 796 WU each,
+eight slots — for information that belongs to the same key the first fold already
+proves. Binding `send_after` and `recv_after` into the leaf makes them free and
+makes them unforgeable: a holder cannot claim a shorter lockup, because changing
+either bound changes the leaf and the path stops reaching the root.
+
 **Fixed input-zero position** for the verifier, as the design document accepts.
 
 Mirrors: `src/dmt.rs`, `gomirror/dmt/` (stdlib-only Go, tests asserting the same
@@ -306,26 +383,32 @@ recomputation as a third opinion.
 
 ## 6. What remains
 
-1. **Transfer limit and height windows** (design doc 3.4, 3.5). The limit needs
-   explicit values and a bounded sum; the windows need `lock_time` comparison
-   plus a class-keyed list. Budget: 4,083 WU of headroom, or buy more with pad.
-2. **More than two regulated inputs per transfer.** A budget purchase, not a
-   design change: ~2,015 WU and ~65 pad words per extra input slot.
-3. **Confidential values on non-A outputs.** Permitted by the covenant,
-   untested; needs a regtest case with a blinded change output.
-4. **External signature ingestion in the CLI.** `transfer-build` prints each user
+Nothing in the covenant. What is left is integration and operations.
+
+1. **More than two regulated inputs per transfer.** A budget purchase, not a
+   design change: ~2,423 WU and ~110 pad words per extra input slot. Lifting the
+   single-sender restriction goes with it (make the owner-agreement check
+   conditional on a limit being committed).
+2. **Confidential values on non-A outputs and on change.** Permitted by the
+   covenant, untested; needs a regtest case with a blinded change output.
+3. **External signature ingestion in the CLI.** `transfer-build` prints each user
    input's `sig_all_hash` and the library accepts an externally produced BIP340
    signature, but `transfer-finalize` still signs only from a supplied private
    key. A `--sig INDEX:HEX` flag is the missing piece for hardware and FROST
    signers.
-5. **Parallel verifier outputs** (design doc section 6). Untouched; the single
+4. **Parallel verifier outputs** (design doc section 6). Untouched; the single
    verifier output is a spending race, which a busy asset will hit first.
-6. **Snapshot signing and publication.** `issuer_sig` over the canonical snapshot
+5. **Snapshot signing and publication.** `issuer_sig` over the canonical snapshot
    belongs with M2's policy service.
-7. **Golden CMR vectors under CI.** `vectors/addresses.json` pins U/P/G CMRs,
+6. **Golden CMR vectors under CI.** `vectors/addresses.json` pins U/P/G CMRs,
    tapleaf and TapData hashes, output keys, script pubkeys, control blocks, both
-   chains' addresses and the dmt-v1 constants. Nothing yet fails a build when a
-   CMR moves; it should.
+   chains' addresses, per-holder window bounds and the dmt-v1 constants. Nothing
+   yet fails a build when a CMR moves; it should.
+7. **Transaction size.** A transfer is ~28 kB, almost all of it budget padding.
+   That is a real fee cost on a live chain and the honest lever on it is the
+   Simplicity cost model, not this crate: every check here is already paid for at
+   the cheapest shape found. Reducing `D` from 16 to 12 (4,094 holders) would
+   save ~199 WU per fold across eight slots.
 8. **Live testnet pilot** (M4). The anyone-can-spend hazard makes
    `getdeploymentinfo` reporting simplicity active a hard precondition for
    funding any covenant address, on any chain.

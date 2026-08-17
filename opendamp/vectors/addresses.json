@@ -4,13 +4,13 @@
   "dmt_v1": {
     "depth": 16,
     "empty_blacklist_root": "009a25ef01f6cade2d114b8315aab47bf5599e3a1386c2f1d414f0e8d6dbf301",
-    "empty_root": "e69f2dc2186b1cca0ed37d851b60121a87832be1ff7f61d58bc4931d26c844cf",
+    "empty_root": "b883626f07bded09c45c76719b43e85945c0ac41ee370d47932f269dd6eabfed",
     "guard_hi": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
     "guard_lo": "0000000000000000000000000000000000000000000000000000000000000000",
     "interval_leaf_of_guards": "1fd8164b6e61192e120f01ca504c786a6e193abe0265104c1303a9b1e09afc39",
     "interval_pad_leaf": "507647244d0d51f754f23c5f23c4f9e6a84eeabd0524bd20fe2d932f539be8d4",
-    "leaf_of_guard_hi": "5e16d316ecd5773e50c3b02737d424192b02f25b4245822079181c557aafda7d",
-    "leaf_of_guard_lo": "7f9c9e31ac8256ca2f258583df262dbc7d6f68f2a03043d5c99a4ae5a7396ce9"
+    "leaf_of_guard_hi": "dc8c3b446f21ee93e5ea4d016c916e8ffd952e3f594462fe0f2a0befe3580c59",
+    "leaf_of_guard_lo": "9e1736c43d19118e6ce4302118af337109491ecc52757dfb949bad6a7940b0c2"
   },
   "issuer_key": "56b328b30c8bf5839e24058747879408bdb36241dc9c2e7c619faa12b2920967",
   "note": "OpenDAMP taproot derivation golden vectors. TapLeaf/elements, TapBranch/elements and TapTweak/elements are BIP341-style tagged hashes (SHA256(SHA256(tag)||SHA256(tag)||msg)) with the /elements suffix; TapData is the bare string \"TapData\", tagged the same way. A Simplicity leaf hashes as H_TapLeaf(0xbe || compact_size(32) || CMR). TapBranch sorts its two children lexicographically; TapData sorts nothing. All hex is in internal byte order except asset ids and CMRs, which print reversed, as txids do.",
@@ -20,23 +20,36 @@
     "blacklisted_outpoint_keys": [
       "2f0a781be235d95128c10c39d23ceffc6b683ecafd784b2510b2897a3b4dd799"
     ],
-    "pi": "bbaefc006dd7eecae091f355cb9118a02d93af313558da1e4ae7380244d36e2c",
+    "pi": "7fcee6927d704020edb46159da07300ee0822228adcab9f6094e88051138fa6a",
     "seq": 0,
+    "transfer_limit": 300000000,
     "whitelist_entries": [
-      "1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f",
-      "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766",
-      "462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b"
+      {
+        "key": "1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f",
+        "recv_after": 0,
+        "send_after": 0
+      },
+      {
+        "key": "462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+        "recv_after": 400,
+        "send_after": 0
+      },
+      {
+        "key": "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766",
+        "recv_after": 0,
+        "send_after": 0
+      }
     ],
-    "whitelist_root": "dc9d33e167118409fba74538497bf7a984166cd60dc92ee62e4ad5283cf52118"
+    "whitelist_root": "c45b3dba5e40f948a15f37c7d5bb19d25fe820925324b2ff84051491956bb66a"
   },
   "programs": {
-    "budget_pad_words": 512,
+    "budget_pad_words": 704,
     "g_cmr": "53c55e01d58ffeea3983e4c13781009217ae524fbcfb684727bed6e767795816",
     "g_tapleaf_hash": "33a233648f778c8ee8725354a54837a87e72b1406b12a0c58039ea4fc0813679",
     "n_max_inputs": 4,
     "n_max_outputs": 6,
-    "p_cmr": "afe1a44fb19cd9bfb00df64b168ccb51b3fe53b71c15a035ca4f218b7b3e309b",
-    "p_tapleaf_hash": "1bfeef192faebc68ced9fbf811ae515ec10912fcc7e0a963ccde2083ddef4f2e",
+    "p_cmr": "01523e6a6a7c8f85888297f77e2dab25b30ef7408ff9d60aa98cc81589ff6b82",
+    "p_tapleaf_hash": "0d2177ecedb2730e1230bc98fd1dfd1f756a6e8d72c4afab4a2d5718d796f488",
     "u_cmr": "92b619160ddbd03ce838da912494d8025f319d7556afd58482b35870ef0f9816",
     "u_tapleaf_hash": "bf49363668add7fcd0f4719d2628cd833b906451848ad3a8d5703405af1a8bd4"
   },
@@ -51,7 +64,9 @@
       "output_key": "e7f6585271dd665ea1d00f469af968b5954033587945170698e040fc391faabd",
       "output_key_parity_odd": true,
       "owner_xonly": "1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f",
+      "recv_after": 0,
       "script_pubkey": "5120e7f6585271dd665ea1d00f469af968b5954033587945170698e040fc391faabd",
+      "send_after": 0,
       "tapdata_hash": "1d834209f38bb5edc4f26336d154376e0aa3d90e4b066aeffa532d24388af750",
       "user_tapleaf_hash": "bf49363668add7fcd0f4719d2628cd833b906451848ad3a8d5703405af1a8bd4"
     },
@@ -64,7 +79,9 @@
       "output_key": "8c96f7e0b2b26c866498a29e3fb3d41876991dc776af624bbefb20dd30f34f2c",
       "output_key_parity_odd": false,
       "owner_xonly": "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766",
+      "recv_after": 0,
       "script_pubkey": "51208c96f7e0b2b26c866498a29e3fb3d41876991dc776af624bbefb20dd30f34f2c",
+      "send_after": 0,
       "tapdata_hash": "0def88982cf627696d4e59f687fd8472c80e92454cfc784cd663fa19c87c3aba",
       "user_tapleaf_hash": "bf49363668add7fcd0f4719d2628cd833b906451848ad3a8d5703405af1a8bd4"
     },
@@ -77,7 +94,9 @@
       "output_key": "d1be631c41c417cf0d046a8cfc1d34835941daba76ec20e018d019e94ec0728d",
       "output_key_parity_odd": false,
       "owner_xonly": "462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+      "recv_after": 400,
       "script_pubkey": "5120d1be631c41c417cf0d046a8cfc1d34835941daba76ec20e018d019e94ec0728d",
+      "send_after": 0,
       "tapdata_hash": "9096f570e58485b65b30eba3c840ebe0accc6e3cf17830da127b5a0f39adc1a1",
       "user_tapleaf_hash": "bf49363668add7fcd0f4719d2628cd833b906451848ad3a8d5703405af1a8bd4"
     }
@@ -87,13 +106,13 @@
   "verifier_asset": "56b97cd9fc25cebe5636bbc07e8502e9262a6290c95fbdde58c7451e1d7c2d98",
   "verifier_asset_internal_bytes": "982d7c1d1e45c758debd5fc990622a26e902857ec0bb3656bece25fcd97cb956",
   "verifier_covenant": {
-    "address_regtest": "ert1pn4smhavztrffuw88j48s47emujw8tc84zqc6jxujwkf9cnme0haq5c96rg",
-    "address_testnet": "tb1pn4smhavztrffuw88j48s47emujw8tc84zqc6jxujwkf9cnme0haqgj8zlk",
-    "control_block_issuer": "be50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac01bfeef192faebc68ced9fbf811ae515ec10912fcc7e0a963ccde2083ddef4f2e",
-    "control_block_primary": "be50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac033a233648f778c8ee8725354a54837a87e72b1406b12a0c58039ea4fc0813679",
-    "merkle_root": "da26c45d11dd266760d114dc38e06733e47c838d0edc6893370b5be4f4443df4",
-    "output_key": "9d61bbf58258d29e38e7954f0afb3be49c75e0f51031a91b9275925c4f797dfa",
-    "output_key_parity_odd": false,
-    "script_pubkey": "51209d61bbf58258d29e38e7954f0afb3be49c75e0f51031a91b9275925c4f797dfa"
+    "address_regtest": "ert1plnxh3mmv7auqzrmgn7hz2j7fh4vt80g9jkw2kc6jgnqkd4ga3h9q9dskh2",
+    "address_testnet": "tb1plnxh3mmv7auqzrmgn7hz2j7fh4vt80g9jkw2kc6jgnqkd4ga3h9qe8jwt5",
+    "control_block_issuer": "bf50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac00d2177ecedb2730e1230bc98fd1dfd1f756a6e8d72c4afab4a2d5718d796f488",
+    "control_block_primary": "bf50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac033a233648f778c8ee8725354a54837a87e72b1406b12a0c58039ea4fc0813679",
+    "merkle_root": "effc1f183c80c64a89e99a792bf3a1c23bb53b08a3f1fbfbc618dd64dd1719b5",
+    "output_key": "fccd78ef6cf778010f689fae254bc9bd58b3bd05959cab635244c166d51d8dca",
+    "output_key_parity_odd": true,
+    "script_pubkey": "5120fccd78ef6cf778010f689fae254bc9bd58b3bd05959cab635244c166d51d8dca"
   }
 }

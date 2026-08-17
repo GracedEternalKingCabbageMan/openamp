@@ -6,8 +6,8 @@
 //!   slot 0           = GUARD_LO (32 x 0x00)
 //!   slots 1..=n      = the n real keys, sorted ascending bytewise, unique
 //!   slots n+1..65535 = GUARD_HI (32 x 0xff)
-//!   leaf(key) = SHA256(0x00 || key)
-//!   node(l,r) = SHA256(0x01 || l || r)     (no sorting: positional)
+//!   leaf(entry) = SHA256(0x00 || key || BE32(send_after) || BE32(recv_after))
+//!   node(l,r)   = SHA256(0x01 || l || r)   (no sorting: positional)
 //!
 //! Membership proof: 16 sibling hashes bottom-up plus the leaf index (whose
 //! bit j says the running node is the right child at level j).
@@ -27,8 +27,44 @@ fn sha256_all(parts: &[&[u8]]) -> [u8; 32] {
     sha256::Hash::from_engine(eng).to_byte_array()
 }
 
-pub fn leaf_hash(key: &[u8; 32]) -> [u8; 32] {
-    sha256_all(&[&[0x00], key])
+/// A whitelist entry: an approved key plus its two height windows.
+///
+/// `send_after` is the lockup: the holder cannot be the owner of a regulated
+/// input until the transaction proves a locktime height at or above it.
+/// `recv_after` is the receive window (the Reg S pattern): the holder cannot be
+/// the recipient of a regulated output until the same bound is proven. Zero
+/// means unrestricted, and is free at consensus because `check_lock_height(0)`
+/// is trivially satisfied.
+///
+/// The bounds live in the LEAF, not in a separate tree, so the single membership
+/// fold that proves a key is approved also proves which windows apply to it. A
+/// witness cannot state a bound the issuer did not commit to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Entry {
+    pub key: [u8; 32],
+    pub send_after: u32,
+    pub recv_after: u32,
+}
+
+impl Entry {
+    /// An entry with no height restrictions.
+    pub fn unrestricted(key: [u8; 32]) -> Self {
+        Entry { key, send_after: 0, recv_after: 0 }
+    }
+}
+
+pub fn leaf_hash(entry: &Entry) -> [u8; 32] {
+    sha256_all(&[
+        &[0x00],
+        &entry.key,
+        &entry.send_after.to_be_bytes(),
+        &entry.recv_after.to_be_bytes(),
+    ])
+}
+
+/// Leaf of a guard slot: the guard key with no windows.
+fn guard_leaf(key: [u8; 32]) -> [u8; 32] {
+    leaf_hash(&Entry::unrestricted(key))
 }
 
 /// dmt-v1 INTERVAL leaf: `SHA256(0x02 || lo || hi)`. Used by the blacklist tree,
@@ -43,39 +79,26 @@ pub fn node_hash(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
     sha256_all(&[&[0x01], left, right])
 }
 
-/// A membership proof: bottom-up siblings plus the leaf index.
+/// A membership proof: the entry proven, bottom-up siblings, and the leaf index.
+/// The entry travels with the proof because the covenant needs its window bounds
+/// to reconstruct the leaf.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Proof {
-    pub siblings: [[u8; 32]; DEPTH],
-    pub index: u16,
-}
-
-impl Proof {
-    /// The covenant's witness encoding: (sibling, node_is_right) per level.
-    pub fn levels(&self) -> Vec<([u8; 32], bool)> {
-        (0..DEPTH)
-            .map(|j| (self.siblings[j], (self.index >> j) & 1 == 1))
-            .collect()
-    }
+    pub entry: Entry,
+    pub path: Path,
 }
 
 pub fn verify(root: &[u8; 32], key: &[u8; 32], proof: &Proof) -> bool {
-    let mut node = leaf_hash(key);
-    for j in 0..DEPTH {
-        let sib = &proof.siblings[j];
-        node = if (proof.index >> j) & 1 == 1 {
-            node_hash(sib, &node)
-        } else {
-            node_hash(&node, sib)
-        };
+    if &proof.entry.key != key {
+        return false;
     }
-    &node == root
+    &proof.path.fold(leaf_hash(&proof.entry)) == root
 }
 
 /// The dense tree over the sorted key set (guards included implicitly).
 pub struct Tree {
-    /// Sorted unique real keys (guards excluded).
-    pub keys: Vec<[u8; 32]>,
+    /// Sorted unique entries (guards excluded), ordered by key.
+    pub entries: Vec<Entry>,
     /// levels[0] = leaves (only the occupied prefix, padding handled by
     /// `pad[level]`); levels[DEPTH] = [root].
     levels: Vec<Vec<[u8; 32]>>,
@@ -84,23 +107,23 @@ pub struct Tree {
 }
 
 impl Tree {
-    /// Build from real keys (any order; deduplicated after sorting is an
-    /// error, as are guard-valued keys).
-    pub fn new(mut keys: Vec<[u8; 32]>) -> Result<Self, String> {
-        keys.sort_unstable();
-        if keys.windows(2).any(|w| w[0] == w[1]) {
+    /// Build from entries (any order). Slot order is by key; duplicate or
+    /// guard-valued keys are rejected.
+    pub fn new(mut entries: Vec<Entry>) -> Result<Self, String> {
+        entries.sort_unstable_by_key(|e| e.key);
+        if entries.windows(2).any(|w| w[0].key == w[1].key) {
             return Err("duplicate key in dmt-v1 tree".into());
         }
-        if keys.iter().any(|k| *k == GUARD_LO || *k == GUARD_HI) {
+        if entries.iter().any(|e| e.key == GUARD_LO || e.key == GUARD_HI) {
             return Err("key collides with a dmt-v1 guard value".into());
         }
-        if keys.len() > SLOTS - 2 {
+        if entries.len() > SLOTS - 2 {
             return Err(format!("dmt-v1 capacity is {} keys", SLOTS - 2));
         }
 
         // Padding subtree hashes per level.
         let mut pad = Vec::with_capacity(DEPTH + 1);
-        pad.push(leaf_hash(&GUARD_HI));
+        pad.push(guard_leaf(GUARD_HI));
         for j in 0..DEPTH {
             let h = node_hash(&pad[j], &pad[j]);
             pad.push(h);
@@ -108,9 +131,9 @@ impl Tree {
 
         // Occupied prefix of each level.
         let mut levels: Vec<Vec<[u8; 32]>> = Vec::with_capacity(DEPTH + 1);
-        let mut level0: Vec<[u8; 32]> = Vec::with_capacity(keys.len() + 1);
-        level0.push(leaf_hash(&GUARD_LO));
-        level0.extend(keys.iter().map(leaf_hash));
+        let mut level0: Vec<[u8; 32]> = Vec::with_capacity(entries.len() + 1);
+        level0.push(guard_leaf(GUARD_LO));
+        level0.extend(entries.iter().map(leaf_hash));
         levels.push(level0);
         for j in 0..DEPTH {
             let prev = &levels[j];
@@ -124,7 +147,7 @@ impl Tree {
             }
             levels.push(next);
         }
-        Ok(Tree { keys, levels, pad })
+        Ok(Tree { entries, levels, pad })
     }
 
     pub fn root(&self) -> [u8; 32] {
@@ -138,12 +161,23 @@ impl Tree {
         }
         if *key == GUARD_HI {
             // First padding slot.
-            return u16::try_from(self.keys.len() + 1).ok();
+            return u16::try_from(self.entries.len() + 1).ok();
         }
-        self.keys
-            .binary_search(key)
+        self.entries
+            .binary_search_by_key(key, |e| e.key)
             .ok()
             .map(|i| (i + 1) as u16)
+    }
+
+    /// The committed entry for `key`, if approved.
+    pub fn entry_of(&self, key: &[u8; 32]) -> Option<Entry> {
+        if *key == GUARD_LO || *key == GUARD_HI {
+            return Some(Entry::unrestricted(*key));
+        }
+        self.entries
+            .binary_search_by_key(key, |e| e.key)
+            .ok()
+            .map(|i| self.entries[i])
     }
 
     fn node_at(&self, level: usize, idx: usize) -> [u8; 32] {
@@ -156,6 +190,7 @@ impl Tree {
 
     pub fn prove(&self, key: &[u8; 32]) -> Option<Proof> {
         let slot = self.slot_of(key)? as usize;
+        let entry = self.entry_of(key)?;
         let mut siblings = [[0u8; 32]; DEPTH];
         let mut idx = slot;
         for (j, sibling) in siblings.iter_mut().enumerate() {
@@ -163,8 +198,8 @@ impl Tree {
             idx >>= 1;
         }
         Some(Proof {
-            siblings,
-            index: slot as u16,
+            entry,
+            path: Path { siblings, index: slot as u16 },
         })
     }
 }
@@ -187,12 +222,43 @@ pub struct IntervalTree {
     pad: Vec<[u8; 32]>,
 }
 
+/// The Merkle path of a leaf: siblings bottom-up plus the leaf index. The
+/// whitelist wraps this with the entry it proves; the blacklist wraps it with
+/// the interval it proves.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Path {
+    pub siblings: [[u8; 32]; DEPTH],
+    pub index: u16,
+}
+
+impl Path {
+    /// The covenant's witness encoding: (sibling, node_is_right) per level.
+    pub fn levels(&self) -> Vec<([u8; 32], bool)> {
+        (0..DEPTH)
+            .map(|j| (self.siblings[j], (self.index >> j) & 1 == 1))
+            .collect()
+    }
+
+    fn fold(&self, leaf: [u8; 32]) -> [u8; 32] {
+        let mut node = leaf;
+        for j in 0..DEPTH {
+            let sib = &self.siblings[j];
+            node = if (self.index >> j) & 1 == 1 {
+                node_hash(sib, &node)
+            } else {
+                node_hash(&node, sib)
+            };
+        }
+        node
+    }
+}
+
 /// One interval and the proof that it is in the blacklist tree.
 #[derive(Clone, Debug)]
 pub struct IntervalProof {
     pub lo: [u8; 32],
     pub hi: [u8; 32],
-    pub proof: Proof,
+    pub path: Path,
 }
 
 impl IntervalTree {
@@ -280,10 +346,7 @@ impl IntervalTree {
         Some(IntervalProof {
             lo,
             hi,
-            proof: Proof {
-                siblings,
-                index: slot as u16,
-            },
+            path: Path { siblings, index: slot as u16 },
         })
     }
 }
@@ -293,16 +356,7 @@ pub fn verify_absent(root: &[u8; 32], key: &[u8; 32], p: &IntervalProof) -> bool
     if !(&p.lo[..] < &key[..] && &key[..] < &p.hi[..]) {
         return false;
     }
-    let mut node = interval_leaf_hash(&p.lo, &p.hi);
-    for j in 0..DEPTH {
-        let sib = &p.proof.siblings[j];
-        node = if (p.proof.index >> j) & 1 == 1 {
-            node_hash(sib, &node)
-        } else {
-            node_hash(&node, sib)
-        };
-    }
-    &node == root
+    &p.path.fold(interval_leaf_hash(&p.lo, &p.hi)) == root
 }
 
 /// The blacklist policy key of an outpoint: `SHA256(txid || BE32(vout))` with
@@ -323,9 +377,13 @@ mod tests {
         x
     }
 
+    fn e(b: u8) -> Entry {
+        Entry::unrestricted(k(b))
+    }
+
     #[test]
     fn membership_roundtrip() {
-        let tree = Tree::new(vec![k(3), k(1), k(2)]).unwrap();
+        let tree = Tree::new(vec![e(3), e(1), e(2)]).unwrap();
         let root = tree.root();
         for key in [k(1), k(2), k(3), GUARD_LO, GUARD_HI] {
             let proof = tree.prove(&key).expect("member");
@@ -339,15 +397,15 @@ mod tests {
 
     #[test]
     fn root_changes_with_set() {
-        let a = Tree::new(vec![k(1)]).unwrap().root();
-        let b = Tree::new(vec![k(1), k(2)]).unwrap().root();
+        let a = Tree::new(vec![e(1)]).unwrap().root();
+        let b = Tree::new(vec![e(1), e(2)]).unwrap().root();
         assert_ne!(a, b);
     }
 
     #[test]
     fn rejects_duplicates_and_guards() {
-        assert!(Tree::new(vec![k(1), k(1)]).is_err());
-        assert!(Tree::new(vec![GUARD_HI]).is_err());
+        assert!(Tree::new(vec![e(1), e(1)]).is_err());
+        assert!(Tree::new(vec![Entry::unrestricted(GUARD_HI)]).is_err());
     }
 
     /// Golden vectors pinning the format. The Go mirror in gomirror/dmt
@@ -356,16 +414,16 @@ mod tests {
     #[test]
     fn golden_vectors() {
         assert_eq!(
-            crate::hexutil::hex(&leaf_hash(&GUARD_LO)),
-            "7f9c9e31ac8256ca2f258583df262dbc7d6f68f2a03043d5c99a4ae5a7396ce9"
+            crate::hexutil::hex(&leaf_hash(&Entry::unrestricted(GUARD_LO))),
+            "9e1736c43d19118e6ce4302118af337109491ecc52757dfb949bad6a7940b0c2"
         );
         assert_eq!(
-            crate::hexutil::hex(&leaf_hash(&GUARD_HI)),
-            "5e16d316ecd5773e50c3b02737d424192b02f25b4245822079181c557aafda7d"
+            crate::hexutil::hex(&leaf_hash(&Entry::unrestricted(GUARD_HI))),
+            "dc8c3b446f21ee93e5ea4d016c916e8ffd952e3f594462fe0f2a0befe3580c59"
         );
         assert_eq!(
             crate::hexutil::hex(&Tree::new(vec![]).unwrap().root()),
-            "e69f2dc2186b1cca0ed37d851b60121a87832be1ff7f61d58bc4931d26c844cf"
+            "b883626f07bded09c45c76719b43e85945c0ac41ee370d47932f269dd6eabfed"
         );
 
         // The three-key whitelist of examples/snapshot-seq0.json, supplied out
@@ -374,10 +432,15 @@ mod tests {
         let alice = key_hex("1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f");
         let bob = key_hex("4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766");
         let carol = key_hex("462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b");
-        let tree = Tree::new(vec![alice, bob, carol]).unwrap();
+        let tree = Tree::new(vec![
+            Entry::unrestricted(alice),
+            Entry::unrestricted(bob),
+            Entry::unrestricted(carol),
+        ])
+        .unwrap();
         assert_eq!(
             crate::hexutil::hex(&tree.root()),
-            "dc9d33e167118409fba74538497bf7a984166cd60dc92ee62e4ad5283cf52118"
+            "66327e6c8cf6cfff8e1c0661e2469d4aa5ae5aa65206003f6758ff1180619a50"
         );
         assert_eq!(tree.slot_of(&alice), Some(1));
         assert_eq!(tree.slot_of(&carol), Some(2));
@@ -388,13 +451,32 @@ mod tests {
     /// the most likely porting bug, so it is asserted against.
     #[test]
     fn node_hash_is_positional() {
-        let a = leaf_hash(&k(1));
-        let b = leaf_hash(&k(2));
+        let a = leaf_hash(&e(1));
+        let b = leaf_hash(&e(2));
         assert_ne!(node_hash(&a, &b), node_hash(&b, &a));
     }
 
     fn key_hex(s: &str) -> [u8; 32] {
         crate::hexutil::unhex32(s).expect("32-byte hex key")
+    }
+
+    #[test]
+    fn window_bounds_are_bound_into_the_leaf() {
+        // Two trees over the same key differ if the windows differ: a holder
+        // cannot be given a shorter lockup than the issuer committed to.
+        let open = Tree::new(vec![Entry::unrestricted(k(1))]).unwrap();
+        let locked = Tree::new(vec![Entry { key: k(1), send_after: 500, recv_after: 0 }]).unwrap();
+        assert_ne!(open.root(), locked.root());
+
+        // And the proof carries the committed bounds, so the covenant reads them
+        // rather than trusting the spender.
+        let p = locked.prove(&k(1)).unwrap();
+        assert_eq!(p.entry.send_after, 500);
+        assert!(verify(&locked.root(), &k(1), &p));
+        // Claiming different bounds breaks the leaf and so the path.
+        let mut lying = p.clone();
+        lying.entry.send_after = 0;
+        assert!(!verify(&locked.root(), &k(1), &lying));
     }
 
     // ------------------------------------------------------- blacklist tree
@@ -454,7 +536,7 @@ mod tests {
         let degenerate = IntervalProof {
             lo: GUARD_HI,
             hi: GUARD_HI,
-            proof: Proof { siblings: [[0u8; 32]; DEPTH], index: 2 },
+            path: Path { siblings: [[0u8; 32]; DEPTH], index: 2 },
         };
         assert!(!verify_absent(&root, &k(9), &degenerate));
     }
@@ -463,7 +545,7 @@ mod tests {
     fn blacklist_leaf_domain_is_separate_from_the_whitelist_leaf_domain() {
         // A whitelist membership proof must not be replayable as a blacklist
         // non-membership proof; the leading domain byte is what prevents it.
-        assert_ne!(leaf_hash(&k(1)), interval_leaf_hash(&k(1), &k(1)));
+        assert_ne!(leaf_hash(&e(1)), interval_leaf_hash(&k(1), &k(1)));
     }
 
     #[test]

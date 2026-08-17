@@ -40,14 +40,15 @@ pub struct Ctx {
     pub issuer_key: XOnlyPublicKey,
     pub wl_tree: dmt::Tree,
     pub bl_tree: dmt::IntervalTree,
+    pub limit: u64,
     pub user: CompiledProgram,
     pub verifier: CompiledProgram,
     pub issuer: CompiledProgram,
 }
 
 impl Ctx {
-    /// `bl_outpoint_keys` are the blacklisted outpoints' policy keys
-    /// (`dmt::outpoint_key`), not the outpoints themselves.
+    /// Convenience for the common case: unrestricted whitelist entries, no
+    /// blacklist, no transfer limit.
     pub fn new(
         net: Net,
         params: AssetParams,
@@ -55,11 +56,36 @@ impl Ctx {
         wl_keys: &[XOnlyPublicKey],
         bl_outpoint_keys: &[[u8; 32]],
     ) -> Result<Self, String> {
-        let wl_tree = dmt::Tree::new(wl_keys.iter().map(|k| k.serialize()).collect())?;
+        let entries = wl_keys
+            .iter()
+            .map(|k| dmt::Entry::unrestricted(k.serialize()))
+            .collect();
+        Self::with_policy(
+            net,
+            params,
+            issuer_key,
+            entries,
+            bl_outpoint_keys,
+            programs::NO_LIMIT,
+        )
+    }
+
+    /// The full policy: whitelist entries (each with its height windows), the
+    /// blacklisted outpoint policy keys, and the transfer limit.
+    pub fn with_policy(
+        net: Net,
+        params: AssetParams,
+        issuer_key: XOnlyPublicKey,
+        wl_entries: Vec<dmt::Entry>,
+        bl_outpoint_keys: &[[u8; 32]],
+        limit: u64,
+    ) -> Result<Self, String> {
+        let wl_tree = dmt::Tree::new(wl_entries)?;
         let bl_tree = dmt::IntervalTree::new(bl_outpoint_keys.to_vec())?;
         let user = compile_user(&params)?;
         let u_cmr = user.commit().cmr();
-        let verifier = compile_verifier(&params, u_cmr, &wl_tree.root(), &bl_tree.root())?;
+        let verifier =
+            compile_verifier(&params, u_cmr, &wl_tree.root(), &bl_tree.root(), limit)?;
         let issuer = compile_issuer(&issuer_key)?;
         Ok(Ctx {
             net,
@@ -67,6 +93,7 @@ impl Ctx {
             issuer_key,
             wl_tree,
             bl_tree,
+            limit,
             user,
             verifier,
             issuer,
@@ -113,12 +140,19 @@ impl Utxo {
     }
 }
 
+/// Every input uses a non-final sequence. `lockHeight`, which the height-window
+/// jet reads, is 0 for a transaction whose every sequence is 0xffffffff - so a
+/// final transaction can satisfy no nonzero window bound. Using 0xfffffffe
+/// unconditionally means a locktime always means what it says, and a transfer
+/// with no windows is unaffected because bound 0 is satisfied by lockHeight 0.
+const NON_FINAL: u32 = 0xffff_fffe;
+
 fn plain_input(outpoint: OutPoint) -> TxIn {
     TxIn {
         previous_output: outpoint,
         is_pegin: false,
         script_sig: Script::new(),
-        sequence: Sequence::MAX,
+        sequence: Sequence::from_consensus(NON_FINAL),
         asset_issuance: Default::default(),
         witness: TxInWitness::default(),
     }
@@ -148,6 +182,10 @@ pub struct TransferReq {
     pub fee_amount: u64,
     /// Where fee-asset change goes (a plain address's script pubkey).
     pub fee_change_spk: Script,
+    /// The height the transaction commits to through nLockTime. It must be at
+    /// least the sender's `send_after` and every recipient's `recv_after`; 0
+    /// means no height is claimed, which only works when no window applies.
+    pub locktime: u32,
     /// Test hook: send the recipient's A to this script instead of C_U
     /// (used to prove the confinement refusal). Never set in real use.
     pub recipient_spk_override: Option<Script>,
@@ -169,7 +207,71 @@ pub struct BuiltTransfer {
     pub fee_input: usize,
 }
 
+/// Build a transfer, refusing one the covenant would reject.
+///
+/// The preflight is a courtesy, not the enforcement: it turns a policy violation
+/// into a clear local error instead of an opaque node rejection. Enforcement is
+/// P(pi). Use [`build_transfer_unchecked`] only to construct a deliberately
+/// invalid transaction for a test that wants the NODE to be the one refusing.
 pub fn build_transfer(ctx: &Ctx, req: &TransferReq) -> Result<BuiltTransfer, String> {
+    let built = build_transfer_unchecked(ctx, req)?;
+    preflight_policy(ctx, req, &built)?;
+    Ok(built)
+}
+
+/// The policy checks P(pi) will apply, evaluated locally so the builder can
+/// explain a refusal.
+pub fn preflight_policy(
+    ctx: &Ctx,
+    req: &TransferReq,
+    built: &BuiltTransfer,
+) -> Result<(), String> {
+    // Height windows: the covenant requires lockHeight >= each bound.
+    let mut needed = 0u32;
+    for (_, owner, _) in &built.a_inputs {
+        if let Some(e) = ctx.wl_tree.entry_of(&owner.serialize()) {
+            needed = needed.max(e.send_after);
+        }
+    }
+    for (_, owner) in &built.a_outputs {
+        if let Some(e) = ctx.wl_tree.entry_of(&owner.serialize()) {
+            needed = needed.max(e.recv_after);
+        }
+    }
+    if req.locktime < needed {
+        return Err(format!(
+            "this transfer needs locktime >= {needed} (a height window applies); \
+             the request asks for {}",
+            req.locktime
+        ));
+    }
+
+    // Transfer limit: what leaves the sender's hands. Change does not count.
+    let paid = payments_to_others(req.sender, built);
+    if paid > ctx.limit {
+        return Err(format!(
+            "this transfer pays {paid} atoms to other owners, over the committed \
+             transfer limit of {}",
+            ctx.limit
+        ));
+    }
+    Ok(())
+}
+
+/// The sum the transfer limit applies to: every A output whose owner is not the
+/// sender. Identified by OWNER KEY, never by output position - a spender chooses
+/// positions, so treating "the last A output" as change would be an aliasing bug
+/// the covenant does not share.
+pub fn payments_to_others(sender: XOnlyPublicKey, built: &BuiltTransfer) -> u64 {
+    built
+        .a_outputs
+        .iter()
+        .filter(|(_, owner)| *owner != sender)
+        .map(|(i, _)| built.tx.output[*i].value.explicit().unwrap_or(0))
+        .sum()
+}
+
+pub fn build_transfer_unchecked(ctx: &Ctx, req: &TransferReq) -> Result<BuiltTransfer, String> {
     let cv = ctx.cv_info();
     let cu_sender = ctx.cu_info(&req.sender);
     let cu_recipient = ctx.cu_info(&req.recipient);
@@ -249,9 +351,17 @@ pub fn build_transfer(ctx: &Ctx, req: &TransferReq) -> Result<BuiltTransfer, Str
         ));
     }
 
+    if req.locktime >= 500_000_000 {
+        return Err(format!(
+            "locktime {} is a timestamp, not a height; the covenant's window \
+             check reads heights only",
+            req.locktime
+        ));
+    }
+
     let tx = Transaction {
         version: 2,
-        lock_time: LockTime::ZERO,
+        lock_time: LockTime::from_consensus(req.locktime),
         input: inputs,
         output: outputs,
     };
@@ -541,7 +651,14 @@ pub fn complete_transfer(
     fee_privkey: &[u8; 32],
     validate: bool,
 ) -> Result<(Transaction, WitnessReport), String> {
-    let built = build_transfer(ctx, req)?;
+    // `validate == false` means "assemble what was asked for and let the node
+    // judge it", so the local policy preflight is skipped along with the
+    // BitMachine run. Every honest path takes the checked builder.
+    let built = if validate {
+        build_transfer(ctx, req)?
+    } else {
+        build_transfer_unchecked(ctx, req)?
+    };
     let mut tx = built.tx.clone();
 
     // User inputs: sign and attach.
@@ -689,6 +806,7 @@ pub fn complete_issuer_op(
         input: inputs,
         output: outputs,
     };
+    // G(I) reads no windows, so the issuer path needs no locktime.
 
     // Issuer leaf spend at input 0.
     let (_, _, g_cb) = cv_spend_info(old_ctx.p_cmr(), old_ctx.g_cmr());

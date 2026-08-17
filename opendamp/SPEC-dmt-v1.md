@@ -14,7 +14,8 @@ the measured numbers).
 The tree is **sorted**, which is what makes non-membership provable. Two leaf
 domains share the same node hashing and depth:
 
-- **key leaves** (`0x00`), used by the whitelist, prove membership of a key;
+- **key leaves** (`0x00`), used by the whitelist, prove membership of a key AND
+  the two height windows committed for it (section 9);
 - **interval leaves** (`0x02`), used by the blacklist, prove *non*-membership of
   a key by exhibiting the gap that contains it (section 7).
 
@@ -36,13 +37,17 @@ returns, not the reversed display form.
 
 ## 2. Slot assignment
 
-Let `k_1 < k_2 < ... < k_n` be the real keys, sorted **ascending by unsigned
+A whitelist **entry** is a triple `(key, send_after, recv_after)` — the approved
+key and its two height windows, both `u32` heights with 0 meaning unrestricted.
+Slot order is by **key only**; the windows ride along in the leaf.
+
+Let `k_1 < k_2 < ... < k_n` be the entries' keys, sorted **ascending by unsigned
 bytewise comparison** of their 32-byte encoding, and deduplicated. Then:
 
 ```
-slot 0            = GUARD_LO = 00 * 32
-slot i (1..=n)    = k_i
-slot n+1 .. 65535 = GUARD_HI = ff * 32
+slot 0            = GUARD_LO = 00 * 32,  windows (0, 0)
+slot i (1..=n)    = entry with key k_i
+slot n+1 .. 65535 = GUARD_HI = ff * 32,  windows (0, 0)
 ```
 
 The guards make the sorted sequence total: every real key has a predecessor and
@@ -58,10 +63,15 @@ job, and keeping it a bare SHA-256 is what the `sha_256_ctx_8_*` jets compute
 most cheaply.
 
 ```
-leaf(key)         = SHA256( 0x00 || key )                   (33 bytes hashed)
-node(left,right)  = SHA256( 0x01 || left || right )         (65 bytes hashed)
-interval(lo,hi)   = SHA256( 0x02 || lo || hi )              (65 bytes hashed)
+leaf(entry)       = SHA256( 0x00 || key
+                            || BE32(send_after) || BE32(recv_after) )  (41 bytes)
+node(left,right)  = SHA256( 0x01 || left || right )                    (65 bytes)
+interval(lo,hi)   = SHA256( 0x02 || lo || hi )                         (65 bytes)
 ```
+
+A whitelist leaf commits the key **and** its windows. Hashing the key alone
+produces a different root and every proof fails at consensus; this is the most
+likely porting mistake after the positional `node`.
 
 The domain byte is what keeps the two leaf kinds apart: a whitelist membership
 proof can never be replayed as a blacklist non-membership proof, or the other
@@ -100,15 +110,17 @@ produce the same root as the naive dense computation.
 
 A proof for the key at slot `s` is:
 
+- the **entry** proven, `(key, send_after, recv_after)`, because the verifier
+  rebuilds the leaf from it and reads the windows out of it;
 - `siblings[0..15]`: 16 × 32 bytes, **bottom-up** — `siblings[j]` is the sibling
-  of the running node at level `j`.
+  of the running node at level `j`;
 - `index`: `u16`, the slot `s`. Bit `j` of `s` (LSB first) is 1 exactly when the
   running node at level `j` is the **right** child.
 
 Verification:
 
 ```
-node = leaf(key)
+node = leaf(entry)      // and the entry's key must equal the key being proven
 for j in 0..16:
     if (index >> j) & 1 == 1: node = node(siblings[j], node)
     else:                     node = node(node, siblings[j])
@@ -117,8 +129,9 @@ accept iff node == root
 
 ### Covenant witness encoding
 
-The Simplicity program consumes the proof as `[(u256, bool); 16]`, one pair per
-level in the same bottom-up order, where the `bool` is "the running node is the
+The Simplicity program consumes a whitelist slot as
+`(Pubkey, u32, u32, [(u256, bool); 16])` — the key, `send_after`, `recv_after`,
+then the path as one pair per level in bottom-up order, where the `bool` is "the running node is the
 right child at this level" — i.e. bit `j` of `index`. The index is therefore
 carried implicitly by the bitmap and is not a separate witness field. The
 verifier program folds this array with `wl_step` and compares the result against
@@ -133,18 +146,20 @@ Pinned in `vectors/addresses.json` (`dmt_v1` object) and asserted by both
 implementations' tests:
 
 ```
-GUARD_LO           = 0000...00  (32 bytes)
-GUARD_HI           = ffff...ff  (32 bytes)
-leaf(GUARD_LO)     = 7f9c9e31ac8256ca2f258583df262dbc7d6f68f2a03043d5c99a4ae5a7396ce9
-leaf(GUARD_HI)     = 5e16d316ecd5773e50c3b02737d424192b02f25b4245822079181c557aafda7d
-root(empty tree)   = e69f2dc2186b1cca0ed37d851b60121a87832be1ff7f61d58bc4931d26c844cf
+GUARD_LO           = 0000...00  (32 bytes), windows (0, 0)
+GUARD_HI           = ffff...ff  (32 bytes), windows (0, 0)
+leaf(GUARD_LO)     = 9e1736c43d19118e6ce4302118af337109491ecc52757dfb949bad6a7940b0c2
+leaf(GUARD_HI)     = dc8c3b446f21ee93e5ea4d016c916e8ffd952e3f594462fe0f2a0befe3580c59
+root(empty tree)   = b883626f07bded09c45c76719b43e85945c0ac41ee370d47932f269dd6eabfed
 ```
 
 and for the three-key whitelist of `examples/snapshot-seq0.json`
 (alice `1b84c556…`, bob `4d4b6cd1…`, carol `462779ad…`):
 
+(all three unrestricted, windows `(0, 0)`):
+
 ```
-root = dc9d33e167118409fba74538497bf7a984166cd60dc92ee62e4ad5283cf52118
+root = 66327e6c8cf6cfff8e1c0661e2469d4aa5ae5aa65206003f6758ff1180619a50
 slots: 0 = GUARD_LO
        1 = 1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f  (alice)
        2 = 462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b  (carol)
@@ -222,9 +237,50 @@ interval(GUARD_HI, GUARD_HI) = 507647244d0d51f754f23c5f23c4f9e6a84eeabd0524bd20f
 root(empty blacklist)        = 009a25ef01f6cade2d114b8315aab47bf5599e3a1386c2f1d414f0e8d6dbf301
 ```
 
-## 8. Versioning
+## 8. Height windows
+
+Each whitelist entry carries two heights, both committed in its leaf:
+
+| field | binds | meaning |
+|---|---|---|
+| `send_after` | the **owner of a regulated input** | a lockup: the holder cannot spend until this height |
+| `recv_after` | the **owner of a regulated output** | a receive window (the Reg S pattern): the holder cannot be paid until this height |
+
+Zero means unrestricted, and costs nothing to enforce.
+
+**How a covenant proves a height.** It cannot read the chain height. Instead the
+verifier calls `check_lock_height(bound)`, which succeeds exactly when
+`bound <= lockHeight(tx)`, where
+
+```
+lockHeight(tx) = (tx is NOT final  &&  tx.nLockTime < 500000000) ? tx.nLockTime : 0
+```
+
+and "final" means every input sequence is `0xffffffff`. So the covenant forces
+the spender to *claim* a height through `nLockTime`, and consensus's own locktime
+rule refuses to mine a transaction whose claim has not yet come true. Both halves
+are necessary, and the regtest test proves them separately (STATUS.md §4, proofs
+10c and 10e). Note the two consequences:
+
+- A **final** transaction has `lockHeight = 0`, so it can satisfy no nonzero
+  bound. A spender cannot dodge the window by ignoring `nLockTime`; this is why
+  the builder sets every sequence to `0xfffffffe`.
+- A **timestamp** locktime (>= 500,000,000) also yields `lockHeight = 0`. The
+  windows are heights only, and the builder rejects a timestamp outright.
+
+Because the bounds live in the leaf, one membership fold proves both that a key
+is approved and which windows bind it. A holder cannot present a shorter lockup
+than the issuer committed to: changing either bound changes the leaf, so the path
+no longer reaches the root. Both implementations assert exactly that.
+
+## 9. Versioning
 
 The snapshot's `tree` field must read `"dmt-v1"`. A tool that does not recognise
 the value must refuse to build a transfer rather than guess: a wrong tree format
 produces proofs that fail at consensus, which looks like a chain problem and is
 not.
+
+The same principle governs the snapshot as a whole: the CLI parses it with
+`deny_unknown_fields`, so a predicate this build cannot enforce is a hard error
+rather than a silently ignored field. An issuer must not be able to publish a
+rule that does not bind.
