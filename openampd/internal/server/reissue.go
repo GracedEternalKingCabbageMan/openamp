@@ -140,7 +140,7 @@ func (s *Server) pickFeeUTXO() (*rpcUnspentLite, error) {
 		return nil, err
 	}
 	for _, u := range feeUtxos {
-		if u.Spendable && sats(u.Amount) > s.cfg.FeeSats*2 {
+		if u.Spendable && u.Explicit() && sats(u.Amount) > s.cfg.FeeSats*2 {
 			return &rpcUnspentLite{u.TxID, u.Vout, sats(u.Amount)}, nil
 		}
 	}

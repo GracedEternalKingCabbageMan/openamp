@@ -509,7 +509,7 @@ func (s *Server) handleTransferBuild(w http.ResponseWriter, r *http.Request) {
 		sats uint64
 	}
 	for _, u := range feeUtxos {
-		if u.Spendable && sats(u.Amount) > s.cfg.FeeSats*2 {
+		if u.Spendable && u.Explicit() && sats(u.Amount) > s.cfg.FeeSats*2 {
 			feeIn = &struct {
 				txid string
 				vout uint32

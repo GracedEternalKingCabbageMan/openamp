@@ -166,7 +166,7 @@ func (s *Server) handleIssue(w http.ResponseWriter, r *http.Request) {
 	}
 	var funding *rpcUnspentLite
 	for _, u := range feeUtxos {
-		if u.Spendable && sats(u.Amount) > s.cfg.FeeSats*3 && s.utxoUnspent(u.TxID, u.Vout) {
+		if u.Spendable && u.Explicit() && sats(u.Amount) > s.cfg.FeeSats*3 && s.utxoUnspent(u.TxID, u.Vout) {
 			funding = &rpcUnspentLite{u.TxID, u.Vout, sats(u.Amount)}
 			break
 		}
@@ -560,7 +560,7 @@ func (s *Server) handleClawback(w http.ResponseWriter, r *http.Request) {
 	}
 	var feeIn *rpcUnspentLite
 	for _, u := range feeUtxos {
-		if u.Spendable && sats(u.Amount) > s.cfg.FeeSats*2 {
+		if u.Spendable && u.Explicit() && sats(u.Amount) > s.cfg.FeeSats*2 {
 			feeIn = &rpcUnspentLite{u.TxID, u.Vout, sats(u.Amount)}
 			break
 		}
