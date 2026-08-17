@@ -1,0 +1,13 @@
+/* OpenDAMP issuer leaf G(I).
+ *
+ * The second leaf of the verifier covenant's taproot tree. A BIP340 signature
+ * under the issuer key I over sig_all_hash authorises any spend: policy update
+ * (recreate C_V(pi') with q of V) or halt (move V anywhere else).
+ *
+ * Compile-time parameter:
+ *   ISSUER_KEY - x-only issuer key I
+ */
+
+fn main() {
+    jet::bip_0340_verify((param::ISSUER_KEY, jet::sig_all_hash()), witness::ISSUER_SIG)
+}

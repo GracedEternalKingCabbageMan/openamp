@@ -1,0 +1,21 @@
+[package]
+name = "opendamp"
+version = "0.1.0"
+edition = "2021"
+description = "OpenDAMP M1/M3: Simplicity covenants and offline transfer tool for network-enforced restricted assets on Sequentia"
+license = "MIT"
+
+[dependencies]
+simplicityhl = "0.4.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[[bin]]
+name = "opendamp"
+path = "src/bin/opendamp.rs"
+
+[dev-dependencies]
+
+[profile.dev]
+# The BitMachine and secp are slow unoptimized; covenant tests run much faster with opt.
+opt-level = 2

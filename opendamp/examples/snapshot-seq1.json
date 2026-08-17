@@ -1,0 +1,21 @@
+{
+  "v": 1,
+  "asset": "daa8284c0d06cb02ef28b75ffa74c3b512131884d9c72e4f11dac634703d4fc4",
+  "verifier_asset": "56b97cd9fc25cebe5636bbc07e8502e9262a6290c95fbdde58c7451e1d7c2d98",
+  "q": 100000,
+  "tree": "dmt-v1",
+  "seq": 1,
+  "prev_pi": null,
+  "issuer_update_key": "56b328b30c8bf5839e24058747879408bdb36241dc9c2e7c619faa12b2920967",
+  "predicates": {
+    "whitelist": {
+      "entries": [
+        "1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f",
+        "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766"
+      ]
+    },
+    "blacklist": null,
+    "limit": null
+  },
+  "network": "testnet"
+}
