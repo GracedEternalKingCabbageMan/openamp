@@ -44,8 +44,25 @@ type PolicySigner interface {
 
 	// SignPolicy returns a 64-byte BIP340 signature over sighash under the
 	// asset's policy key. Production fans this out to the quorum and
-	// aggregates; the caller neither knows nor cares.
-	SignPolicy(assetID string, sighash [32]byte) (sig []byte, err error)
+	// aggregates; the caller neither knows nor cares. ctx says what the
+	// signature is FOR (see PolicyContext); it is advisory and never alters
+	// the signature.
+	SignPolicy(assetID string, sighash [32]byte, ctx PolicyContext) (sig []byte, err error)
+}
+
+// PolicyContext describes what a policy signature authorizes. A sighash alone
+// is opaque, so a threshold backend's quorum members could not tell a routine
+// transfer co-signature from a clawback sweep; this context travels with the
+// sighash so each member can see (log, rate-limit, or veto) what it is being
+// asked to sign. Every field is informational: the LocalKeySigner ignores the
+// whole struct, and no backend may derive signature bytes from it (the sighash
+// already commits to the real transaction).
+type PolicyContext struct {
+	Action     string // "issue" | "transfer" | "burn" | "clawback" | "reissue"
+	AID        string // acting account: the sender (transfer/burn) or the swept holder (clawback)
+	TxID       string // txid of the transaction the sighash belongs to
+	Reason     string // human-readable reason (clawbacks); empty otherwise
+	InputIndex int    // which input of TxID the sighash covers
 }
 
 // LocalKeySigner is the single-key backend: it stores one policy private key
@@ -103,7 +120,8 @@ func (l *LocalKeySigner) PolicyPubKey(assetID string) ([32]byte, bool) {
 	return elements.XOnlyFromPriv(priv), true
 }
 
-func (l *LocalKeySigner) SignPolicy(assetID string, sighash [32]byte) ([]byte, error) {
+// SignPolicy ignores ctx: a single local key has no quorum members to inform.
+func (l *LocalKeySigner) SignPolicy(assetID string, sighash [32]byte, _ PolicyContext) ([]byte, error) {
 	priv, ok := l.priv(assetID)
 	if !ok {
 		return nil, fmt.Errorf("policy key unavailable for asset %s", assetID)

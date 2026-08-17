@@ -356,6 +356,14 @@ func (c *Client) ListUnspentAll() ([]ConfUnspent, error) {
 	return res, err
 }
 
+// RescanBlockchain rescans the whole chain for this (watch) wallet, surfacing
+// UTXOs that landed before their address/blinding key was imported. Can run
+// long on a big chain; callers run it off the request path (a background
+// goroutine) so the client timeout is the only bound.
+func (c *Client) RescanBlockchain() error {
+	return c.Call(nil, "rescanblockchain")
+}
+
 // GetRawTransactionHex returns a transaction's raw hex (requires -txindex for
 // confirmed txs; mempool txs work without it).
 func (c *Client) GetRawTransactionHex(txid string) (string, error) {

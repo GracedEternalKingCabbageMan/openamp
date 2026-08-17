@@ -38,6 +38,13 @@ type issueNode struct {
 	blechAsked    bool // a per-call blech32 address was requested
 	blindCalled   bool // rawblindrawtransaction was invoked
 	lastBroadcast string
+
+	// W-1 gate knobs.
+	mempoolReject    string // non-empty: testmempoolaccept refuses with this reason
+	mempoolChecks    int    // count of testmempoolaccept calls
+	lastMempoolCheck string // hex the gate submitted
+	sendErr          string // non-empty: sendrawtransaction fails with this message
+	sends            int    // count of sendrawtransaction calls
 }
 
 func newIssueNode() *issueNode {
@@ -111,7 +118,27 @@ func (n *issueNode) handler(w http.ResponseWriter, r *http.Request) {
 		reply(str(0)) // echo the tx hex unchanged: structurally valid, round-trips
 	case "signrawtransactionwithwallet":
 		reply(map[string]any{"hex": str(0), "complete": true})
+	case "testmempoolaccept":
+		var txs []string
+		if len(req.Params) > 0 {
+			_ = json.Unmarshal(req.Params[0], &txs)
+		}
+		n.mempoolChecks++
+		if len(txs) == 1 {
+			n.lastMempoolCheck = txs[0]
+		}
+		if n.mempoolReject != "" {
+			reply([]any{map[string]any{"allowed": false, "reject-reason": n.mempoolReject}})
+			return
+		}
+		reply([]any{map[string]any{"allowed": true}})
 	case "sendrawtransaction":
+		if n.sendErr != "" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"result": nil,
+				"error": map[string]any{"code": -26, "message": n.sendErr}})
+			return
+		}
+		n.sends++
 		n.lastBroadcast = str(0)
 		reply(n.broadcast)
 	default:

@@ -948,9 +948,21 @@ func (s *Server) cosignAndBroadcast(p *pendingTransfer, sender *store.User, user
 	if err != nil {
 		return "", err
 	}
+	// A burn build (OA-5) sends the sender's units to the unspendable output, so
+	// none of them land in a recipient enclave (atomsOut is empty); the moved
+	// amount is the burned amount. Record it as a "burn" so the reduction in the
+	// chain-derived supply is attributable in the transparency log. A plain
+	// transfer keeps its exact M5/M6 accounting (burnAtoms == 0 here).
+	action := "transfer"
+	if p.burnAtoms > 0 {
+		action = "burn"
+	}
 	p.tx.NormalizeWitness()
+	buildTxid := p.tx.TxID()
 	for i, idx := range p.enclave {
-		policySig, err := s.signer.SignPolicy(p.asset.ID, p.sighashes[i])
+		policySig, err := s.signer.SignPolicy(p.asset.ID, p.sighashes[i], PolicyContext{
+			Action: action, AID: sender.AID, TxID: buildTxid, InputIndex: idx,
+		})
 		if err != nil {
 			return "", err
 		}
@@ -961,6 +973,13 @@ func (s *Server) cosignAndBroadcast(p *pendingTransfer, sender *store.User, user
 	if err != nil {
 		return "", err
 	}
+	// Safety gate (W-1): a hosted transfer or burn the node would reject is
+	// refused before broadcast (the caller surfaces this as 502).
+	if err := s.mempoolGate(action, signed.Hex, map[string]any{
+		"sender": sender.AID, "asset": p.asset.ID,
+	}); err != nil {
+		return "", err
+	}
 	txid, err := s.wallet.SendRawTransaction(signed.Hex)
 	if err != nil {
 		return "", err
@@ -969,14 +988,9 @@ func (s *Server) cosignAndBroadcast(p *pendingTransfer, sender *store.User, user
 	for _, a := range atomsOut {
 		sent += a
 	}
-	// A burn build (OA-5) sends the sender's units to the unspendable output, so
-	// none of them land in a recipient enclave (atomsOut is empty); the moved
-	// amount is the burned amount. Record it as a "burn" so the reduction in the
-	// chain-derived supply is attributable in the transparency log. A plain
-	// transfer keeps its exact M5/M6 accounting (burnAtoms == 0 here).
-	action, moved := "transfer", sent
+	moved := sent
 	if p.burnAtoms > 0 {
-		action, moved = "burn", p.burnAtoms
+		moved = p.burnAtoms
 	}
 	s.st.Update(func(st *store.State) error {
 		st.Transfers = append(st.Transfers, store.TransferRecord{
@@ -1091,13 +1105,16 @@ func (s *Server) handleCosign(w http.ResponseWriter, r *http.Request) {
 	for _, a := range atomsOut {
 		sent += a
 	}
+	cosignTxid := tx.TxID()
 	for _, idx := range req.Inputs {
 		sh, err := elements.TaprootSighash(tx, spent, elements.SighashDefault, s.genesis, idx, leaf)
 		if err != nil {
 			httpErr(w, 500, "sighash: %v", err)
 			return
 		}
-		sig, err := s.signer.SignPolicy(asset.ID, sh)
+		sig, err := s.signer.SignPolicy(asset.ID, sh, PolicyContext{
+			Action: "transfer", AID: sender.AID, TxID: cosignTxid, InputIndex: idx,
+		})
 		if err != nil {
 			httpErr(w, 500, "%v", err)
 			return
@@ -1107,7 +1124,7 @@ func (s *Server) handleCosign(w http.ResponseWriter, r *http.Request) {
 			Leaf: hex.EncodeToString(leaf), Control: hex.EncodeToString(control),
 		})
 	}
-	rawTxid := tx.TxID()
+	rawTxid := cosignTxid
 	s.st.Update(func(st *store.State) error {
 		st.Transfers = append(st.Transfers, store.TransferRecord{
 			Txid: rawTxid, Asset: asset.ID, SenderAID: sender.AID, Atoms: sent, Height: -1,

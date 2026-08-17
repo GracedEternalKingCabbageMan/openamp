@@ -62,6 +62,10 @@ type Server struct {
 	mu      sync.Mutex
 	pending map[string]*pendingTransfer
 
+	// watchReconcile guards the watch-wallet rescan reconcile (W-5c) to at
+	// most one run per process start.
+	watchReconcile sync.Once
+
 	genesis [32]byte // internal order
 }
 
@@ -100,6 +104,10 @@ func New(cfg Config, st *store.Store, node, wallet *rpc.Client) (*Server, error)
 	for i := 0; i < 32; i++ {
 		s.genesis[i] = g[31-i]
 	}
+	// Reconcile the watch wallet's confidential-enclave imports in the
+	// background (W-5c): re-import scripts + blinding keys idempotently and run
+	// one rescan pass, without ever blocking request handling.
+	s.startWatchReconcile()
 	return s, nil
 }
 
@@ -157,6 +165,29 @@ func decodeBody(r *http.Request, v any) error {
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	return dec.Decode(v)
+}
+
+// mempoolGate is the pre-broadcast safety gate (W-1): it runs testmempoolaccept
+// on a fully signed server-built transaction and refuses to broadcast one the
+// node would reject, so a malformed spend can never leave the server. On
+// rejection it writes a refusal-style transparency entry (reject_reason
+// included) and returns an error carrying the node's reject-reason; the caller
+// surfaces that as HTTP 502 and broadcasts nothing. This generalizes the gate
+// the reissue path has always had to every spend site.
+func (s *Server) mempoolGate(action, signedHex string, details map[string]any) error {
+	ok, reason, err := s.wallet.TestMempoolAccept(signedHex)
+	if err != nil {
+		return fmt.Errorf("testmempoolaccept: %w", err)
+	}
+	if !ok {
+		d := map[string]any{"reject_reason": reason}
+		for k, v := range details {
+			d[k] = v
+		}
+		logRefusal(action, s.st, d)
+		return fmt.Errorf("%s rejected by the node (not broadcast): %s", action, reason)
+	}
+	return nil
 }
 
 // PolicyRefusal is surfaced to clients with HTTP 403 and logged.
