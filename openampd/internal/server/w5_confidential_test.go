@@ -50,7 +50,6 @@ func fundClawbackConf(t *testing.T, s *Server, node *oa4Node, holder *store.User
 		TxID: ePrevID, Vout: 0, ScriptPubKey: holderSpk,
 		Amount: float64(atoms) / 1e8, Asset: asset.ID,
 		AmountBlinder: strings.Repeat("11", 32), AssetBlinder: strings.Repeat("22", 32),
-		Confidential: true,
 	})
 
 	feePrev := &elements.Tx{Version: 2}
@@ -205,7 +204,6 @@ func TestW5_ConfidentialReissueBlindsMint(t *testing.T) {
 		TxID: strings.Repeat("aa", 32), Vout: 1, ScriptPubKey: "0014" + strings.Repeat("dd", 20),
 		Amount: 1.0, Asset: tokenID,
 		AmountBlinder: strings.Repeat("11", 32), AssetBlinder: strings.Repeat("22", 32),
-		Confidential: true,
 	})
 
 	code, body := callReissue(t, f.s, map[string]any{

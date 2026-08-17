@@ -363,7 +363,23 @@ type ConfUnspent struct {
 	AmountBlinder string  `json:"amountblinder"`
 	AssetBlinder  string  `json:"assetblinder"`
 	Spendable     bool    `json:"spendable"`
-	Confidential  bool    `json:"confidential"`
+}
+
+// Blinded reports whether this coin is confidential on chain: listunspent has
+// no boolean for it, the signal is a non-zero amount or asset blinder. (An
+// earlier phantom "confidential" field decoded a key the node never sends and
+// was therefore always false, which made explicit builds treat blinded enclave
+// coins as explicit and unbalance at the node.)
+func (u ConfUnspent) Blinded() bool {
+	nonzero := func(h string) bool {
+		for _, c := range h {
+			if c != '0' {
+				return true
+			}
+		}
+		return false
+	}
+	return nonzero(u.AmountBlinder) || nonzero(u.AssetBlinder)
 }
 
 // ListUnspentAll returns all UTXOs (minconf 0) this (watch) wallet tracks,

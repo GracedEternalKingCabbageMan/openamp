@@ -54,7 +54,6 @@ func seedBlindedEnclaveCoin(t *testing.T, s *Server, node *oa4Node, u *store.Use
 		TxID: id, Vout: 0, ScriptPubKey: hex.EncodeToString(spk),
 		Amount: float64(atoms) / 1e8, Asset: asset.ID,
 		AmountBlinder: strings.Repeat("11", 32), AssetBlinder: strings.Repeat("22", 32),
-		Confidential: true,
 	})
 	return id
 }
@@ -253,7 +252,7 @@ func TestPT_UnifiedBalanceDedupes(t *testing.T) {
 	// One blinded coin only the watch wallet sees.
 	node.confUnspent = append(node.confUnspent, rpc.ConfUnspent{
 		TxID: strings.Repeat("32", 32), Vout: 0, ScriptPubKey: spk, Amount: 250.0 / 1e8, Asset: asset.ID,
-		AmountBlinder: strings.Repeat("11", 32), AssetBlinder: strings.Repeat("22", 32), Confidential: true,
+		AmountBlinder: strings.Repeat("11", 32), AssetBlinder: strings.Repeat("22", 32),
 	})
 
 	req := httptest.NewRequest("GET", "/v1/users/"+holder.AID+"/balance?asset="+asset.ID, nil)
@@ -287,7 +286,7 @@ func TestPT_LegacyConfidentialFlagReadsUnified(t *testing.T) {
 	node.scan[spk] = []rpc.ScanUnspent{{TxID: strings.Repeat("41", 32), Vout: 0, Asset: asset.ID, Amount: 500.0 / 1e8, ScriptPubKey: spk, Height: 1}}
 	node.confUnspent = append(node.confUnspent, rpc.ConfUnspent{
 		TxID: strings.Repeat("42", 32), Vout: 0, ScriptPubKey: spk, Amount: 250.0 / 1e8, Asset: asset.ID,
-		AmountBlinder: strings.Repeat("11", 32), AssetBlinder: strings.Repeat("22", 32), Confidential: true,
+		AmountBlinder: strings.Repeat("11", 32), AssetBlinder: strings.Repeat("22", 32),
 	})
 
 	req := httptest.NewRequest("GET", "/v1/users/"+holder.AID+"/balance?asset="+asset.ID, nil)
