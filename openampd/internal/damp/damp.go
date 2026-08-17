@@ -62,10 +62,26 @@ const (
 	TagWindows  = "OpenDAMP/windows/v1"
 )
 
-// TreeSMTv1 is the snapshot "tree" value this library implements. The design
-// doc also reserves "cmt-v1" (Cartesian Merkle tree), which is not supported
-// here; Validate refuses it.
-const TreeSMTv1 = "smt-v1"
+// Snapshot "tree" values this library implements.
+//
+//   - TreeSMTv1 is the design document's depth-256 sparse Merkle tree. It is
+//     the pure-M2 document format: nothing on chain reads it, and its pi is
+//     built from RulesRoot (below) over display-order asset bytes.
+//   - TreeDMTv1 is the tree the SHIPPED covenants actually verify against
+//     (opendamp/SPEC-dmt-v1.md): a sorted dense tree of depth 16. A dmt-v1
+//     snapshot is therefore a CONSENSUS-BEARING document, and its pi is the
+//     covenant's pi — PiCovenant over INTERNAL-order asset bytes and
+//     RulesRootCovenant, both in covenant.go. The two pi constructions are
+//     deliberately different and each is pinned to its own vectors; a snapshot
+//     declares which one applies by its tree field. Never compute one with the
+//     other's rules_root.
+//
+// The design doc also reserves "cmt-v1" (Cartesian Merkle tree), which is not
+// supported here; Validate refuses it.
+const (
+	TreeSMTv1 = "smt-v1"
+	TreeDMTv1 = "dmt-v1"
+)
 
 // taggedHash is the BIP340 tagged hash: SHA256(SHA256(tag) || SHA256(tag) || msg).
 // Implemented locally (mirroring elements.TaggedHash) so this package's
@@ -103,10 +119,15 @@ func (h PolicyHeader) Commitment() [32]byte {
 }
 
 // OutpointKey is the policy key of an input outpoint for the blacklist
-// predicate (design doc 3.2): SHA256(txid || BE32(vout)). txid is in the same
-// byte order the snapshot publisher uses for entries (display order, matching
-// PolicyHeader.Asset). Owner-key entries for the whitelist predicate are the
-// raw 32-byte x-only key itself (hashed by the SMT leaf rule like any key).
+// predicate (design doc 3.2): SHA256(txid || BE32(vout)). Owner-key entries for
+// the whitelist predicate are the raw 32-byte x-only key itself (hashed by the
+// tree's leaf rule like any key).
+//
+// BYTE ORDER IS THE CALLER'S: pass the txid in the order the consumer uses, and
+// the two consumers differ. The snapshot document uses display order (matching
+// PolicyHeader.Asset); the covenant reads a transaction's prevout, so a key the
+// on-chain blacklist must match is built from the txid in INTERNAL order. Feed
+// the wrong order and the proof simply never matches, silently.
 func OutpointKey(txid [32]byte, vout uint32) [32]byte {
 	var v [4]byte
 	binary.BigEndian.PutUint32(v[:], vout)

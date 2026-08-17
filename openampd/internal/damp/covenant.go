@@ -86,6 +86,24 @@ func WhitelistRoot(ownerKeys [][32]byte) ([32]byte, error) {
 	return tree.Root(), nil
 }
 
+// BlacklistRoot is the dmt-v1 INTERVAL root over the outpoint keys a policy
+// refuses to let spend. Non-membership is proved by one membership proof of the
+// interval bracketing the key plus two strict comparisons, which is what makes
+// it affordable inside the covenant; the tree shape therefore differs from the
+// whitelist's. An empty blacklist still has a root (the guard interval), so a
+// policy that lists nothing commits to that root, never to zero.
+func BlacklistRoot(outpointKeys [][32]byte) ([32]byte, error) {
+	keys := make([]dmt.Key, 0, len(outpointKeys))
+	for _, k := range outpointKeys {
+		keys = append(keys, dmt.Key(k))
+	}
+	tree, err := dmt.NewIntervalTree(keys)
+	if err != nil {
+		return [32]byte{}, err
+	}
+	return tree.Root(), nil
+}
+
 // RulesRootCovenant is the fixed-order two-level Merkle root over the four
 // predicate commitments [blacklist, whitelist, limit, windows]; an absent
 // predicate commits to 32 zero bytes. This is opendamp/src/policy.rs

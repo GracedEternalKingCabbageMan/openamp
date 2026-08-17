@@ -108,6 +108,11 @@ func (s *Snapshot) sigMsg() ([32]byte, error) {
 	return taggedHash(TagSnapshot, h[:]), nil
 }
 
+// SigMessage is the 32-byte message an issuer signs to authenticate this
+// snapshot. Exported so a server can hand it to an offline (or browser-held)
+// issuer key without shipping the private key anywhere near the snapshot code.
+func (s *Snapshot) SigMessage() ([32]byte, error) { return s.sigMsg() }
+
 // Sign sets IssuerSig to the BIP340 signature of the snapshot under privKey
 // (32 bytes).
 func (s *Snapshot) Sign(privKey []byte) error {
@@ -211,9 +216,82 @@ func WindowsHash(windows []Window) ([32]byte, error) {
 	return taggedHash(TagWindows, c), nil
 }
 
-// ComputePi derives the policy commitment the snapshot's contents imply:
-// predicate roots -> rules_root -> PolicyHeader -> commitment.
+// dmtWhitelistRoot recomputes a dmt-v1 list predicate's root from its inline
+// entries and checks it against the declared root, returning nil when the
+// predicate is absent (so RulesRootCovenant commits zeros for the slot). The
+// entries are raw 32-byte x-only owner keys; dmt.New refuses the guard values
+// and duplicates, which would make slot assignment ambiguous.
+func dmtWhitelistRoot(p PredicateList) (*[32]byte, error) {
+	const name = "predicates.whitelist"
+	if p.Root == "" {
+		if len(p.Entries) != 0 || p.URL != "" {
+			return nil, fmt.Errorf("%s: entries/url present but root empty (absent predicate must be fully absent)", name)
+		}
+		return nil, nil
+	}
+	declared, err := parseHex32(name+".root", p.Root)
+	if err != nil {
+		return nil, err
+	}
+	if p.URL != "" && len(p.Entries) == 0 {
+		return nil, fmt.Errorf("%s: url-only lists are not accepted; inline entries are required so the root is recomputable", name)
+	}
+	keys := make([][32]byte, 0, len(p.Entries))
+	for i, e := range p.Entries {
+		k, err := parseHex32(fmt.Sprintf("%s.entries[%d]", name, i), e)
+		if err != nil {
+			return nil, err
+		}
+		keys = append(keys, k)
+	}
+	got, err := WhitelistRoot(keys)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", name, err)
+	}
+	if got != declared {
+		return nil, fmt.Errorf("%s.root mismatch: declared %s, entries hash to %x", name, p.Root, got)
+	}
+	return &declared, nil
+}
+
+// computePiDMT is the pi a dmt-v1 snapshot commits to: the one the deployed
+// verifier covenant is instantiated with. It mirrors `pi_of` in
+// opendamp/src/bin/opendamp.rs exactly — a dmt-v1 whitelist root, the
+// covenant rules_root, and the asset id in INTERNAL byte order.
+//
+// The blacklist slot is deliberately the empty hash: no shipped program reads a
+// blacklist root (opendamp/STATUS.md, degradation (a)), so committing one would
+// advertise enforcement that does not exist. Validate refuses a dmt-v1 snapshot
+// that carries a blacklist rather than silently dropping it, because an issuer
+// who publishes one and believes it binds has a false sense of a freeze.
+// Windows are refused for the same reason.
+func (s *Snapshot) computePiDMT() ([32]byte, error) {
+	wl, err := dmtWhitelistRoot(s.Predicates.Whitelist)
+	if err != nil {
+		return [32]byte{}, err
+	}
+	var limit uint64
+	if s.Predicates.Limit != nil {
+		limit = *s.Predicates.Limit
+	}
+	display, err := parseHex32("asset", s.Asset)
+	if err != nil {
+		return [32]byte{}, err
+	}
+	var internal [32]byte
+	for i := 0; i < 32; i++ {
+		internal[i] = display[31-i]
+	}
+	return PiCovenant(internal, s.Seq, RulesRootCovenant(nil, wl, limit, nil)), nil
+}
+
+// ComputePi derives the policy commitment the snapshot's contents imply. Which
+// construction applies is selected by the tree field: dmt-v1 is the covenant's
+// own commitment (computePiDMT), smt-v1 is the M2 document commitment below.
 func (s *Snapshot) ComputePi() ([32]byte, error) {
+	if s.Tree == TreeDMTv1 {
+		return s.computePiDMT()
+	}
 	blRoot, err := predicateRoot("predicates.blacklist", s.Predicates.Blacklist)
 	if err != nil {
 		return [32]byte{}, err
@@ -252,8 +330,20 @@ func (s *Snapshot) Validate() error {
 	if s.V != 1 {
 		return fmt.Errorf("v must be 1, got %d", s.V)
 	}
-	if s.Tree != TreeSMTv1 {
-		return fmt.Errorf("tree %q not supported (this library implements %q only)", s.Tree, TreeSMTv1)
+	switch s.Tree {
+	case TreeSMTv1:
+	case TreeDMTv1:
+		// The consensus-bearing format: refuse anything the shipped covenant does
+		// not read, rather than committing to it and implying enforcement.
+		bl := s.Predicates.Blacklist
+		if bl.Root != "" || len(bl.Entries) != 0 || bl.URL != "" {
+			return fmt.Errorf("a dmt-v1 snapshot must not carry a blacklist: the shipped covenant commits the empty hash in that slot and enforces nothing there, so listed outpoints would stay spendable (opendamp/STATUS.md)")
+		}
+		if len(s.Predicates.Windows) != 0 {
+			return fmt.Errorf("a dmt-v1 snapshot must not carry height windows: no shipped covenant enforces them")
+		}
+	default:
+		return fmt.Errorf("tree %q not supported (this library implements %q and %q)", s.Tree, TreeDMTv1, TreeSMTv1)
 	}
 	if _, err := parseHex32("verifier_asset", s.VerifierAsset); err != nil {
 		return err

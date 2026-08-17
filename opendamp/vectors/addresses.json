@@ -3,9 +3,12 @@
   "asset_internal_bytes": "c44f3d7034c6da114f2ec7d984181312b5c374fa5fb728ef02cb060d4c28a8da",
   "dmt_v1": {
     "depth": 16,
+    "empty_blacklist_root": "009a25ef01f6cade2d114b8315aab47bf5599e3a1386c2f1d414f0e8d6dbf301",
     "empty_root": "e69f2dc2186b1cca0ed37d851b60121a87832be1ff7f61d58bc4931d26c844cf",
     "guard_hi": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
     "guard_lo": "0000000000000000000000000000000000000000000000000000000000000000",
+    "interval_leaf_of_guards": "1fd8164b6e61192e120f01ca504c786a6e193abe0265104c1303a9b1e09afc39",
+    "interval_pad_leaf": "507647244d0d51f754f23c5f23c4f9e6a84eeabd0524bd20fe2d932f539be8d4",
     "leaf_of_guard_hi": "5e16d316ecd5773e50c3b02737d424192b02f25b4245822079181c557aafda7d",
     "leaf_of_guard_lo": "7f9c9e31ac8256ca2f258583df262dbc7d6f68f2a03043d5c99a4ae5a7396ce9"
   },
@@ -13,7 +16,11 @@
   "note": "OpenDAMP taproot derivation golden vectors. TapLeaf/elements, TapBranch/elements and TapTweak/elements are BIP341-style tagged hashes (SHA256(SHA256(tag)||SHA256(tag)||msg)) with the /elements suffix; TapData is the bare string \"TapData\", tagged the same way. A Simplicity leaf hashes as H_TapLeaf(0xbe || compact_size(32) || CMR). TapBranch sorts its two children lexicographically; TapData sorts nothing. All hex is in internal byte order except asset ids and CMRs, which print reversed, as txids do.",
   "nums_internal_key": "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0",
   "policy": {
-    "pi": "e0000621a665f89924e07d71fa714281341990652c7f57fef4cc24eab3ab68e6",
+    "blacklist_root": "25e74bdf16e25709031f41b2d2a51ff865800b53e3787fca9cfb75edc07e11cb",
+    "blacklisted_outpoint_keys": [
+      "2f0a781be235d95128c10c39d23ceffc6b683ecafd784b2510b2897a3b4dd799"
+    ],
+    "pi": "bbaefc006dd7eecae091f355cb9118a02d93af313558da1e4ae7380244d36e2c",
     "seq": 0,
     "whitelist_entries": [
       "1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f",
@@ -23,12 +30,13 @@
     "whitelist_root": "dc9d33e167118409fba74538497bf7a984166cd60dc92ee62e4ad5283cf52118"
   },
   "programs": {
-    "budget_pad_words": 384,
+    "budget_pad_words": 512,
     "g_cmr": "53c55e01d58ffeea3983e4c13781009217ae524fbcfb684727bed6e767795816",
     "g_tapleaf_hash": "33a233648f778c8ee8725354a54837a87e72b1406b12a0c58039ea4fc0813679",
-    "n_max_outputs": 8,
-    "p_cmr": "c877302d70733c25c30f94f8852967d26f36db862e5d8c75916d027168bac7b6",
-    "p_tapleaf_hash": "fe513300404e86dbfa6ca8a23f4a53c9bf59d2741ad0b06c1e4dfacd477c04e2",
+    "n_max_inputs": 4,
+    "n_max_outputs": 6,
+    "p_cmr": "afe1a44fb19cd9bfb00df64b168ccb51b3fe53b71c15a035ca4f218b7b3e309b",
+    "p_tapleaf_hash": "1bfeef192faebc68ced9fbf811ae515ec10912fcc7e0a963ccde2083ddef4f2e",
     "u_cmr": "92b619160ddbd03ce838da912494d8025f319d7556afd58482b35870ef0f9816",
     "u_tapleaf_hash": "bf49363668add7fcd0f4719d2628cd833b906451848ad3a8d5703405af1a8bd4"
   },
@@ -79,13 +87,13 @@
   "verifier_asset": "56b97cd9fc25cebe5636bbc07e8502e9262a6290c95fbdde58c7451e1d7c2d98",
   "verifier_asset_internal_bytes": "982d7c1d1e45c758debd5fc990622a26e902857ec0bb3656bece25fcd97cb956",
   "verifier_covenant": {
-    "address_regtest": "ert1p0hmqfqf85t825g0f85dxl3kmjjt6m869t5ljy9xy9j8tutg6cp7qest64s",
-    "address_testnet": "tb1p0hmqfqf85t825g0f85dxl3kmjjt6m869t5ljy9xy9j8tutg6cp7q96fzfw",
-    "control_block_issuer": "be50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0fe513300404e86dbfa6ca8a23f4a53c9bf59d2741ad0b06c1e4dfacd477c04e2",
+    "address_regtest": "ert1pn4smhavztrffuw88j48s47emujw8tc84zqc6jxujwkf9cnme0haq5c96rg",
+    "address_testnet": "tb1pn4smhavztrffuw88j48s47emujw8tc84zqc6jxujwkf9cnme0haqgj8zlk",
+    "control_block_issuer": "be50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac01bfeef192faebc68ced9fbf811ae515ec10912fcc7e0a963ccde2083ddef4f2e",
     "control_block_primary": "be50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac033a233648f778c8ee8725354a54837a87e72b1406b12a0c58039ea4fc0813679",
-    "merkle_root": "7dcf39b7e51b4d06e6ed7934ddccba86d4ef484fcd16ea28441a42b614648cee",
-    "output_key": "7df6048127a2ceaa21e93d1a6fc6db9497ad9f455d3f2214c42c8ebe2d1ac07c",
+    "merkle_root": "da26c45d11dd266760d114dc38e06733e47c838d0edc6893370b5be4f4443df4",
+    "output_key": "9d61bbf58258d29e38e7954f0afb3be49c75e0f51031a91b9275925c4f797dfa",
     "output_key_parity_odd": false,
-    "script_pubkey": "51207df6048127a2ceaa21e93d1a6fc6db9497ad9f455d3f2214c42c8ebe2d1ac07c"
+    "script_pubkey": "51209d61bbf58258d29e38e7954f0afb3be49c75e0f51031a91b9275925c4f797dfa"
   }
 }

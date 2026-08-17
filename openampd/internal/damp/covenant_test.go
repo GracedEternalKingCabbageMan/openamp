@@ -26,10 +26,12 @@ func TestCovenantPolicyMatchesVectors(t *testing.T) {
 			EmptyRoot string `json:"empty_root"`
 		} `json:"dmt_v1"`
 		Policy struct {
-			Pi               string   `json:"pi"`
-			Seq              uint64   `json:"seq"`
-			WhitelistRoot    string   `json:"whitelist_root"`
-			WhitelistEntries []string `json:"whitelist_entries"`
+			Pi                      string   `json:"pi"`
+			Seq                     uint64   `json:"seq"`
+			WhitelistRoot           string   `json:"whitelist_root"`
+			WhitelistEntries        []string `json:"whitelist_entries"`
+			BlacklistRoot           string   `json:"blacklist_root"`
+			BlacklistedOutpointKeys []string `json:"blacklisted_outpoint_keys"`
 		} `json:"policy"`
 		Programs struct {
 			UCMR string `json:"u_cmr"`
@@ -60,15 +62,37 @@ func TestCovenantPolicyMatchesVectors(t *testing.T) {
 		t.Fatalf("whitelist root = %s, want %s", got, v.Policy.WhitelistRoot)
 	}
 
-	// pi over that root, with the blacklist slot deliberately empty (this build
-	// carries no in-covenant blacklist; see opendamp/STATUS.md).
+	// The blacklist root over the vectors' listed outpoint keys. This is an
+	// INTERVAL tree, a different shape from the whitelist's, because
+	// non-membership has to be affordable inside the covenant.
+	blKeys := make([][32]byte, 0, len(v.Policy.BlacklistedOutpointKeys))
+	for _, e := range v.Policy.BlacklistedOutpointKeys {
+		b, err := hex.DecodeString(e)
+		if err != nil || len(b) != 32 {
+			t.Fatalf("bad blacklist entry %q", e)
+		}
+		var k [32]byte
+		copy(k[:], b)
+		blKeys = append(blKeys, k)
+	}
+	bl, err := BlacklistRoot(blKeys)
+	if err != nil {
+		t.Fatalf("BlacklistRoot: %v", err)
+	}
+	if got := hex.EncodeToString(bl[:]); got != v.Policy.BlacklistRoot {
+		t.Fatalf("blacklist root = %s, want %s", got, v.Policy.BlacklistRoot)
+	}
+
+	// pi over both roots. The blacklist slot carries a real root now that the
+	// covenant enforces non-membership; an empty blacklist still commits to the
+	// guard interval's root, never to zero.
 	var assetInternal [32]byte
 	ai, err := hex.DecodeString(v.AssetInternalBytes)
 	if err != nil || len(ai) != 32 {
 		t.Fatalf("bad asset_internal_bytes %q", v.AssetInternalBytes)
 	}
 	copy(assetInternal[:], ai)
-	rules := RulesRootCovenant(nil, &wl, 0, nil)
+	rules := RulesRootCovenant(&bl, &wl, 0, nil)
 	pi := PiCovenant(assetInternal, v.Policy.Seq, rules)
 	if got := hex.EncodeToString(pi[:]); got != v.Policy.Pi {
 		t.Fatalf("pi = %s, want %s", got, v.Policy.Pi)

@@ -41,7 +41,7 @@ fn test_ctx(wl: &[XOnlyPublicKey]) -> Ctx {
         asset_v: asset(0xbb),
         q: 1000,
     };
-    Ctx::new(net(), params, issuer, wl).expect("programs compile")
+    Ctx::new(net(), params, issuer, wl, &[]).expect("programs compile")
 }
 
 fn transfer_req(_ctx: &Ctx, sender: XOnlyPublicKey, recipient: XOnlyPublicKey) -> TransferReq {
@@ -160,8 +160,8 @@ fn issuer_update_and_halt_satisfy_g() {
         asset_v: asset(0xbb),
         q: 1000,
     };
-    let ctx0 = Ctx::new(net(), params, issuer, &[alice, bob]).unwrap();
-    let ctx1 = Ctx::new(net(), params, issuer, &[alice, bob, carol]).unwrap();
+    let ctx0 = Ctx::new(net(), params, issuer, &[alice, bob], &[]).unwrap();
+    let ctx1 = Ctx::new(net(), params, issuer, &[alice, bob, carol], &[]).unwrap();
     assert_ne!(
         ctx0.cv_info().script_pubkey,
         ctx1.cv_info().script_pubkey,
