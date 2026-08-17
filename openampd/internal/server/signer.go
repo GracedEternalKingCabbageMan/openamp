@@ -65,6 +65,31 @@ type PolicyContext struct {
 	InputIndex int    // which input of TxID the sighash covers
 }
 
+// SignerFactory constructs a PolicySigner backend over the key store.
+type SignerFactory func(st *store.Store) (PolicySigner, error)
+
+// signerFactories maps a -signer backend name to its constructor. "local" is
+// built in; backends whose packages import THIS package (frostsigner) register
+// from their init, because server cannot import them back through the seam.
+var signerFactories = map[string]SignerFactory{
+	"local": func(st *store.Store) (PolicySigner, error) { return NewLocalKeySigner(st), nil },
+}
+
+// RegisterSigner names a PolicySigner backend for -signer selection.
+func RegisterSigner(name string, f SignerFactory) { signerFactories[name] = f }
+
+// newSigner resolves the configured backend name ("" = local).
+func newSigner(name string, st *store.Store) (PolicySigner, error) {
+	if name == "" {
+		name = "local"
+	}
+	f, ok := signerFactories[name]
+	if !ok {
+		return nil, fmt.Errorf("unknown signer backend %q (is its package linked in?)", name)
+	}
+	return f(st)
+}
+
 // LocalKeySigner is the single-key backend: it stores one policy private key
 // per asset in the store's 0600 keys file. Appropriate for testnet and demos
 // only; production replaces it with a threshold backend behind the same

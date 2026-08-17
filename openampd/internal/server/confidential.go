@@ -3,6 +3,7 @@ package server
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"log"
@@ -54,7 +55,17 @@ func (s *Server) watchClient() (*rpc.Client, error) {
 	return c, nil
 }
 
-// blindMaster returns the server's master blinding secret (per install),
+// blindMasterName is the keys-file name of an epoch's master blinding secret.
+// Epoch 0 keeps the original per-install name so every pre-rotation key
+// re-derives from the exact same material.
+func blindMasterName(epoch uint32) string {
+	if epoch == 0 {
+		return "blind-master"
+	}
+	return fmt.Sprintf("blind-master-v%d", epoch)
+}
+
+// blindMaster returns the epoch-0 master blinding secret (per install),
 // generating and persisting it on first use.
 func (s *Server) blindMaster() ([]byte, error) {
 	keys, err := s.st.LoadKeys()
@@ -74,22 +85,78 @@ func (s *Server) blindMaster() ([]byte, error) {
 	return m, nil
 }
 
-// blindingKey derives the deterministic blinding keypair for a (holder, asset)
-// enclave: priv = SHA256(master || assetID || holderXonly), pub = priv*G
-// (compressed). Deterministic so the server can always re-derive and re-import.
-func (s *Server) blindingKey(assetID string, holderXonly [32]byte) (priv []byte, pubCompressed []byte, err error) {
-	master, err := s.blindMaster()
+// blindMasterForEpoch reads the versioned master secret an epoch derives from.
+// Epoch 0 self-provisions (the original behaviour); a later epoch's master is
+// only ever created by a rotation, so reading a missing one is an error — a
+// derivation must never silently invent material for an epoch that was never
+// cut. Old masters are retained forever: historical blinded outputs stay
+// readable.
+func (s *Server) blindMasterForEpoch(epoch uint32) ([]byte, error) {
+	if epoch == 0 {
+		return s.blindMaster()
+	}
+	keys, err := s.st.LoadKeys()
+	if err != nil {
+		return nil, err
+	}
+	h, ok := keys[blindMasterName(epoch)]
+	if !ok {
+		return nil, fmt.Errorf("no master blinding secret for epoch %d (was it rotated on another install?)", epoch)
+	}
+	return hex.DecodeString(h)
+}
+
+// assetBlindEpoch returns an asset's current blinding epoch. Unknown assets
+// (e.g. mid-issuance, before the record persists) derive at epoch 0, exactly
+// the pre-rotation behaviour.
+func (s *Server) assetBlindEpoch(assetID string) uint32 {
+	var epoch uint32
+	s.st.View(func(st *store.State) {
+		if a, ok := st.Assets[assetID]; ok {
+			epoch = a.BlindEpoch
+		}
+	})
+	return epoch
+}
+
+// blindingKeyAt derives the deterministic blinding keypair for a (holder,
+// asset) enclave at a given epoch; pub = priv*G (compressed). Deterministic so
+// the server can always re-derive and re-import.
+//
+// Epoch 0 is the FROZEN v1 derivation — SHA256(master || "openamp-blind-v1" ||
+// assetID || holderXonly) — byte-exactly what every key before rotation
+// existed was, so existing blinded UTXOs stay readable (pinned by
+// TestRotation_V1DerivationPinned). Epoch N>0 binds the epoch into a v2
+// string: SHA256(master_vN || "openamp-blind-v2" || assetID || epoch_be32 ||
+// holderXonly).
+func (s *Server) blindingKeyAt(assetID string, holderXonly [32]byte, epoch uint32) (priv []byte, pubCompressed []byte, err error) {
+	master, err := s.blindMasterForEpoch(epoch)
 	if err != nil {
 		return nil, nil, err
 	}
 	h := sha256.New()
 	h.Write(master)
-	h.Write([]byte("openamp-blind-v1"))
-	h.Write([]byte(assetID))
+	if epoch == 0 {
+		h.Write([]byte("openamp-blind-v1"))
+		h.Write([]byte(assetID))
+	} else {
+		var eb [4]byte
+		binary.BigEndian.PutUint32(eb[:], epoch)
+		h.Write([]byte("openamp-blind-v2"))
+		h.Write([]byte(assetID))
+		h.Write(eb[:])
+	}
 	h.Write(holderXonly[:])
 	sum := h.Sum(nil)
 	sk, pk := btcec.PrivKeyFromBytes(sum)
 	return sk.Serialize(), pk.SerializeCompressed(), nil
+}
+
+// blindingKey derives at the asset's CURRENT epoch: what addresses are served
+// with and what new outputs blind to. Reads of old outputs never come through
+// here — the watch wallet keeps every epoch's imported keys.
+func (s *Server) blindingKey(assetID string, holderXonly [32]byte) (priv []byte, pubCompressed []byte, err error) {
+	return s.blindingKeyAt(assetID, holderXonly, s.assetBlindEpoch(assetID))
 }
 
 // confidentialEnclaveAddress builds the blech32 confidential address for an
@@ -280,6 +347,7 @@ func (s *Server) reconcileWatchWallet() {
 		assetID string
 		spkHex  string
 		holderX [32]byte
+		epoch   uint32 // the asset's current epoch; every epoch up to it is imported
 	}
 	var pairs []pair
 	s.st.View(func(st *store.State) {
@@ -289,7 +357,7 @@ func (s *Server) reconcileWatchWallet() {
 				if err != nil {
 					continue
 				}
-				pairs = append(pairs, pair{a.ID, hex.EncodeToString(tree.ScriptPubKey()), elements.MustHex32(u.Pubkeys[0])})
+				pairs = append(pairs, pair{a.ID, hex.EncodeToString(tree.ScriptPubKey()), elements.MustHex32(u.Pubkeys[0]), a.BlindEpoch})
 			}
 		}
 	})
@@ -298,16 +366,24 @@ func (s *Server) reconcileWatchWallet() {
 	}
 	imported := 0
 	for _, p := range pairs {
-		priv, pub, err := s.blindingKey(p.assetID, p.holderX)
-		if err != nil {
-			log.Printf("watch reconcile: blinding key for asset %s: %v", p.assetID, err)
-			continue
+		// Every live epoch, not just the current one: outputs blinded before a
+		// rotation stay readable only through their epoch's key.
+		ok := true
+		for e := uint32(0); e <= p.epoch; e++ {
+			priv, pub, err := s.blindingKeyAt(p.assetID, p.holderX, e)
+			if err != nil {
+				log.Printf("watch reconcile: blinding key for asset %s epoch %d: %v", p.assetID, e, err)
+				ok = false
+				continue
+			}
+			if err := s.importConfidentialEnclave(p.spkHex, priv, hex.EncodeToString(pub)); err != nil {
+				log.Printf("watch reconcile: import enclave %s (asset %s epoch %d): %v", p.spkHex, p.assetID, e, err)
+				ok = false
+			}
 		}
-		if err := s.importConfidentialEnclave(p.spkHex, priv, hex.EncodeToString(pub)); err != nil {
-			log.Printf("watch reconcile: import enclave %s (asset %s): %v", p.spkHex, p.assetID, err)
-			continue
+		if ok {
+			imported++
 		}
-		imported++
 	}
 	w, err := s.watchClient()
 	if err != nil {
