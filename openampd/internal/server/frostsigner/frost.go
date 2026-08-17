@@ -99,10 +99,39 @@ func isInfinity(p *secp.JacobianPoint) bool {
 	return p.X.IsZero() && p.Y.IsZero()
 }
 
+// parsePoint decodes a 33-byte compressed point to affine form.
+func parsePoint(b []byte) (*secp.JacobianPoint, error) {
+	if len(b) != 33 {
+		return nil, fmt.Errorf("want a 33-byte compressed point, got %d bytes", len(b))
+	}
+	pub, err := secp.ParsePubKey(b)
+	if err != nil {
+		return nil, err
+	}
+	var p secp.JacobianPoint
+	pub.AsJacobian(&p)
+	p.ToAffine()
+	if isInfinity(&p) {
+		return nil, fmt.Errorf("point at infinity")
+	}
+	return &p, nil
+}
+
 func idBytes(id int) []byte {
 	var b [2]byte
 	binary.BigEndian.PutUint16(b[:], uint16(id))
 	return b[:]
+}
+
+// sortedIDs returns a map's integer keys in ascending order, so every
+// participant serializes the same list in the same order.
+func sortedIDs[V any](m map[int]V) []int {
+	ids := make([]int, 0, len(m))
+	for id := range m {
+		ids = append(ids, id)
+	}
+	sort.Ints(ids)
+	return ids
 }
 
 // lagrange computes the Lagrange coefficient at x=0 for participant i within
@@ -156,113 +185,91 @@ func dealerKeygen(t, n int, rnd io.Reader) (groupX [32]byte, shares [][32]byte, 
 	return groupX, shares, nil
 }
 
-// round is one FROST signing round over a threshold subset of shares. Both
-// protocol rounds run in-process here (the participants share an address
-// space), but the structure is the wire protocol's: independent per-participant
-// nonces and commitments, binding factors over the full commitment list, and
-// partial signatures that are individually verifiable against public data
-// before aggregation.
-type round struct {
+// signingContext is one FROST signing round derived from PUBLIC data only: the
+// message, the group public key and the members' nonce commitments. Coordinator
+// and member each build it from the same SigningPackage and therefore agree on
+// the binding factors, the aggregate nonce, both BIP340 parity adjustments and
+// the challenge without exchanging any of them. Nothing secret enters here, so
+// the same type serves the member (which then adds its share and nonces) and
+// the coordinator (which then verifies and aggregates).
+type signingContext struct {
 	m       [32]byte
 	ids     []int // signing subset, ascending
 	lambdas map[int]*secp.ModNScalar
 
-	secrets   map[int]*secp.ModNScalar    // each participant's share d_i
-	pubShares map[int]*secp.JacobianPoint // Y_i = d_i*G (public)
-
-	hiding, binding map[int]*secp.ModNScalar    // nonce scalars, R-parity applied
-	commD, commE    map[int]*secp.JacobianPoint // original commitments D_i, E_i
-	rhos            map[int]*secp.ModNScalar
+	commD, commE map[int]*secp.JacobianPoint // as published by the members
+	rhos         map[int]*secp.ModNScalar
 
 	rx     [32]byte
 	e      *secp.ModNScalar
 	groupX [32]byte
 
-	rNegated bool // R.y was odd: all nonces negated, verify against -D_i, -E_i
+	rNegated bool // R.y was odd: nonces negated, verify against -D_i, -E_i
 	pNegated bool // P.y was odd: shares negated in partials, verify against -Y_i
 }
 
-// newRound derives everything both protocol messages would carry: nonce
-// commitments, binding factors, the aggregate nonce R (with the BIP340 R-parity
-// adjustment), the group key parity, and the challenge e. shares maps
-// participant id -> share scalar; the subset IS the signing quorum.
-func newRound(m [32]byte, shares map[int][32]byte, rnd io.Reader) (*round, error) {
-	r := &round{
-		m:       m,
-		lambdas: map[int]*secp.ModNScalar{}, secrets: map[int]*secp.ModNScalar{},
-		pubShares: map[int]*secp.JacobianPoint{},
-		hiding:    map[int]*secp.ModNScalar{}, binding: map[int]*secp.ModNScalar{},
-		commD: map[int]*secp.JacobianPoint{}, commE: map[int]*secp.JacobianPoint{},
+// newSigningContext derives the round from a signing package.
+func newSigningContext(pkg *SigningPackage) (*signingContext, error) {
+	if pkg == nil || len(pkg.Commitments) < 2 {
+		return nil, fmt.Errorf("signing package needs at least 2 nonce commitments")
+	}
+	c := &signingContext{
+		m:       pkg.Message,
+		lambdas: map[int]*secp.ModNScalar{},
+		commD:   map[int]*secp.JacobianPoint{}, commE: map[int]*secp.JacobianPoint{},
 		rhos: map[int]*secp.ModNScalar{},
 	}
-	for id := range shares {
-		if id < 1 || id > 0xffff {
-			return nil, fmt.Errorf("participant id %d out of range", id)
+	for _, nc := range pkg.Commitments {
+		if nc.From < 1 || nc.From > 0xffff {
+			return nil, fmt.Errorf("participant id %d out of range", nc.From)
 		}
-		r.ids = append(r.ids, id)
-	}
-	sort.Ints(r.ids)
-	if len(r.ids) < 2 {
-		return nil, fmt.Errorf("need at least 2 signers, have %d", len(r.ids))
-	}
-
-	// Shares, public shares, Lagrange weights, and the group point
-	// P = sum(lambda_i * Y_i).
-	var P secp.JacobianPoint
-	for _, id := range r.ids {
-		b := shares[id]
-		d := new(secp.ModNScalar)
-		if d.SetBytes(&b) != 0 || d.IsZero() {
-			return nil, fmt.Errorf("participant %d: invalid share scalar", id)
+		if _, dup := c.commD[nc.From]; dup {
+			return nil, fmt.Errorf("participant %d appears twice in the signing package", nc.From)
 		}
-		r.secrets[id] = d
-		r.pubShares[id] = pointFromScalar(d)
-		r.lambdas[id] = lagrange(r.ids, id)
-
-		var term, sum secp.JacobianPoint
-		secp.ScalarMultNonConst(r.lambdas[id], r.pubShares[id], &term)
-		secp.AddNonConst(&P, &term, &sum)
-		P.Set(&sum)
-	}
-	P.ToAffine()
-	if isInfinity(&P) {
-		return nil, fmt.Errorf("degenerate group key")
-	}
-	r.groupX = xBytes(&P)
-	r.pNegated = P.Y.IsOdd()
-
-	// Round 1: two nonces per participant, commitments D_i = k_h*G, E_i = k_b*G.
-	for _, id := range r.ids {
-		kh, err := randomScalar(rnd)
+		D, err := parsePoint(nc.D)
 		if err != nil {
-			return nil, err
+			return nil, misbehaved(nc.From, "hiding-nonce commitment is not a valid point: %v", err)
 		}
-		kb, err := randomScalar(rnd)
+		E, err := parsePoint(nc.E)
 		if err != nil {
-			return nil, err
+			return nil, misbehaved(nc.From, "binding-nonce commitment is not a valid point: %v", err)
 		}
-		r.hiding[id], r.binding[id] = kh, kb
-		r.commD[id], r.commE[id] = pointFromScalar(kh), pointFromScalar(kb)
+		c.commD[nc.From], c.commE[nc.From] = D, E
+	}
+	c.ids = sortedIDs(c.commD)
+	for _, id := range c.ids {
+		c.lambdas[id] = lagrange(c.ids, id)
 	}
 
-	// Binding factors over the full commitment list, then
-	// R = sum(D_i + rho_i*E_i).
+	// The group key travels as a full point so its parity is derived, not
+	// trusted: an x-only key names the even-Y point, so an odd-Y group point
+	// means the effective secret is n-d and every share's contribution is
+	// negated.
+	P, err := parsePoint(pkg.GroupKey)
+	if err != nil {
+		return nil, fmt.Errorf("group public key: %w", err)
+	}
+	c.groupX = xBytes(P)
+	c.pNegated = P.Y.IsOdd()
+
+	// Binding factors over the FULL commitment list (so a commitment cannot be
+	// replayed into another round), then R = sum(D_i + rho_i*E_i).
 	var commitList []byte
-	for _, id := range r.ids {
+	for _, id := range c.ids {
 		commitList = append(commitList, idBytes(id)...)
-		commitList = append(commitList, compressPoint(r.commD[id])...)
-		commitList = append(commitList, compressPoint(r.commE[id])...)
+		commitList = append(commitList, compressPoint(c.commD[id])...)
+		commitList = append(commitList, compressPoint(c.commE[id])...)
 	}
 	var R secp.JacobianPoint
-	for _, id := range r.ids {
-		rho := scalarFromHash(taggedHash(rhoTag, idBytes(id), m[:], commitList))
+	for _, id := range c.ids {
+		rho := scalarFromHash(taggedHash(rhoTag, idBytes(id), c.m[:], commitList))
 		if rho.IsZero() {
 			return nil, fmt.Errorf("participant %d: zero binding factor", id)
 		}
-		r.rhos[id] = rho
+		c.rhos[id] = rho
 		var rhoE, bound, sum secp.JacobianPoint
-		secp.ScalarMultNonConst(rho, r.commE[id], &rhoE)
-		secp.AddNonConst(&rhoE, r.commD[id], &bound)
+		secp.ScalarMultNonConst(rho, c.commE[id], &rhoE)
+		secp.AddNonConst(&rhoE, c.commD[id], &bound)
 		secp.AddNonConst(&R, &bound, &sum)
 		R.Set(&sum)
 	}
@@ -272,34 +279,39 @@ func newRound(m [32]byte, shares map[int][32]byte, rnd io.Reader) (*round, error
 	}
 	// BIP340 R parity: an odd-Y R is negated by negating every nonce scalar
 	// (R.x is unchanged, so the signature bytes commit to the same rx).
-	if R.Y.IsOdd() {
-		r.rNegated = true
-		for _, id := range r.ids {
-			r.hiding[id].Negate()
-			r.binding[id].Negate()
-		}
-	}
-	r.rx = xBytes(&R)
+	c.rNegated = R.Y.IsOdd()
+	c.rx = xBytes(&R)
 
 	// e = tagged_hash("BIP0340/challenge", R.x || P.x || m), exactly the single
 	// signer's challenge, so the aggregate verifies as an ordinary signature.
-	r.e = scalarFromHash(taggedHash("BIP0340/challenge", r.rx[:], r.groupX[:], m[:]))
-	return r, nil
+	c.e = scalarFromHash(taggedHash("BIP0340/challenge", c.rx[:], c.groupX[:], c.m[:]))
+	return c, nil
 }
 
-// partial computes participant id's signature share
-// s_i = k_h + rho_i*k_b + e*lambda_i*d_i, with d_i negated when the group key
-// has odd Y (the nonces already carry the R-parity sign from newRound).
-func (r *round) partial(id int) [32]byte {
-	d := new(secp.ModNScalar).Set(r.secrets[id])
-	if r.pNegated {
+// partial computes one member's signature share
+// s_i = k_h + rho_i*k_b + e*lambda_i*d_i, applying both parity adjustments: the
+// nonces are negated when R had odd Y, the share when the group point had odd
+// Y. Only the member itself ever calls this — share and nonces are its secrets.
+func (c *signingContext) partial(id int, share, kh, kb *secp.ModNScalar) ([32]byte, error) {
+	lambda, ok := c.lambdas[id]
+	if !ok {
+		return [32]byte{}, fmt.Errorf("participant %d is not in this signing round", id)
+	}
+	h := new(secp.ModNScalar).Set(kh)
+	b := new(secp.ModNScalar).Set(kb)
+	if c.rNegated {
+		h.Negate()
+		b.Negate()
+	}
+	d := new(secp.ModNScalar).Set(share)
+	if c.pNegated {
 		d.Negate()
 	}
-	term := new(secp.ModNScalar).Set(r.e)
-	term.Mul(r.lambdas[id]).Mul(d)
-	s := new(secp.ModNScalar).Set(r.rhos[id])
-	s.Mul(r.binding[id]).Add(r.hiding[id]).Add(term)
-	return s.Bytes()
+	term := new(secp.ModNScalar).Set(c.e)
+	term.Mul(lambda).Mul(d)
+	s := new(secp.ModNScalar).Set(c.rhos[id])
+	s.Mul(b).Add(h).Add(term)
+	return s.Bytes(), nil
 }
 
 // verifyPartial checks a partial signature against PUBLIC data only:
@@ -307,50 +319,53 @@ func (r *round) partial(id int) [32]byte {
 // exactly when the corresponding parity adjustment applied. Because rho_i and e
 // commit to this round's message and commitment list, a partial from any other
 // round (or any other message) fails here — replay is not a special case.
-func (r *round) verifyPartial(id int, partial [32]byte) error {
-	if _, ok := r.rhos[id]; !ok {
+func (c *signingContext) verifyPartial(id int, Y *secp.JacobianPoint, partial [32]byte) error {
+	if _, ok := c.rhos[id]; !ok {
 		return fmt.Errorf("participant %d: not in this signing round", id)
 	}
 	var si secp.ModNScalar
 	if si.SetBytes(&partial) != 0 {
-		return fmt.Errorf("participant %d: partial overflows the group order", id)
+		return misbehaved(id, "partial signature overflows the group order")
 	}
 	lhs := pointFromScalar(&si)
 
-	D, E := r.commD[id], r.commE[id]
-	if r.rNegated {
+	D, E := c.commD[id], c.commE[id]
+	if c.rNegated {
 		D, E = negatePoint(D), negatePoint(E)
 	}
-	Y := r.pubShares[id]
-	if r.pNegated {
+	if c.pNegated {
 		Y = negatePoint(Y)
 	}
-	el := new(secp.ModNScalar).Set(r.e)
-	el.Mul(r.lambdas[id])
+	el := new(secp.ModNScalar).Set(c.e)
+	el.Mul(c.lambdas[id])
 
 	var t1, t2, dt1, rhs secp.JacobianPoint
-	secp.ScalarMultNonConst(r.rhos[id], E, &t1)
+	secp.ScalarMultNonConst(c.rhos[id], E, &t1)
 	secp.ScalarMultNonConst(el, Y, &t2)
 	secp.AddNonConst(D, &t1, &dt1)
 	secp.AddNonConst(&dt1, &t2, &rhs)
 	rhs.ToAffine()
 	if !lhs.X.Equals(&rhs.X) || !lhs.Y.Equals(&rhs.Y) {
-		return fmt.Errorf("participant %d: invalid partial signature", id)
+		return misbehaved(id, "invalid partial signature")
 	}
 	return nil
 }
 
-// aggregate verifies every partial and sums them into the final 64-byte BIP340
-// signature (R.x || s). A bad partial fails here with its participant named,
-// before it can poison the aggregate.
-func (r *round) aggregate(partials map[int][32]byte) ([]byte, error) {
+// aggregate verifies every partial against its member's public share and sums
+// them into the final 64-byte BIP340 signature (R.x || s). A bad partial fails
+// here with its member named, before it can poison the aggregate.
+func (c *signingContext) aggregate(partials map[int][32]byte, pubShares map[int]*secp.JacobianPoint) ([]byte, error) {
 	s := new(secp.ModNScalar)
-	for _, id := range r.ids {
+	for _, id := range c.ids {
 		p, ok := partials[id]
 		if !ok {
 			return nil, fmt.Errorf("participant %d: missing partial signature", id)
 		}
-		if err := r.verifyPartial(id, p); err != nil {
+		Y, ok := pubShares[id]
+		if !ok {
+			return nil, fmt.Errorf("participant %d: no public share to verify its partial against", id)
+		}
+		if err := c.verifyPartial(id, Y, p); err != nil {
 			return nil, err
 		}
 		var si secp.ModNScalar
@@ -358,27 +373,36 @@ func (r *round) aggregate(partials map[int][32]byte) ([]byte, error) {
 		s.Add(&si)
 	}
 	sig := make([]byte, 64)
-	copy(sig[:32], r.rx[:])
+	copy(sig[:32], c.rx[:])
 	sb := s.Bytes()
 	copy(sig[32:], sb[:])
 	return sig, nil
 }
 
-// signFROST runs a complete in-process signing round over the given share
-// subset and returns the BIP340 signature plus the group X the subset
-// reconstructs (for the caller to check against the stored group key).
-func signFROST(m [32]byte, shares map[int][32]byte, rnd io.Reader) (sig []byte, groupX [32]byte, err error) {
-	r, err := newRound(m, shares, rnd)
-	if err != nil {
-		return nil, groupX, err
+// groupPointFromShares reconstructs the group point from a threshold subset of
+// shares: sum(lambda_i * d_i * G) = f(0)*G = P. Used for key material generated
+// before the group point was persisted in full (see
+// FrostSigner.verificationData) and by the dealer keygen.
+func groupPointFromShares(shares map[int][32]byte) (*secp.JacobianPoint, error) {
+	ids := sortedIDs(shares)
+	if len(ids) < 2 {
+		return nil, fmt.Errorf("need at least 2 shares, have %d", len(ids))
 	}
-	partials := map[int][32]byte{}
-	for _, id := range r.ids {
-		partials[id] = r.partial(id)
+	var P secp.JacobianPoint
+	for _, id := range ids {
+		b := shares[id]
+		d := new(secp.ModNScalar)
+		if d.SetBytes(&b) != 0 || d.IsZero() {
+			return nil, fmt.Errorf("participant %d: invalid share scalar", id)
+		}
+		var term, sum secp.JacobianPoint
+		secp.ScalarMultNonConst(lagrange(ids, id), pointFromScalar(d), &term)
+		secp.AddNonConst(&P, &term, &sum)
+		P.Set(&sum)
 	}
-	sig, err = r.aggregate(partials)
-	if err != nil {
-		return nil, groupX, err
+	P.ToAffine()
+	if isInfinity(&P) {
+		return nil, fmt.Errorf("degenerate group key")
 	}
-	return sig, r.groupX, nil
+	return &P, nil
 }

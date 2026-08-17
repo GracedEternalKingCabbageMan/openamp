@@ -6,10 +6,13 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"fmt"
+	"io"
 	"strings"
 	"testing"
 
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
+	secp "github.com/decred/dcrd/dcrec/secp256k1/v4"
 
 	"github.com/GracedEternalKingCabbageMan/openamp/openampd/internal/server"
 	"github.com/GracedEternalKingCabbageMan/openamp/openampd/internal/store"
@@ -63,6 +66,82 @@ func verifyBIP340(t *testing.T, sig []byte, m [32]byte, groupX [32]byte) {
 	}
 }
 
+// inProcessRound drives one signing round directly over the protocol
+// primitives, holding every share itself. It is the reference path the pinned
+// vectors were computed under: the real signer never does this — it runs the
+// same primitives across the transport seam, one share per member.
+type inProcessRound struct {
+	ctx       *signingContext
+	shares    map[int]*secp.ModNScalar
+	pubShares map[int]*secp.JacobianPoint
+	nonces    map[int][2]*secp.ModNScalar
+}
+
+func newInProcessRound(m [32]byte, shares map[int][32]byte, rnd io.Reader) (*inProcessRound, error) {
+	P, err := groupPointFromShares(shares)
+	if err != nil {
+		return nil, err
+	}
+	r := &inProcessRound{
+		shares: map[int]*secp.ModNScalar{}, pubShares: map[int]*secp.JacobianPoint{},
+		nonces: map[int][2]*secp.ModNScalar{},
+	}
+	pkg := &SigningPackage{Message: m, GroupKey: compressPoint(P)}
+	for _, id := range sortedIDs(shares) {
+		b := shares[id]
+		d := new(secp.ModNScalar)
+		d.SetBytes(&b)
+		r.shares[id] = d
+		r.pubShares[id] = pointFromScalar(d)
+		kh, err := randomScalar(rnd)
+		if err != nil {
+			return nil, err
+		}
+		kb, err := randomScalar(rnd)
+		if err != nil {
+			return nil, err
+		}
+		r.nonces[id] = [2]*secp.ModNScalar{kh, kb}
+		pkg.Commitments = append(pkg.Commitments, &NonceCommitment{
+			From: id, D: compressPoint(pointFromScalar(kh)), E: compressPoint(pointFromScalar(kb)),
+		})
+	}
+	r.ctx, err = newSigningContext(pkg)
+	return r, err
+}
+
+func (r *inProcessRound) partial(t *testing.T, id int) [32]byte {
+	t.Helper()
+	p, err := r.ctx.partial(id, r.shares[id], r.nonces[id][0], r.nonces[id][1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func (r *inProcessRound) allPartials(t *testing.T) map[int][32]byte {
+	t.Helper()
+	out := map[int][32]byte{}
+	for _, id := range r.ctx.ids {
+		out[id] = r.partial(t, id)
+	}
+	return out
+}
+
+// signInProcess is the reference single-process signing path.
+func signInProcess(t *testing.T, m [32]byte, shares map[int][32]byte, rnd io.Reader) ([]byte, [32]byte) {
+	t.Helper()
+	r, err := newInProcessRound(m, shares, rnd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig, err := r.ctx.aggregate(r.allPartials(t), r.pubShares)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sig, r.ctx.groupX
+}
+
 // TestFrost_RandomKeysAndMessages is the base correctness gate: over many
 // random keys and messages, the aggregate of a 2-of-3 round is a valid BIP340
 // signature under the group x-only key (checked by the independent btcec
@@ -77,10 +156,7 @@ func TestFrost_RandomKeysAndMessages(t *testing.T) {
 		if _, err := rand.Read(m[:]); err != nil {
 			t.Fatal(err)
 		}
-		sig, gotX, err := signFROST(m, shareSubset(shares, 1, 2), rand.Reader)
-		if err != nil {
-			t.Fatal(err)
-		}
+		sig, gotX := signInProcess(t, m, shareSubset(shares, 1, 2), rand.Reader)
 		if gotX != groupX {
 			t.Fatalf("subset reconstructs %x, dealer says %x", gotX, groupX)
 		}
@@ -102,20 +178,16 @@ func TestFrost_ParityBranches(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		r, err := newRound(m, shareSubset(shares, 1, 3), rnd)
+		r, err := newInProcessRound(m, shareSubset(shares, 1, 3), rnd)
 		if err != nil {
 			t.Fatal(err)
 		}
-		partials := map[int][32]byte{}
-		for _, id := range r.ids {
-			partials[id] = r.partial(id)
-		}
-		sig, err := r.aggregate(partials)
+		sig, err := r.ctx.aggregate(r.allPartials(t), r.pubShares)
 		if err != nil {
-			t.Fatalf("aggregate (pNegated=%v rNegated=%v): %v", r.pNegated, r.rNegated, err)
+			t.Fatalf("aggregate (pNegated=%v rNegated=%v): %v", r.ctx.pNegated, r.ctx.rNegated, err)
 		}
 		verifyBIP340(t, sig, m, groupX)
-		seen[[2]bool{r.pNegated, r.rNegated}]++
+		seen[[2]bool{r.ctx.pNegated, r.ctx.rNegated}]++
 	}
 	if len(seen) < 4 {
 		t.Fatalf("not all parity combinations exercised: %v", seen)
@@ -134,10 +206,7 @@ func TestFrost_AllSignerPairs(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, pair := range [][]int{{1, 2}, {1, 3}, {2, 3}} {
-		sig, gotX, err := signFROST(m, shareSubset(shares, pair...), rand.Reader)
-		if err != nil {
-			t.Fatalf("pair %v: %v", pair, err)
-		}
+		sig, gotX := signInProcess(t, m, shareSubset(shares, pair...), rand.Reader)
 		if gotX != groupX {
 			t.Fatalf("pair %v reconstructs %x, want %x", pair, gotX, groupX)
 		}
@@ -155,24 +224,21 @@ func TestFrost_TamperedPartialDetectedAndNamed(t *testing.T) {
 	}
 	var m [32]byte
 	m[0] = 7
-	r, err := newRound(m, shareSubset(shares, 2, 3), rand.Reader)
+	r, err := newInProcessRound(m, shareSubset(shares, 2, 3), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
-	partials := map[int][32]byte{}
-	for _, id := range r.ids {
-		partials[id] = r.partial(id)
-	}
+	partials := r.allPartials(t)
 	bad := partials[3]
 	bad[31] ^= 0x01
 	partials[3] = bad
-	if _, err := r.aggregate(partials); err == nil {
+	if _, err := r.ctx.aggregate(partials, r.pubShares); err == nil {
 		t.Fatal("tampered partial must fail aggregation")
-	} else if !strings.Contains(err.Error(), "participant 3") {
-		t.Fatalf("the error must name participant 3, got: %v", err)
+	} else if !strings.Contains(err.Error(), "member 3") {
+		t.Fatalf("the error must name member 3, got: %v", err)
 	}
 	// The honest partial still verifies: detection is per participant.
-	if err := r.verifyPartial(2, partials[2]); err != nil {
+	if err := r.ctx.verifyPartial(2, r.pubShares[2], partials[2]); err != nil {
 		t.Fatalf("honest partial rejected: %v", err)
 	}
 }
@@ -187,29 +253,31 @@ func TestFrost_PartialReplayAcrossMessagesFails(t *testing.T) {
 	}
 	var m1, m2 [32]byte
 	m1[0], m2[0] = 1, 2
-	r1, err := newRound(m1, shareSubset(shares, 1, 2), rand.Reader)
+	subset := shareSubset(shares, 1, 2)
+	r1, err := newInProcessRound(m1, subset, rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
-	replayed := r1.partial(1)
-	r2, err := newRound(m2, shareSubset(shares, 1, 2), rand.Reader)
+	replayed := r1.partial(t, 1)
+	r2, err := newInProcessRound(m2, subset, rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := r2.verifyPartial(1, replayed); err == nil {
+	if err := r2.ctx.verifyPartial(1, r2.pubShares[1], replayed); err == nil {
 		t.Fatal("a partial from another message's round must not verify")
 	}
-	partials := map[int][32]byte{1: replayed, 2: r2.partial(2)}
-	if _, err := r2.aggregate(partials); err == nil {
+	partials := map[int][32]byte{1: replayed, 2: r2.partial(t, 2)}
+	if _, err := r2.ctx.aggregate(partials, r2.pubShares); err == nil {
 		t.Fatal("aggregation over a replayed partial must fail")
 	}
 }
 
-// Pinned deterministic vectors: for a fixed rand stream and message, keygen
-// and the signing round must reproduce these exact bytes. A change here means
-// the derivation or the protocol serialization changed — which invalidates
-// nothing on-chain (signatures are per-round) but must be a deliberate,
-// reviewed decision, not drift.
+// Pinned deterministic vectors: for a fixed rand stream and message, the
+// TRUSTED-DEALER keygen and the signing round must reproduce these exact bytes.
+// A change here means the derivation or the protocol serialization changed —
+// which invalidates nothing on-chain (signatures are per-round) but must be a
+// deliberate, reviewed decision, not drift. Keeping the dealer path is partly
+// what keeps this gate meaningful now that DKG is the default.
 const (
 	frostVectorGroupX = "817e243dd6b8b869c09b3ca4646f2eaf9b6d9b626d6a00acc8cf5588d74b5dbe"
 	frostVectorSig    = "78142032461f4be50066b5058403d08580eddda5ef2d2cb9b22c8229f4934881ae5e80390957f9ce20ad9eba26c4a49d2737a04934e88b641c2844d8d2862491"
@@ -225,10 +293,7 @@ func TestFrost_DeterministicVectorsPinned(t *testing.T) {
 		t.Fatalf("group key drifted:\n got %s\nwant %s", got, frostVectorGroupX)
 	}
 	m := sha256.Sum256([]byte("openamp frost vector message"))
-	sig, _, err := signFROST(m, shareSubset(shares, 1, 2), rnd)
-	if err != nil {
-		t.Fatal(err)
-	}
+	sig, _ := signInProcess(t, m, shareSubset(shares, 1, 2), rnd)
 	if got := hex.EncodeToString(sig); got != frostVectorSig {
 		t.Fatalf("signature drifted:\n got %s\nwant %s", got, frostVectorSig)
 	}
@@ -237,68 +302,83 @@ func TestFrost_DeterministicVectorsPinned(t *testing.T) {
 
 // --- the PolicySigner backend -------------------------------------------------
 
-// TestFrostSigner_KeyLifecycle drives GeneratePolicyKey -> Adopt -> SignPolicy
-// against a real store: shares land in the keys file under the asset id, the
-// group key is the policy pubkey, and the signature verifies under it.
-func TestFrostSigner_KeyLifecycle(t *testing.T) {
+// newTestSigner builds a signer over a fresh store, with the given keygen mode.
+func newTestSigner(t *testing.T, mode KeygenMode) (*FrostSigner, *store.Store) {
+	t.Helper()
 	st, err := store.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	f, err := New(st, Config{})
+	f, err := New(st, Config{Keygen: mode})
 	if err != nil {
 		t.Fatal(err)
 	}
-	pub, ref, err := f.GeneratePolicyKey()
-	if err != nil {
-		t.Fatal(err)
+	return f, st
+}
+
+// TestFrostSigner_KeyLifecycle drives GeneratePolicyKey -> Adopt -> SignPolicy
+// under BOTH keygen modes: each member's share lands in the keys file under the
+// asset id, the coordinator's record carries the group point and the pinned
+// public shares, and the signature verifies under the group key. DKG is the
+// default, so the zero-value mode must behave like KeygenDKG.
+func TestFrostSigner_KeyLifecycle(t *testing.T) {
+	for _, mode := range []KeygenMode{"", KeygenDKG, KeygenDealer} {
+		t.Run("mode-"+string(mode), func(t *testing.T) {
+			f, st := newTestSigner(t, mode)
+			pub, ref, err := f.GeneratePolicyKey()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := f.Adopt(ref, "asset-1"); err != nil {
+				t.Fatal(err)
+			}
+			keys, err := st.LoadKeys()
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, want := range []string{
+				"frost:asset-1:group",
+				"frost:asset-1:share:1", "frost:asset-1:share:2", "frost:asset-1:share:3",
+				"frost:asset-1:pubshare:1", "frost:asset-1:pubshare:2", "frost:asset-1:pubshare:3",
+			} {
+				if _, ok := keys[want]; !ok {
+					t.Fatalf("missing key %s after adopt (have %v)", want, keys)
+				}
+			}
+			for name := range keys {
+				if strings.HasPrefix(name, "frost-pending:") {
+					t.Fatalf("staged key %s survived adopt", name)
+				}
+			}
+			// The group record is the FULL point, so the parity the signing round
+			// needs is part of the record rather than recovered at signing time.
+			if g := keys["frost:asset-1:group"]; len(g) != 66 {
+				t.Fatalf("group record must be a 33-byte compressed point, got %q", g)
+			}
+			got, ok := f.PolicyPubKey("asset-1")
+			if !ok || got != pub {
+				t.Fatalf("PolicyPubKey = %x ok=%v, want %x", got, ok, pub)
+			}
+			sighash := sha256.Sum256([]byte("a real spend"))
+			sig, err := f.SignPolicy("asset-1", sighash, server.PolicyContext{Action: "transfer"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			verifyBIP340(t, sig, sighash, pub)
+		})
 	}
-	if err := f.Adopt(ref, "asset-1"); err != nil {
-		t.Fatal(err)
-	}
-	keys, err := st.LoadKeys()
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, want := range []string{"frost:asset-1:group", "frost:asset-1:share:1", "frost:asset-1:share:2", "frost:asset-1:share:3"} {
-		if _, ok := keys[want]; !ok {
-			t.Fatalf("missing key %s after adopt (have %v)", want, keys)
-		}
-	}
-	for name := range keys {
-		if strings.HasPrefix(name, "frost-pending:") {
-			t.Fatalf("staged key %s survived adopt", name)
-		}
-	}
-	got, ok := f.PolicyPubKey("asset-1")
-	if !ok || got != pub {
-		t.Fatalf("PolicyPubKey = %x ok=%v, want %x", got, ok, pub)
-	}
-	sighash := sha256.Sum256([]byte("a real spend"))
-	sig, err := f.SignPolicy("asset-1", sighash, server.PolicyContext{Action: "transfer"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	verifyBIP340(t, sig, sighash, pub)
 }
 
 // TestFrostSigner_LegacyLocalFallback proves an asset provisioned by the
 // LocalKeySigner keeps signing when the frost backend is selected.
 func TestFrostSigner_LegacyLocalFallback(t *testing.T) {
-	st, err := store.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	f, st := newTestSigner(t, KeygenDKG)
 	local := server.NewLocalKeySigner(st)
 	pub, ref, err := local.GeneratePolicyKey()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := local.Adopt(ref, "legacy-asset"); err != nil {
-		t.Fatal(err)
-	}
-	f, err := New(st, Config{})
-	if err != nil {
 		t.Fatal(err)
 	}
 	got, ok := f.PolicyPubKey("legacy-asset")
@@ -312,3 +392,100 @@ func TestFrostSigner_LegacyLocalFallback(t *testing.T) {
 	}
 	verifyBIP340(t, sig, sighash, pub)
 }
+
+// TestFrostSigner_FirstReleaseKeyLayoutStillSigns pins backward compatibility
+// with the layout this backend shipped with — an x-only group record and NO
+// pinned public shares, which is what the live testnet asset carries. The
+// coordinator must recover the group point's parity and the public shares from
+// the members and still produce a valid signature.
+func TestFrostSigner_FirstReleaseKeyLayoutStillSigns(t *testing.T) {
+	f, st := newTestSigner(t, KeygenDealer)
+	pub, ref, err := f.GeneratePolicyKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Adopt(ref, "old-asset"); err != nil {
+		t.Fatal(err)
+	}
+	// Rewrite the record in the first release's shape: x-only group key, no
+	// pubshare entries.
+	if err := st.SaveKey("frost:old-asset:group", hex.EncodeToString(pub[:])); err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 3; i++ {
+		if err := st.DeleteKey(fmt.Sprintf("frost:old-asset:pubshare:%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, ok := f.PolicyPubKey("old-asset")
+	if !ok || got != pub {
+		t.Fatalf("PolicyPubKey over the first-release layout = %x ok=%v, want %x", got, ok, pub)
+	}
+	sighash := sha256.Sum256([]byte("spend under the old layout"))
+	sig, err := f.SignPolicy("old-asset", sighash, server.PolicyContext{Action: "clawback", Reason: "court order"})
+	if err != nil {
+		t.Fatalf("first-release key layout must still sign: %v", err)
+	}
+	verifyBIP340(t, sig, sighash, pub)
+}
+
+// TestFrostSigner_CorruptedPublicShareRecordRefuses proves the group-key
+// cross-check catches a public-share record that does not belong to the key,
+// instead of emitting a signature that cannot verify.
+func TestFrostSigner_CorruptedPublicShareRecordRefuses(t *testing.T) {
+	f, st := newTestSigner(t, KeygenDKG)
+	_, ref, err := f.GeneratePolicyKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Adopt(ref, "asset-x"); err != nil {
+		t.Fatal(err)
+	}
+	// A valid point, but not member 1's public share.
+	other := pointFromScalar(scalarFromHash(sha256.Sum256([]byte("not the right share"))))
+	if err := st.SaveKey("frost:asset-x:pubshare:1", hex.EncodeToString(compressPoint(other))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.SignPolicy("asset-x", sha256.Sum256([]byte("m")), server.PolicyContext{Action: "transfer"}); err == nil {
+		t.Fatal("a public-share record inconsistent with the group key must refuse to sign")
+	} else if !strings.Contains(err.Error(), "reconstruct") {
+		t.Fatalf("expected a reconstruction mismatch, got: %v", err)
+	}
+}
+
+// TestFrostSigner_DealerModeNeedsALocalQuorum proves the trusted-dealer mode is
+// refused on a transport whose members will not accept externally generated
+// shares — the property that makes DKG the only option once members are
+// separate hosts — while DKG works over that same transport.
+func TestFrostSigner_DealerModeNeedsALocalQuorum(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := NewWithTransport(st, Config{Keygen: KeygenDealer}, &remoteish{NewLocalTransport(st, 3, rand.Reader)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := f.GeneratePolicyKey(); err == nil {
+		t.Fatal("dealer keygen must be refused when members cannot be handed shares")
+	} else if !strings.Contains(err.Error(), "install dealt shares") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	f2, err := NewWithTransport(st, Config{Keygen: KeygenDKG}, &remoteish{NewLocalTransport(st, 3, rand.Reader)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := f2.GeneratePolicyKey(); err != nil {
+		t.Fatalf("DKG must work over a transport that cannot install shares: %v", err)
+	}
+}
+
+// remoteish exposes ONLY the Transport interface, hiding InstallDealtShares —
+// exactly how a networked transport must look.
+type remoteish struct{ inner *LocalTransport }
+
+func (r *remoteish) Members() []Identity           { return r.inner.Members() }
+func (r *remoteish) Member(id int) (Member, error) { return r.inner.Member(id) }
+func (r *remoteish) Close() error                  { return r.inner.Close() }
+
+var _ Transport = (*remoteish)(nil)

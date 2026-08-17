@@ -16,17 +16,19 @@ import (
 // backend concern: nothing about enclaves, contracts, wallets, or any
 // already-issued asset changes when the backend changes.
 //
-//   - Testnet / PoC: LocalKeySigner holds one key per asset (this file).
-//   - Mainnet: a FROST (or threshold-Schnorr MPC / threshold-custody HSM)
-//     backend implements this same interface. The on-chain K_policy is the
-//     FROST group public key; signing runs a t-of-n quorum off-chain and
-//     returns one 64-byte signature that verifies under K_policy. Because the
-//     group key is invariant under share resharing, the quorum's signer set
-//     and threshold can be rotated over the asset's life with NO chain
-//     migration of holders' funds. That rotation property is the reason the
-//     quorum lives off-chain behind this seam rather than on-chain as a
-//     k-of-n script multisig (which would bake the signer set into every
-//     enclave address).
+//   - Default: LocalKeySigner holds one key per asset (this file).
+//   - Threshold: the FROST backend (internal/server/frostsigner, -signer frost)
+//     implements this same interface. The on-chain K_policy is the FROST group
+//     public key, generated distributively so no component holds the group
+//     secret; signing runs a t-of-n quorum and returns one 64-byte signature
+//     that verifies under K_policy.
+//
+// The group key is a public point, independent of who holds shares, so a
+// resharing could rotate the quorum's signer set and threshold over an asset's
+// life with NO chain migration of holders' funds. That property is the reason
+// the quorum lives off-chain behind this seam rather than on-chain as a k-of-n
+// script multisig (which would bake the signer set into every enclave address);
+// resharing itself is not implemented yet.
 type PolicySigner interface {
 	// GeneratePolicyKey provisions a new policy key and returns its x-only
 	// public key plus an opaque ref. The pubkey is needed to build the
