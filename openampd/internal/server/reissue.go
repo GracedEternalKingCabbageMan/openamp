@@ -234,7 +234,7 @@ func (s *Server) handleReissue(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, 409, "reissuance token not found in the server wallet")
 		return
 	}
-	if !tok.Confidential || tok.AssetBlinder == "" || tok.AssetBlinder == zeroBlinder {
+	if tok.AssetBlinder == "" || tok.AssetBlinder == zeroBlinder {
 		// Re-blind first (the phantom-tx hazard). Broadcasts a token -> blinded
 		// address move; the caller retries the same request_id once it is in the
 		// wallet (0-conf is fine to chain from, nothing is final yet).

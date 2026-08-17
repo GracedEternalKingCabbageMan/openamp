@@ -537,7 +537,7 @@ func (s *Server) unifiedUTXOs(spks []string, assetID string) ([]enclaveUTXO, err
 			continue // stale watch-wallet entry
 		}
 		seen[key] = true
-		out = append(out, enclaveUTXO{txid: u.TxID, vout: u.Vout, atoms: sats(u.Amount), spk: u.ScriptPubKey, blinded: u.Confidential})
+		out = append(out, enclaveUTXO{txid: u.TxID, vout: u.Vout, atoms: sats(u.Amount), spk: u.ScriptPubKey, blinded: u.Blinded()})
 	}
 	return out, nil
 }
