@@ -285,34 +285,17 @@ func (s *Server) holderBalances(asset *store.Asset) (map[string]uint64, error) {
 	if len(spks) == 0 {
 		return balances, nil
 	}
-	// Confidential assets are unblinded through the watch wallet, which reports
-	// the amount per enclave scriptPubKey; scantxoutset would only see
-	// commitments (whose asset never matches the plaintext asset id).
-	if asset.Confidential {
-		w, err := s.watchClient()
-		if err != nil {
-			return nil, err
-		}
-		all, err := w.ListUnspentAll()
-		if err != nil {
-			return nil, err
-		}
-		for _, u := range all {
-			if aid, ok := spkToAID[u.ScriptPubKey]; ok && u.Asset == asset.ID {
-				balances[aid] += sats(u.Amount)
-			}
-		}
-		return balances, nil
-	}
-	unspents, err := s.node.ScanTxOutSet(spks)
+	// Unified view for EVERY asset: any enclave may hold a mix of explicit and
+	// blinded coins (confidentiality is per transfer), so the balance is the
+	// deduped union of the UTXO-set scan and the watch wallet's unblinded
+	// listing. There is no per-asset branch: a legacy Asset.Confidential flag
+	// only means some existing UTXOs are blinded, which this read absorbs.
+	utxos, err := s.unifiedUTXOs(spks, asset.ID)
 	if err != nil {
 		return nil, err
 	}
-	for _, u := range unspents {
-		if u.Asset != asset.ID {
-			continue
-		}
-		balances[spkToAID[u.ScriptPubKey]] += sats(u.Amount)
+	for _, u := range utxos {
+		balances[spkToAID[u.spk]] += u.atoms
 	}
 	return balances, nil
 }
@@ -429,6 +412,12 @@ func (s *Server) handleTransferBuild(w http.ResponseWriter, r *http.Request) {
 		RecipientAID string `json:"recipient_aid"`
 		Atoms        uint64 `json:"atoms"`
 		FeeMode      string `json:"fee_mode"` // "convert" | "sponsor"
+		// Confidential is the PER-TRANSFER privacy choice (default false): true
+		// blinds the recipient/change/conversion enclave outputs of THIS
+		// transaction to the derived per-(holder, asset) blinding keys, whatever
+		// the asset and however its earlier UTXOs look; false builds the asset
+		// legs explicit even when some selected inputs are blinded.
+		Confidential bool `json:"confidential"`
 		// Payment (OA-4): an optional ordinary-asset (e.g. USDX) leg carried in the
 		// SAME transaction as the restricted transfer, turning delivery-versus-
 		// payment into one atomic tx. from_address is an ordinary address the
@@ -466,12 +455,12 @@ func (s *Server) handleTransferBuild(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// OA-4 payment leg: only for a transparent restricted asset (the atomic DvP
-	// path keeps the WHOLE tx transparent; a blinded restricted leg cannot carry
-	// an explicit foreign payment output under the transparency rule).
+	// OA-4 payment leg: only for a fully explicit (confidential: false) build —
+	// the atomic DvP path keeps the WHOLE tx transparent, so a per-transfer
+	// confidential build cannot carry a payment leg.
 	if req.Payment != nil {
-		if asset.Confidential {
-			httpErr(w, 400, "an atomic payment leg is only supported for a transparent restricted asset")
+		if req.Confidential {
+			httpErr(w, 400, "an atomic payment leg requires a fully transparent build; it cannot be combined with \"confidential\": true")
 			return
 		}
 		p := req.Payment
@@ -489,24 +478,22 @@ func (s *Server) handleTransferBuild(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Sender coin selection.
+	// Sender coin selection over the mixed (explicit + blinded) enclave set.
 	utxos, err := s.enclaveUTXOs(senderTree, asset.ID)
 	if err != nil {
 		httpErr(w, 502, "scan: %v", err)
 		return
 	}
 	need := req.Atoms + convertAtoms
-	var chosen []enclaveUTXO
-	var total uint64
-	for _, u := range utxos {
-		chosen = append(chosen, u)
-		total += u.atoms
-		if total >= need {
-			break
-		}
-	}
+	chosen, total, anyBlindedIn := selectUTXOs(utxos, need, req.Confidential)
 	if total < need {
 		httpErr(w, 409, "insufficient balance: have %d atoms, need %d", total, need)
+		return
+	}
+	// The payment leg needs the whole tx explicit; blinded inputs would force a
+	// blinded balancing output into the atomic settlement.
+	if req.Payment != nil && anyBlindedIn {
+		httpErr(w, 409, "an atomic payment leg requires the transfer to be funded from explicit enclave coins; the sender's explicit balance cannot cover %d atoms", need)
 		return
 	}
 
@@ -564,11 +551,14 @@ func (s *Server) handleTransferBuild(w http.ResponseWriter, r *http.Request) {
 	}
 	tx.In = append(tx.In, &elements.TxIn{Prevout: elements.OutPoint{Hash: internalHash(feeIn.txid), N: feeIn.vout}})
 
-	// Output nonces: null for transparent assets; per-enclave blinding pubkeys
-	// for a confidential asset (each also registers the recipient's enclave in
-	// the watch wallet so the server can unblind it later).
+	// Output nonces: null for an explicit build; for a confidential REQUEST the
+	// enclave outputs carry per-(holder, asset) blinding pubkeys, whatever the
+	// asset (each derivation also registers that enclave in the watch wallet so
+	// the server can unblind the output later). A confidential:false build
+	// keeps the asset legs explicit even when blinded inputs were selected —
+	// the holder chose to reveal these amounts.
 	recipNonce, changeNonce, convNonce := elements.NullNonce(), elements.NullNonce(), elements.NullNonce()
-	if asset.Confidential {
+	if req.Confidential {
 		if recipNonce, err = s.enclaveConfNonce(asset.ID, elements.MustHex32(recipUser.Pubkeys[0]), hex.EncodeToString(recipTree.ScriptPubKey())); err != nil {
 			httpErr(w, 500, "confidential recipient: %v", err)
 			return
@@ -577,9 +567,11 @@ func (s *Server) handleTransferBuild(w http.ResponseWriter, r *http.Request) {
 			httpErr(w, 500, "confidential change: %v", err)
 			return
 		}
-		if convNonce, err = s.enclaveConfNonce(asset.ID, elements.MustHex32(issuerUser.Pubkeys[0]), hex.EncodeToString(issuerTree.ScriptPubKey())); err != nil {
-			httpErr(w, 500, "confidential conversion: %v", err)
-			return
+		if convertAtoms > 0 {
+			if convNonce, err = s.enclaveConfNonce(asset.ID, elements.MustHex32(issuerUser.Pubkeys[0]), hex.EncodeToString(issuerTree.ScriptPubKey())); err != nil {
+				httpErr(w, 500, "confidential conversion: %v", err)
+				return
+			}
 		}
 	}
 
@@ -653,10 +645,13 @@ func (s *Server) handleTransferBuild(w http.ResponseWriter, r *http.Request) {
 			})
 		}
 	}
-	// Fee change: a confidential wallet output for a confidential asset (so the
-	// transaction has >=2 confidential outputs and the amount is hidden too),
-	// otherwise a plain wallet output.
-	if asset.Confidential {
+	// Fee change: a per-call blinded (blech32) wallet output whenever this
+	// transaction blinds at all — for a confidential request it completes the
+	// >=2-blinded-outputs discipline; for an explicit build that had to spend
+	// blinded inputs it is the ONE blinded output consensus requires to absorb
+	// the input blinding factors (see blindTx: an all-explicit-output tx over
+	// blinded inputs can never balance). Otherwise a plain wallet output.
+	if req.Confidential || anyBlindedIn {
 		feeChange, err := s.confWalletOutput(feeIn.sats - s.cfg.FeeSats)
 		if err != nil {
 			httpErr(w, 502, "%v", err)
@@ -677,9 +672,12 @@ func (s *Server) handleTransferBuild(w http.ResponseWriter, r *http.Request) {
 
 	// Keep the pre-blind (explicit) tx for the policy check, which reads
 	// amounts, assets and destinations; blind the copy that gets signed and
-	// broadcast (the sighash commits to the blinded outputs).
+	// broadcast (the sighash commits to the blinded outputs). Blinding runs
+	// whenever any output carries a nonce OR any input is blinded (whose
+	// blinders must be supplied to rawblindrawtransaction either way); a fully
+	// explicit build over explicit inputs skips it, byte-identically to before.
 	explicitTx := tx
-	if asset.Confidential {
+	if req.Confidential || anyBlindedIn {
 		blinded, err := s.blindTx(tx)
 		if err != nil {
 			httpErr(w, 500, "blind transfer: %v", err)
@@ -1022,14 +1020,21 @@ func (s *Server) handleCosign(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, 404, "%v", err)
 		return
 	}
-	if asset.Confidential {
-		httpErr(w, 400, "confidential assets must use the hosted transfer flow (POST /v1/transfers); the server blinds the transaction")
-		return
-	}
 	tx, err := elements.DeserializeTx(mustHexBytes(req.Tx))
 	if err != nil {
 		httpErr(w, 400, "tx: %v", err)
 		return
+	}
+	// The refusal keys on the TRANSACTION, never on the asset: a self-built
+	// transfer must be fully transparent because the policy engine cannot check
+	// blinded outputs. Any asset — including one with blinded UTXOs elsewhere —
+	// co-signs fine as long as this tx is explicit; per-transfer confidentiality
+	// lives in the hosted flow (POST /v1/transfers with "confidential": true).
+	for i, out := range tx.Out {
+		if len(out.Asset) != 33 || out.Asset[0] != 1 || len(out.Value) != 9 || out.Value[0] != 1 {
+			httpErr(w, 400, "output %d is blinded: self-built (cosign) transactions are transparent-only, because the policy server cannot verify blinded outputs; use the hosted transfer flow (POST /v1/transfers with \"confidential\": true) for a confidential transfer", i)
+			return
+		}
 	}
 	spent, err := s.spentOutputs(tx)
 	if err != nil {
@@ -1053,6 +1058,14 @@ func (s *Server) handleCosign(w http.ResponseWriter, r *http.Request) {
 		claimed[idx] = true
 		if hex.EncodeToString(spent[idx].ScriptPubKey) != senderSpk {
 			httpErr(w, 403, "input %d is not the sender's enclave output", idx)
+			return
+		}
+		// A claimed input must spend an EXPLICIT prevout: a blinded enclave coin
+		// has hidden amounts the policy engine cannot re-derive, and a valid
+		// all-explicit tx cannot spend it anyway (the commitments would not
+		// balance). Its holder moves it through the hosted flow instead.
+		if _, ok := elements.ExplicitValueAmount(spent[idx].Value); !ok || len(spent[idx].Asset) != 33 || spent[idx].Asset[0] != 1 {
+			httpErr(w, 400, "input %d spends a blinded enclave output: self-built transfers can only spend explicit coins; move blinded coins through the hosted transfer flow (POST /v1/transfers)", idx)
 			return
 		}
 	}

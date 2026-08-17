@@ -132,10 +132,16 @@ func newOA3Server(t *testing.T) (*Server, *store.Store, *[]map[string]any) {
 	return s, st, &scanUnspents
 }
 
+// balanceUTXOSeq gives every fixture UTXO a distinct outpoint: the unified
+// balance read dedupes by outpoint (the same coin can appear in both the scan
+// and the watch wallet), so two holders' coins must never share one.
+var balanceUTXOSeq uint32
+
 func balanceUTXO(spk, assetID string) map[string]any {
+	balanceUTXOSeq++
 	return map[string]any{
 		"txid":         strings.Repeat("22", 32),
-		"vout":         0,
+		"vout":         balanceUTXOSeq,
 		"scriptPubKey": spk,
 		"amount":       1.0,
 		"asset":        assetID,

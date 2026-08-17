@@ -27,6 +27,12 @@ func (s *Server) handleBurnBuild(w http.ResponseWriter, r *http.Request) {
 		HolderAID string `json:"holder_aid"`
 		Atoms     uint64 `json:"atoms"`
 		FeeMode   string `json:"fee_mode"` // "sponsor" (default) | "convert"
+		// Confidential asks for blinded handling of THIS burn's change and
+		// conversion outputs (per-transfer choice, default false). The burn
+		// output itself is always explicit: the amount being retired is public
+		// by design. Blinded handling is also forced when any selected input is
+		// blinded, since those amounts were private and the change must stay so.
+		Confidential bool `json:"confidential"`
 	}
 	if err := decodeBody(r, &req); err != nil {
 		httpErr(w, 400, "%v", err)
@@ -67,25 +73,26 @@ func (s *Server) handleBurnBuild(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Holder coin selection.
+	// Holder coin selection over the mixed (explicit + blinded) enclave set.
 	utxos, err := s.enclaveUTXOs(holderTree, asset.ID)
 	if err != nil {
 		httpErr(w, 502, "scan: %v", err)
 		return
 	}
 	need := req.Atoms + convertAtoms
-	var chosen []enclaveUTXO
-	var total uint64
-	for _, u := range utxos {
-		chosen = append(chosen, u)
-		total += u.atoms
-		if total >= need {
-			break
-		}
-	}
+	chosen, total, anyBlindedIn := selectUTXOs(utxos, need, req.Confidential)
 	if total < need {
 		httpErr(w, 409, "insufficient balance: have %d atoms, need %d", total, need)
 		return
+	}
+	blindOutputs := req.Confidential || anyBlindedIn
+	// An exact-amount confidential burn of explicit coins has no change and no
+	// conversion output: the only asset output is the public 0x6a burn, so
+	// nothing confidential would remain, and blinding would leave a single
+	// blindable output (the fee change) with no blinded inputs — a shape the
+	// node refuses. Build it explicit instead.
+	if req.Confidential && !anyBlindedIn && total == need && convertAtoms == 0 {
+		blindOutputs = false
 	}
 
 	// Server fee funding.
@@ -136,9 +143,11 @@ func (s *Server) handleBurnBuild(w http.ResponseWriter, r *http.Request) {
 	// The burn output is always explicit: an OP_RETURN carries no blinding nonce
 	// and the amount being retired is public by design. The change back to the
 	// holder and the fee-conversion output blind to the enclave keys when the
-	// asset is confidential (giving the >=2 blinded outputs a blinded tx needs).
+	// request asks for confidential handling OR any selected input is blinded
+	// (giving the >=2 blinded outputs a blinded tx needs, and keeping
+	// previously-private input amounts unrecoverable from an explicit change).
 	changeNonce, convNonce := elements.NullNonce(), elements.NullNonce()
-	if asset.Confidential {
+	if blindOutputs {
 		if changeNonce, err = s.enclaveConfNonce(asset.ID, elements.MustHex32(holder.Pubkeys[0]), hex.EncodeToString(holderTree.ScriptPubKey())); err != nil {
 			httpErr(w, 500, "confidential change: %v", err)
 			return
@@ -166,7 +175,7 @@ func (s *Server) handleBurnBuild(w http.ResponseWriter, r *http.Request) {
 			Nonce: convNonce, ScriptPubKey: issuerTree.ScriptPubKey(),
 		})
 	}
-	if asset.Confidential {
+	if blindOutputs {
 		feeChange, err := s.confWalletOutput(feeIn.sats - s.cfg.FeeSats)
 		if err != nil {
 			httpErr(w, 502, "%v", err)
@@ -186,9 +195,9 @@ func (s *Server) handleBurnBuild(w http.ResponseWriter, r *http.Request) {
 	tx.NormalizeWitness()
 
 	// Keep the pre-blind (explicit) tx for the policy check; blind the copy that
-	// gets signed and broadcast when the asset is confidential.
+	// gets signed and broadcast when this burn blinds at all.
 	explicitTx := tx
-	if asset.Confidential {
+	if blindOutputs {
 		blinded, err := s.blindTx(tx)
 		if err != nil {
 			httpErr(w, 500, "blind burn: %v", err)

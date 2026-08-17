@@ -7,14 +7,17 @@ plan.
 
 ## Where we are
 
-Every per-(holder, asset) blinding key is derived deterministically from ONE
-master secret in the daemon's 0600 keys file:
+Confidentiality is opt-in PER TRANSFER, not per asset: any holder can receive
+or move any restricted asset blinded in a given transaction, so EVERY
+registered (holder, asset) pair — not a "confidential subset" — has a blinding
+key, derived deterministically from ONE master secret in the daemon's 0600
+keys file:
 
     priv = SHA256(master || "openamp-blind-v1" || assetID || holderXonly)
 
 Determinism is the feature: the server can always re-derive and re-import a
-key into the watch wallet (the W-5c reconcile depends on it). The cost is a
-single point of compromise.
+key into the watch wallet (the W-5c reconcile, which now iterates all pairs of
+all assets, depends on it). The cost is a single point of compromise.
 
 ## Threat model
 
@@ -35,7 +38,9 @@ single point of compromise.
    `blind-master-v<N>` entries. Old epochs are retained (never deleted) so
    historical outputs stay unblindable by the server and auditors.
 2. **Per-asset epoch in the derivation string.** Record on each asset a
-   `blind_epoch` (default 0 for existing assets, current epoch for new ones)
+   `blind_epoch` (default 0 for existing assets, current epoch for new ones;
+   this is server-side rotation bookkeeping, NOT an asset confidentiality
+   property — it never touches the contract)
    and derive with a versioned tag:
 
        priv = SHA256(master[N] || "openamp-blind-v2" || epoch || assetID || holderXonly)
@@ -50,8 +55,8 @@ single point of compromise.
 4. **Watch-wallet re-import.** On rotation, import the new-epoch blinding key
    for every registered pair alongside the old one (the watch wallet holds
    both; unblinding tries all imported keys). The W-5c startup reconcile
-   already iterates all pairs — it extends to iterating pairs x live epochs,
-   plus its one rescan pass.
+   already iterates all (holder, asset) pairs of every asset — it extends to
+   iterating pairs x live epochs, plus its one rescan pass.
 
 Operationally: rotation is one issuer-surface call ("cut a new epoch"),
 requires no holder action, and never blocks transfers mid-migration.
@@ -62,7 +67,9 @@ requires no holder action, and never blocks transfers mid-migration.
   permanently unblindable by whoever holds that epoch's secret. The chain is
   immutable; rotation only protects outputs created AFTER the cut. Treat a
   compromise as a disclosure event for all prior confidential history of the
-  affected assets, not as something rotation repairs.
+  affected assets' blinded outputs (under per-transfer confidentiality that
+  means every blinded UTXO of every asset, though explicit UTXOs were public
+  anyway), not as something rotation repairs.
 - **The server-sees-everything design.** The policy server intentionally holds
   all blinding keys (issuer oversight). Rotation narrows the blast radius in
   time; it does not change that trust model.
@@ -85,6 +92,7 @@ None cryptographically, and that is the point to preserve:
 
 Adopt the four-part rotation (versioned masters, per-asset epoch, re-blind on
 touch, watch re-import) as the committed design, so the `blind_epoch` field can
-be added to the asset record before more confidential assets are issued —
+be added to the asset record before more blinded activity accumulates — under
+per-transfer confidentiality every asset can acquire blinded UTXOs, so
 retrofitting the epoch later multiplies the reconcile surface for every asset
 issued in the meantime.

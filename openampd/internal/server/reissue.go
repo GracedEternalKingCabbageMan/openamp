@@ -172,6 +172,11 @@ func (s *Server) handleReissue(w http.ResponseWriter, r *http.Request) {
 		TargetAID string `json:"target_aid"`
 		Atoms     uint64 `json:"atoms"`
 		RequestID string `json:"request_id"` // idempotency key; a retry returns the same txid
+		// Confidential blinds THIS mint's enclave output to the target holder's
+		// derived blinding key (per-transfer choice, default false; never an
+		// asset property). The token-change and fee-change outputs blind either
+		// way, so the reissuance transaction always blinds.
+		Confidential bool `json:"confidential"`
 	}
 	if err := decodeBody(r, &req); err != nil {
 		httpErr(w, 400, "%v", err)
@@ -268,13 +273,13 @@ func (s *Server) handleReissue(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, 502, "fee blinded output: %v", err)
 		return
 	}
-	// Confidential asset (W-5b): blind the minted enclave output to the
-	// holder's derived blinding key (the same enclave conf nonce mechanism
-	// transfers use, which also registers the enclave in the watch wallet), so
-	// a DR mint does not leak the minted amount. Transparent assets keep the
-	// explicit mint byte-identically.
+	// Confidential mint request (per transfer, any asset): blind the minted
+	// enclave output to the holder's derived blinding key (the same enclave
+	// conf nonce mechanism transfers use, which also registers the enclave in
+	// the watch wallet), so a DR mint does not leak the minted amount. An
+	// explicit request keeps the explicit mint byte-identically.
 	var enclaveNonce []byte
-	if asset.Confidential {
+	if req.Confidential {
 		enclaveNonce, err = s.enclaveConfNonce(asset.ID, elements.MustHex32(targetUser.Pubkeys[0]), hex.EncodeToString(targetTree.ScriptPubKey()))
 		if err != nil {
 			httpErr(w, 500, "confidential mint output: %v", err)
@@ -296,8 +301,9 @@ func (s *Server) handleReissue(w http.ResponseWriter, r *http.Request) {
 	}
 	tx := buildReissuanceTx(p)
 
-	// Blind the token-change and fee-change outputs via the node's tested CT
-	// machinery; the minted enclave output stays explicit.
+	// Blind via the node's tested CT machinery: always the token-change and
+	// fee-change outputs, plus the minted enclave output iff the request asked
+	// for a confidential mint.
 	blinded, err := s.blindTx(tx)
 	if err != nil {
 		httpErr(w, 500, "blind reissuance: %v", err)

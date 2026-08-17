@@ -54,7 +54,7 @@ func TestM2_CosignByteIdentity(t *testing.T) {
 	if !bytes.Equal(a, c) {
 		t.Fatalf("cosign election changed the contract bytes:\n absent: %s\n cosign: %s", a, c)
 	}
-	want := `{"issuer_pubkey":"` + oa1IssuerPub + `","name":"BONDX","openamp":{"burn_allowed":false,"clawback":true,"confidential":false,"policy_pubkey":"` + oa1PolicyPub + `","type":"restricted","version":1},"precision":8,"ticker":"BONDX","version":0}`
+	want := `{"issuer_pubkey":"` + oa1IssuerPub + `","name":"BONDX","openamp":{"burn_allowed":false,"clawback":true,"policy_pubkey":"` + oa1PolicyPub + `","type":"restricted","version":1},"precision":8,"ticker":"BONDX","version":0}`
 	if string(c) != want {
 		t.Fatalf("cosign contract is not the pinned pre-M2 shape.\n got: %s\nwant: %s", c, want)
 	}

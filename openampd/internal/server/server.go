@@ -4,7 +4,7 @@
 //
 //	POST /v1/users                      register pubkeys -> AID
 //	GET  /v1/users/{aid}                registration status
-//	GET  /v1/users/{aid}/address        enclave address for an asset
+//	GET  /v1/users/{aid}/address        enclave address for an asset (?confidential=1 for the blinded form)
 //	GET  /v1/users/{aid}/balance        confirmed enclave balance
 //	POST /v1/transfers                  hosted transfer build (fee convert/sponsor)
 //	POST /v1/transfers/{id}/complete    submit user signatures -> broadcast
@@ -278,6 +278,7 @@ func (s *Server) handleAsset(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleAddress(w http.ResponseWriter, r *http.Request) {
 	aid := r.PathValue("aid")
 	assetID := r.URL.Query().Get("asset")
+	wantConf := r.URL.Query().Get("confidential") == "1" || r.URL.Query().Get("confidential") == "true"
 	tree, user, asset, err := s.enclaveFor(aid, assetID)
 	if err != nil {
 		httpErr(w, 404, "%v", err)
@@ -289,28 +290,38 @@ func (s *Server) handleAddress(w http.ResponseWriter, r *http.Request) {
 	}
 	s.node.Call(&addr, "decodescript", hex.EncodeToString(spk))
 	address := addr.Address
-	// For a confidential asset, hand back the blinding (blech32) enclave
-	// address, and make sure the watch wallet tracks it so the server can
-	// unblind receipts. Same one-step ease as any confidential Sequentia asset.
-	if asset.Confidential {
-		priv, pub, err := s.blindingKey(asset.ID, elements.MustHex32(user.Pubkeys[0]))
-		if err == nil {
-			if ca, cerr := s.confidentialEnclaveAddress(hex.EncodeToString(spk), hex.EncodeToString(pub)); cerr == nil {
-				address = ca
-				_ = s.importConfidentialEnclave(hex.EncodeToString(spk), priv, hex.EncodeToString(pub))
-			}
+	// Confidentiality is per transfer, so EVERY asset has a blinded (blech32)
+	// form of the enclave address: ?confidential=1 selects it as the primary
+	// address, the plain request keeps the bech32m form. Both paths import the
+	// script + blinding key into the watch wallet (idempotently), so a blinded
+	// receipt to this script is always readable by the server later, whichever
+	// form the holder handed out first.
+	confAddress := ""
+	priv, pub, err := s.blindingKey(asset.ID, elements.MustHex32(user.Pubkeys[0]))
+	if err == nil {
+		if ca, cerr := s.confidentialEnclaveAddress(hex.EncodeToString(spk), hex.EncodeToString(pub)); cerr == nil {
+			confAddress = ca
+			_ = s.importConfidentialEnclave(hex.EncodeToString(spk), priv, hex.EncodeToString(pub))
 		}
+	}
+	if wantConf {
+		if confAddress == "" {
+			httpErr(w, 502, "confidential enclave address unavailable")
+			return
+		}
+		address = confAddress
 	}
 	transferCtl, _ := tree.ControlBlock("transfer")
 	resp := map[string]any{
-		"aid":              aid,
-		"asset":            asset.ID,
-		"script_pubkey":    hex.EncodeToString(spk),
-		"address":          address,
-		"confidential":     asset.Confidential,
-		"user_pubkey":      user.Pubkeys[0],
-		"transfer_leaf":    hex.EncodeToString(tree.Leaves["transfer"].Script),
-		"transfer_control": hex.EncodeToString(transferCtl),
+		"aid":                  aid,
+		"asset":                asset.ID,
+		"script_pubkey":        hex.EncodeToString(spk),
+		"address":              address,
+		"address_confidential": confAddress,
+		"confidential":         wantConf,
+		"user_pubkey":          user.Pubkeys[0],
+		"transfer_leaf":        hex.EncodeToString(tree.Leaves["transfer"].Script),
+		"transfer_control":     hex.EncodeToString(transferCtl),
 	}
 	if asset.Clawback {
 		clawCtl, _ := tree.ControlBlock("claw")
@@ -465,50 +476,106 @@ func (s *Server) treeFor(user *store.User, asset *store.Asset) (*elements.TapTre
 }
 
 type enclaveUTXO struct {
-	txid  string
-	vout  uint32
-	atoms uint64
-	spk   string
+	txid    string
+	vout    uint32
+	atoms   uint64
+	spk     string
+	blinded bool // the on-chain output is a commitment; the watch wallet unblinded it
 }
 
-func (s *Server) enclaveUTXOs(tree *elements.TapTree, assetID string) ([]enclaveUTXO, error) {
-	spk := hex.EncodeToString(tree.ScriptPubKey())
-	// Confidential assets are scanned through the watch wallet, which holds the
-	// blinding keys and reports unblinded amounts; scantxoutset would only see
-	// commitments. Transparent assets scan the UTXO set directly.
-	if s.assetConfidential(assetID) {
-		cus, err := s.confidentialUTXOs(spk, assetID)
-		if err != nil {
-			return nil, err
-		}
-		var out []enclaveUTXO
-		for _, u := range cus {
-			out = append(out, enclaveUTXO{txid: u.TxID, vout: u.Vout, atoms: sats(u.Amount), spk: u.ScriptPubKey})
-		}
-		return out, nil
+// unifiedUTXOs is THE read path for enclave holdings: the deduped-by-outpoint
+// union of the global UTXO set (scantxoutset — the explicit view; blinded
+// outputs drop out of it because their commitment never matches the plaintext
+// asset id) and the watch wallet's listunspent (which sees both explicit and
+// blinded UTXOs on imported enclave scripts, unblinding the latter). Any
+// enclave can hold a MIXED set — some explicit, some blinded — because
+// confidentiality is chosen per transfer, so every consumer (transfer/burn/
+// clawback building, balances, holders, supply) goes through here. An explicit
+// UTXO on an imported script appears in BOTH sources; the outpoint dedupe
+// keeps it once (scan row first). Watch-only rows are additionally verified
+// against gettxout, since a watch wallet can list outputs another wallet
+// already spent.
+func (s *Server) unifiedUTXOs(spks []string, assetID string) ([]enclaveUTXO, error) {
+	want := map[string]bool{}
+	for _, k := range spks {
+		want[k] = true
 	}
-	unspents, err := s.node.ScanTxOutSet([]string{spk})
+	seen := map[string]bool{}
+	var out []enclaveUTXO
+	unspents, err := s.node.ScanTxOutSet(spks)
 	if err != nil {
 		return nil, err
 	}
-	var out []enclaveUTXO
 	for _, u := range unspents {
 		if u.Asset != assetID {
 			continue
 		}
+		key := fmt.Sprintf("%s:%d", u.TxID, u.Vout)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
 		out = append(out, enclaveUTXO{txid: u.TxID, vout: u.Vout, atoms: sats(u.Amount), spk: u.ScriptPubKey})
+	}
+	w, err := s.watchClient()
+	if err != nil {
+		return nil, err
+	}
+	all, err := w.ListUnspentAll()
+	if err != nil {
+		return nil, err
+	}
+	for _, u := range all {
+		if !want[u.ScriptPubKey] || u.Asset != assetID {
+			continue
+		}
+		key := fmt.Sprintf("%s:%d", u.TxID, u.Vout)
+		if seen[key] {
+			continue // explicit UTXO on an imported script: already counted from the scan
+		}
+		if !s.utxoUnspent(u.TxID, u.Vout) {
+			continue // stale watch-wallet entry
+		}
+		seen[key] = true
+		out = append(out, enclaveUTXO{txid: u.TxID, vout: u.Vout, atoms: sats(u.Amount), spk: u.ScriptPubKey, blinded: u.Confidential})
 	}
 	return out, nil
 }
 
-func (s *Server) assetConfidential(assetID string) bool {
-	var conf bool
-	s.st.View(func(st *store.State) {
-		if a, ok := st.Assets[assetID]; ok {
-			conf = a.Confidential
+func (s *Server) enclaveUTXOs(tree *elements.TapTree, assetID string) ([]enclaveUTXO, error) {
+	return s.unifiedUTXOs([]string{hex.EncodeToString(tree.ScriptPubKey())}, assetID)
+}
+
+// selectUTXOs picks coins covering need atoms from a mixed set. An explicit
+// (confidential:false) build prefers explicit coins, so it only touches
+// blinded ones — forcing a blinded balancing output — when the explicit
+// balance cannot cover the amount; a confidential build prefers blinded coins,
+// keeping previously-private amounts in the blinded domain. Returns the chosen
+// coins, their total, and whether any chosen coin is blinded.
+func selectUTXOs(utxos []enclaveUTXO, need uint64, preferBlinded bool) ([]enclaveUTXO, uint64, bool) {
+	ordered := make([]enclaveUTXO, 0, len(utxos))
+	for _, u := range utxos {
+		if u.blinded == preferBlinded {
+			ordered = append(ordered, u)
 		}
-	})
-	return conf
+	}
+	for _, u := range utxos {
+		if u.blinded != preferBlinded {
+			ordered = append(ordered, u)
+		}
+	}
+	var chosen []enclaveUTXO
+	var total uint64
+	anyBlinded := false
+	for _, u := range ordered {
+		chosen = append(chosen, u)
+		total += u.atoms
+		anyBlinded = anyBlinded || u.blinded
+		if total >= need {
+			break
+		}
+	}
+	return chosen, total, anyBlinded
 }
 
 func sats(v float64) uint64 {

@@ -11,12 +11,14 @@ import (
 	"github.com/GracedEternalKingCabbageMan/openamp/openampd/internal/store"
 )
 
-// W-5: confidential-path completions. A confidential asset's clawback sweep
-// blinds the seized output (instead of leaking the amount against blinded
-// inputs), a confidential DR mint blinds the minted enclave output, and the
-// watch wallet reconciles its imports (plus one rescan) on startup.
+// W-5, reworked for per-transfer confidentiality: a clawback sweep blinds the
+// seized output whenever any swept input is blinded (the legacy per-asset flag
+// is inert), a reissue request with "confidential": true blinds the minted
+// enclave output, and the watch wallet reconciles its imports for EVERY
+// registered (holder, asset) pair (plus one rescan) on startup.
 
-// makeConfidential flips a stored asset to confidential.
+// makeConfidential sets the LEGACY per-asset flag on a stored asset. Behavior
+// never branches on it anymore; tests use it to prove the flag is inert.
 func makeConfidential(t *testing.T, st *store.Store, assetID string) {
 	t.Helper()
 	if err := st.Update(func(s *store.State) error {
@@ -62,9 +64,11 @@ func fundClawbackConf(t *testing.T, s *Server, node *oa4Node, holder *store.User
 	node.broadcast = strings.Repeat("77", 32)
 }
 
-// TestW5_ConfidentialClawback_TwoPhase proves a confidential asset's two-phase
-// clawback build blinds the seized output and the fee change (the >=2 blinded
-// outputs discipline), computes the issuer sighashes over the BLINDED tx (the
+// TestW5_ConfidentialClawback_TwoPhase proves a two-phase clawback sweeping a
+// BLINDED holder UTXO blinds the seized output and the fee change (the blinded
+// amounts stay private through the seizure; nothing here depends on any asset
+// flag — the asset is a plain transparent-issued one whose holder happens to
+// hold a blinded coin), computes the issuer sighashes over the BLINDED tx (the
 // pending build IS the blinded tx with a fixed txid), keeps the
 // reason-before-signing property, and completes idempotently: a replay returns
 // the same txid and never re-broadcasts.
@@ -73,8 +77,6 @@ func TestW5_ConfidentialClawback_TwoPhase(t *testing.T) {
 	issuer := regUser(t, st, nil)
 	holder, _ := regUserWithKey(t, st)
 	asset, issuerPriv := clawAsset(t, st, issuer.AID, true) // external issuer
-	makeConfidential(t, st, asset.ID)
-	asset.Confidential = true
 	fundClawbackConf(t, s, node, holder, asset, 1000)
 
 	code, out, body := callClawback(t, s, map[string]any{
@@ -87,7 +89,7 @@ func TestW5_ConfidentialClawback_TwoPhase(t *testing.T) {
 		t.Fatalf("build must broadcast nothing, saw %d sends", node.sends)
 	}
 	if !node.blindCalled {
-		t.Fatal("a confidential clawback build must blind the transaction")
+		t.Fatal("a clawback sweeping a blinded input must blind the transaction")
 	}
 	if !logHasClawbackReason(t, st, "confidential seizure") {
 		t.Fatal("the reason must be logged before any signature")
@@ -148,15 +150,16 @@ func TestW5_ConfidentialClawback_TwoPhase(t *testing.T) {
 }
 
 // TestW5_ConfidentialClawback_LegacySingleCall proves the legacy (server-held
-// issuer key) clawback of a confidential asset also blinds the seized output
-// and still completes in one gated call.
+// issuer key) clawback sweeping a blinded holder UTXO also blinds the seized
+// output and still completes in one gated call. The LEGACY per-asset
+// Confidential flag is set here on purpose: it must be inert — the blinding
+// decision keys on the swept inputs, and everything still works with it set.
 func TestW5_ConfidentialClawback_LegacySingleCall(t *testing.T) {
 	s, st, node := newM9Server(t, Config{FeeAsset: oa4FeeID, FeeSats: 100})
 	issuer := regUser(t, st, nil)
 	holder, _ := regUserWithKey(t, st)
 	asset, _ := clawAsset(t, st, issuer.AID, false) // server holds the issuer key
-	makeConfidential(t, st, asset.ID)
-	asset.Confidential = true
+	makeConfidential(t, st, asset.ID)               // legacy flag: inert
 	fundClawbackConf(t, s, node, holder, asset, 1000)
 
 	code, out, body := callClawback(t, s, map[string]any{
@@ -169,7 +172,7 @@ func TestW5_ConfidentialClawback_LegacySingleCall(t *testing.T) {
 		t.Fatalf("legacy clawback must broadcast in one call, got %s", body)
 	}
 	if !node.blindCalled {
-		t.Fatal("a confidential clawback must blind the transaction")
+		t.Fatal("a clawback sweeping a blinded input must blind the transaction")
 	}
 	sent, err := elements.DeserializeTx(mustHexBytes(node.lastBroadcast))
 	if err != nil {
@@ -180,16 +183,16 @@ func TestW5_ConfidentialClawback_LegacySingleCall(t *testing.T) {
 	}
 }
 
-// TestW5_ConfidentialReissueBlindsMint proves a DR mint of a confidential asset
-// carries the holder's blinding nonce on the minted enclave output and runs the
-// blinding RPC, so the minted amount never leaks, while the reserve-before-
-// broadcast double-mint guard records the mint as before.
+// TestW5_ConfidentialReissueBlindsMint proves a DR mint requested with
+// "confidential": true (a per-request choice on an ordinary, transparent-issued
+// asset) carries the holder's blinding nonce on the minted enclave output and
+// runs the blinding RPC, so the minted amount never leaks, while the
+// reserve-before-broadcast double-mint guard records the mint as before.
 func TestW5_ConfidentialReissueBlindsMint(t *testing.T) {
 	f := newOA4Fixture(t)
 	tokenID := strings.Repeat("44", 32)
 	if err := f.st.Update(func(s *store.State) error {
 		a := s.Assets[f.asset.ID]
-		a.Confidential = true
 		a.Entropy = strings.Repeat("33", 32)
 		a.Token = tokenID
 		return nil
@@ -207,6 +210,7 @@ func TestW5_ConfidentialReissueBlindsMint(t *testing.T) {
 
 	code, body := callReissue(t, f.s, map[string]any{
 		"asset": f.asset.ID, "target_aid": f.investor.AID, "atoms": 500, "request_id": "conf-mint-1",
+		"confidential": true,
 	})
 	if code != 200 {
 		t.Fatalf("confidential reissue failed: %d %s", code, body)
@@ -258,17 +262,18 @@ func TestW5_TransparentReissueMintStaysExplicit(t *testing.T) {
 }
 
 // TestW5_WatchReconcileImportsAndRescansOnce proves the startup reconcile
-// re-imports every (holder, asset) pair of a confidential asset idempotently
-// and runs exactly one rescan pass, and that startWatchReconcile is bounded to
-// one run per process regardless of how often it is invoked.
+// re-imports EVERY registered (holder, asset) pair idempotently — the asset
+// here is an ordinary transparent-issued one, because under per-transfer
+// confidentiality any enclave may hold blinded coins — and runs exactly one
+// rescan pass, and that startWatchReconcile is bounded to one run per process
+// regardless of how often it is invoked.
 func TestW5_WatchReconcileImportsAndRescansOnce(t *testing.T) {
 	s, st, node := newM9Server(t, Config{FeeAsset: oa4FeeID, FeeSats: 100})
 	issuer := regUser(t, st, nil)
 	regUser(t, st, nil) // a second registered user
-	asset, _ := clawAsset(t, st, issuer.AID, false)
-	makeConfidential(t, st, asset.ID)
+	clawAsset(t, st, issuer.AID, false)
 
-	// Direct (synchronous) run: 2 users x 1 confidential asset = 2 pairs, each
+	// Direct (synchronous) run: 2 users x 1 asset = 2 pairs, each
 	// re-imported (script + blinding key), then ONE rescan.
 	s.reconcileWatchWallet()
 	if node.imports.Load() != 2 || node.blindImports.Load() != 2 {
@@ -292,16 +297,17 @@ func TestW5_WatchReconcileImportsAndRescansOnce(t *testing.T) {
 	}
 }
 
-// TestW5_WatchReconcileNoConfidentialAssetsIsNoop proves a deployment with no
-// confidential assets neither imports nor rescans.
-func TestW5_WatchReconcileNoConfidentialAssetsIsNoop(t *testing.T) {
+// TestW5_WatchReconcileNoPairsIsNoop proves a deployment with no registered
+// (holder, asset) pairs — here, no assets at all — neither imports nor rescans.
+// (With per-transfer confidentiality there is no such thing as a "deployment
+// without confidential assets": every pair is reconciled once any asset exists.)
+func TestW5_WatchReconcileNoPairsIsNoop(t *testing.T) {
 	s, st, node := newM9Server(t, Config{FeeAsset: oa4FeeID, FeeSats: 100})
-	issuer := regUser(t, st, nil)
-	clawAsset(t, st, issuer.AID, false) // transparent
+	regUser(t, st, nil) // a user, but no assets: zero pairs
 
 	s.reconcileWatchWallet()
 	if node.imports.Load() != 0 || node.blindImports.Load() != 0 || node.rescans.Load() != 0 {
-		t.Fatalf("no confidential assets: expected no imports/rescan, got %d/%d/%d",
+		t.Fatalf("no enclave pairs: expected no imports/rescan, got %d/%d/%d",
 			node.imports.Load(), node.blindImports.Load(), node.rescans.Load())
 	}
 }
