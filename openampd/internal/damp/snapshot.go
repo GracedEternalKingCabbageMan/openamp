@@ -11,19 +11,87 @@ import (
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
 )
 
+// PredicateEntry is one entry of a list predicate. Key is the 32-byte policy
+// key in hex: an outpoint key for the blacklist, a raw x-only owner key for the
+// whitelist. SendAfter and RecvAfter are the whitelist's height bounds, and they
+// are part of the LEAF the covenant hashes, not commentary beside it: SendAfter
+// is the lockup binding the owner of a regulated input, RecvAfter the receive
+// window binding the recipient of a regulated output, and zero means unbounded.
+//
+// # WHY THE JSON FORM IS TWO SHAPES
+//
+// An unbounded entry serializes as a BARE HEX STRING and a bounded one as an
+// object. That is not decoration: the snapshot hash and the issuer signature
+// commit to the canonical bytes, so every document written before bounds existed
+// has to keep hashing and verifying exactly as it did. A bare key round-trips
+// byte-identically, and only an entry that actually carries a bound spends the
+// extra bytes. A bounded entry always writes BOTH bound fields, so there is one
+// encoding of a bound rather than one per zero-valued combination.
+type PredicateEntry struct {
+	Key       string `json:"key"`
+	SendAfter uint32 `json:"send_after"`
+	RecvAfter uint32 `json:"recv_after"`
+}
+
+// Unbounded reports whether the entry carries no height bound at all, which is
+// the case for every holder until an issuer sets a lockup or a receive window.
+func (e PredicateEntry) Unbounded() bool { return e.SendAfter == 0 && e.RecvAfter == 0 }
+
+func (e PredicateEntry) MarshalJSON() ([]byte, error) {
+	if e.Unbounded() {
+		return json.Marshal(e.Key)
+	}
+	type bounded PredicateEntry
+	return json.Marshal(bounded(e))
+}
+
+func (e *PredicateEntry) UnmarshalJSON(b []byte) error {
+	var key string
+	if err := json.Unmarshal(b, &key); err == nil {
+		*e = PredicateEntry{Key: key}
+		return nil
+	}
+	type bounded PredicateEntry
+	var out bounded
+	if err := json.Unmarshal(b, &out); err != nil {
+		return fmt.Errorf("a predicate entry is either a 32-byte hex key or an object {key, send_after, recv_after}: %w", err)
+	}
+	*e = PredicateEntry(out)
+	return nil
+}
+
+// KeyEntries lifts bare hex keys into entries with no height bounds, for the
+// callers (issuance, the blacklist, every pre-bounds document) that have keys and
+// nothing else.
+func KeyEntries(keys []string) []PredicateEntry {
+	out := make([]PredicateEntry, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, PredicateEntry{Key: k})
+	}
+	return out
+}
+
+// Keys returns just the hex keys of a list, for the reads that do not care about
+// bounds (an ownership scan wants addresses, not windows).
+func (p PredicateList) Keys() []string {
+	out := make([]string, 0, len(p.Entries))
+	for _, e := range p.Entries {
+		out = append(out, e.Key)
+	}
+	return out
+}
+
 // PredicateList is one list predicate (blacklist or whitelist) in a snapshot.
 // An ABSENT predicate has Root == "" and no entries, and commits to 32 zero
-// bytes in RulesRoot. An enabled predicate carries the smt-v1 root over its
-// entries (EmptyRoot() when the list is enabled but empty). Entries are the
-// 32-byte policy keys in hex (outpoint keys for the blacklist, raw x-only
-// owner keys for the whitelist). The design doc allows "url" as an
-// alternative to inline entries; this library validates inline entries only,
-// and Validate refuses a url-only list (M2 snapshot service requires inline
-// entries so the roots are recomputable).
+// bytes in RulesRoot. An enabled predicate carries the root over its entries
+// (EmptyRoot() when the list is enabled but empty). The design doc allows "url"
+// as an alternative to inline entries; this library validates inline entries
+// only, and Validate refuses a url-only list (M2 snapshot service requires
+// inline entries so the roots are recomputable).
 type PredicateList struct {
-	Root    string   `json:"root"`
-	Entries []string `json:"entries"`
-	URL     string   `json:"url,omitempty"`
+	Root    string           `json:"root"`
+	Entries []PredicateEntry `json:"entries"`
+	URL     string           `json:"url,omitempty"`
 }
 
 // Window is one height-window rule (design doc 3.5): holders of owner class
@@ -187,12 +255,18 @@ func predicateRoot(name string, p PredicateList) ([32]byte, error) {
 	}
 	tree := NewSMT()
 	for i, e := range p.Entries {
-		k, err := parseHex32(fmt.Sprintf("%s.entries[%d]", name, i), e)
+		// smt-v1 leaves are bare keys: there is no leaf shape for a height bound, so
+		// accepting one would commit a root that omits it and imply a window nothing
+		// enforces.
+		if !e.Unbounded() {
+			return [32]byte{}, fmt.Errorf("%s.entries[%d]: height bounds are a dmt-v1 leaf field; an smt-v1 document has nowhere to commit them", name, i)
+		}
+		k, err := parseHex32(fmt.Sprintf("%s.entries[%d]", name, i), e.Key)
 		if err != nil {
 			return [32]byte{}, err
 		}
 		if tree.Has(k) {
-			return [32]byte{}, fmt.Errorf("%s.entries[%d]: duplicate entry %s", name, i, e)
+			return [32]byte{}, fmt.Errorf("%s.entries[%d]: duplicate entry %s", name, i, e.Key)
 		}
 		tree.Insert(k)
 	}
@@ -216,16 +290,10 @@ func WindowsHash(windows []Window) ([32]byte, error) {
 	return taggedHash(TagWindows, c), nil
 }
 
-// dmtPredicateRoot recomputes a dmt-v1 list predicate's root from its inline
-// entries with the tree that predicate actually uses, and checks it against the
-// declared root. Both trees are keyed by raw 32-byte values and both refuse the
-// guard values and duplicates, which would make slot assignment ambiguous.
-//
-// The two trees are DIFFERENT SHAPES and are not interchangeable: the whitelist
-// is a sorted dense tree of owner keys (membership), the blacklist an interval
-// tree of outpoint keys (non-membership by bracketing interval). Building one
-// with the other's constructor yields a root no covenant answers to.
-func dmtPredicateRoot(name string, p PredicateList, build func([][32]byte) ([32]byte, error)) (*[32]byte, error) {
+// dmtDeclaredRoot is the shared preamble of both dmt-v1 predicate roots: an
+// absent predicate is fully absent, a present one declares a root and carries
+// inline entries so that root is recomputable.
+func dmtDeclaredRoot(name string, p PredicateList) (*[32]byte, error) {
 	if p.Root == "" {
 		if len(p.Entries) != 0 || p.URL != "" {
 			return nil, fmt.Errorf("%s: entries/url present but root empty (absent predicate must be fully absent)", name)
@@ -239,22 +307,75 @@ func dmtPredicateRoot(name string, p PredicateList, build func([][32]byte) ([32]
 	if p.URL != "" && len(p.Entries) == 0 {
 		return nil, fmt.Errorf("%s: url-only lists are not accepted; inline entries are required so the root is recomputable", name)
 	}
+	return &declared, nil
+}
+
+// dmtWhitelistRoot recomputes the whitelist's dmt-v1 root from its inline entries
+// AND THEIR HEIGHT BOUNDS, and checks it against the declared root.
+//
+// The bounds are load-bearing here. The covenant's whitelist leaf is
+// SHA256(0x00 || key || BE32(send_after) || BE32(recv_after)), so computing the
+// root from keys alone would publish a root that silently omits every lockup and
+// receive window: a pi no deployed program answers to, which would make every
+// transfer of the asset unspendable rather than merely unrestricted. That failure
+// mode is why this is a separate function from the blacklist's rather than one
+// generic helper over a build callback.
+func dmtWhitelistRoot(name string, p PredicateList) (*[32]byte, error) {
+	declared, err := dmtDeclaredRoot(name, p)
+	if err != nil || declared == nil {
+		return declared, err
+	}
+	entries := make([]WhitelistEntry, 0, len(p.Entries))
+	for i, e := range p.Entries {
+		k, err := parseHex32(fmt.Sprintf("%s.entries[%d]", name, i), e.Key)
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, WhitelistEntry{Key: k, SendAfter: e.SendAfter, RecvAfter: e.RecvAfter})
+	}
+	got, err := WhitelistRootWithWindows(entries)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", name, err)
+	}
+	if got != *declared {
+		return nil, fmt.Errorf("%s.root mismatch: declared %s, entries hash to %x", name, p.Root, got)
+	}
+	return declared, nil
+}
+
+// dmtBlacklistRoot recomputes the blacklist's dmt-v1 INTERVAL root from its
+// inline outpoint keys.
+//
+// The two trees are DIFFERENT SHAPES and are not interchangeable: the whitelist
+// is a sorted dense tree of holder leaves (membership, bounds included), the
+// blacklist an interval tree of outpoint keys (non-membership by bracketing
+// interval). Building one with the other's constructor yields a root no covenant
+// answers to. A blacklist entry therefore has no height bounds to carry, and one
+// that claims to is refused rather than dropped.
+func dmtBlacklistRoot(name string, p PredicateList) (*[32]byte, error) {
+	declared, err := dmtDeclaredRoot(name, p)
+	if err != nil || declared == nil {
+		return declared, err
+	}
 	keys := make([][32]byte, 0, len(p.Entries))
 	for i, e := range p.Entries {
-		k, err := parseHex32(fmt.Sprintf("%s.entries[%d]", name, i), e)
+		if !e.Unbounded() {
+			return nil, fmt.Errorf("%s.entries[%d]: a frozen outpoint has no height bounds; the interval leaf commits the outpoint key alone", name, i)
+		}
+		k, err := parseHex32(fmt.Sprintf("%s.entries[%d]", name, i), e.Key)
 		if err != nil {
 			return nil, err
 		}
 		keys = append(keys, k)
 	}
-	got, err := build(keys)
+	got, err := BlacklistRoot(keys)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", name, err)
 	}
-	if got != declared {
+	if got != *declared {
 		return nil, fmt.Errorf("%s.root mismatch: declared %s, entries hash to %x", name, p.Root, got)
 	}
-	return &declared, nil
+	return declared, nil
 }
 
 // computePiDMT is the pi a dmt-v1 snapshot commits to: the one the deployed
@@ -274,14 +395,16 @@ func dmtPredicateRoot(name string, p PredicateList, build func([][32]byte) ([32]
 // returns, not the reversed display form. Getting that backwards produces a root
 // that looks right and freezes nothing.
 //
-// Height windows are still refused: no shipped program reads them, and an issuer
-// who publishes one and believes it binds has a false sense of a rule.
+// Height bounds ARE committed, per holder, inside the whitelist leaf, so a lockup
+// or a receive window travels with the key it binds. The separate class-keyed
+// "windows" array of the design document is a different construction that no
+// shipped program reads, and Validate refuses it rather than committing to it.
 func (s *Snapshot) computePiDMT() ([32]byte, error) {
-	wl, err := dmtPredicateRoot("predicates.whitelist", s.Predicates.Whitelist, WhitelistRoot)
+	wl, err := dmtWhitelistRoot("predicates.whitelist", s.Predicates.Whitelist)
 	if err != nil {
 		return [32]byte{}, err
 	}
-	bl, err := dmtPredicateRoot("predicates.blacklist", s.Predicates.Blacklist, BlacklistRoot)
+	bl, err := dmtBlacklistRoot("predicates.blacklist", s.Predicates.Blacklist)
 	if err != nil {
 		return [32]byte{}, err
 	}
@@ -360,9 +483,19 @@ func (s *Snapshot) Validate() error {
 			return fmt.Errorf("a dmt-v1 snapshot must carry a blacklist root: the covenant proves non-membership against it on every regulated input, and an empty blacklist still commits to the empty interval tree's root rather than to zeros")
 		}
 		// Refuse what nothing reads, rather than committing to it and implying
-		// enforcement that does not exist.
+		// enforcement that does not exist. Height bounds themselves ARE enforced:
+		// they belong to the holder they bind, inside the whitelist leaf, and this
+		// refusal is about the separate class-keyed "windows" array, which no shipped
+		// program reads.
 		if len(s.Predicates.Windows) != 0 {
-			return fmt.Errorf("a dmt-v1 snapshot must not carry height windows: no shipped covenant enforces them")
+			return fmt.Errorf("a dmt-v1 snapshot must not carry a class-keyed windows array: no shipped covenant reads one. A height bound belongs to the holder it binds, as send_after/recv_after on that whitelist entry")
+		}
+		// A frozen outpoint has no window; refusing it here means the message names
+		// the field rather than surfacing as a root mismatch.
+		for i, e := range s.Predicates.Blacklist.Entries {
+			if !e.Unbounded() {
+				return fmt.Errorf("predicates.blacklist.entries[%d]: a frozen outpoint carries no height bounds", i)
+			}
 		}
 	default:
 		return fmt.Errorf("tree %q not supported (this library implements %q and %q)", s.Tree, TreeDMTv1, TreeSMTv1)

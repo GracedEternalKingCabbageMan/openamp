@@ -261,12 +261,49 @@ func explicitAssetCommit(displayID string) []byte {
 	return elements.ExplicitAsset(id)
 }
 
-// holderBalances scans confirmed enclave balances for every registered user.
+// holderBalances scans confirmed holdings for every account that could hold the
+// asset. It is the single read behind the ownership report and the circulating
+// supply figure.
+//
+// WHICH ACCOUNTS THOSE ARE DIFFERS BY TIER, and getting it wrong is silent:
+//
+//   - A co-signed asset can only sit in an enclave this server derived, and every
+//     enclave belongs to a REGISTERED user, so the registered set is the whole
+//     population.
+//   - A network-enforced asset sits in covenants C_U(X) keyed by raw x-only keys
+//     that need never register here at all, and the policy WHITELIST is the
+//     authoritative enumeration of who may hold it. Scanning only registered
+//     users reported 0 with an empty holder map for a live asset with units on
+//     chain, which reads as a truthful empty register rather than as a missing
+//     input. The scan set is therefore the UNION of the asset's stored whitelist
+//     and the registered users, because a whitelisted key may ALSO be registered
+//     and must not be counted twice.
+//
+// An unregistered whitelist key is reported under the AID it WOULD have on
+// registering (store.AID of that one key), so the identifier is stable and a
+// later registration does not renumber the holder.
 func (s *Server) holderBalances(asset *store.Asset) (map[string]uint64, error) {
 	spkToAID := map[string]string{}
 	var spks []string
 	var scanErr error
+	add := func(spk, aid string) {
+		if _, seen := spkToAID[spk]; seen {
+			return
+		}
+		spkToAID[spk] = aid
+		spks = append(spks, spk)
+	}
 	s.st.View(func(st *store.State) {
+		if asset.Enforcement == "damp" && asset.Damp != nil {
+			for _, e := range asset.Damp.Whitelist {
+				raw, err := dampHolderSPK(asset, e.Key)
+				if err != nil {
+					scanErr = err
+					return
+				}
+				add(hex.EncodeToString(raw), store.AID([]string{e.Key}))
+			}
+		}
 		for _, u := range st.Users {
 			// A damp asset lives in covenants, so the script to scan is C_U(X), not
 			// an enclave tree. Ownership reporting and supply therefore keep working
@@ -278,8 +315,14 @@ func (s *Server) holderBalances(asset *store.Asset) (map[string]uint64, error) {
 					return
 				}
 				spk := hex.EncodeToString(raw)
-				spkToAID[spk] = u.AID
-				spks = append(spks, spk)
+				// A registered user whose active key is whitelisted resolves to the SAME
+				// script. Prefer the registered AID: it is the identifier every other
+				// surface (claims, mandates, travel-rule records) is keyed by.
+				if prior, seen := spkToAID[spk]; seen && prior != u.AID {
+					spkToAID[spk] = u.AID
+					continue
+				}
+				add(spk, u.AID)
 				continue
 			}
 			tree, err := s.treeFor(u, asset)
@@ -287,9 +330,7 @@ func (s *Server) holderBalances(asset *store.Asset) (map[string]uint64, error) {
 				scanErr = err
 				return
 			}
-			spk := hex.EncodeToString(tree.ScriptPubKey())
-			spkToAID[spk] = u.AID
-			spks = append(spks, spk)
+			add(hex.EncodeToString(tree.ScriptPubKey()), u.AID)
 		}
 	})
 	if scanErr != nil {

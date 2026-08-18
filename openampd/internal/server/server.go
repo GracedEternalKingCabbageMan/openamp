@@ -19,6 +19,8 @@
 //	POST /v1/issuer/assets              issue a co-signed restricted asset
 //	POST /v1/issuer/damp-assets         prepare a network-enforced (OpenDAMP) asset
 //	POST /v1/issuer/damp-assets/{id}/complete  supply the covenant CMRs and mint it
+//	POST /v1/issuer/damp-policy         prepare a policy update (freeze/unfreeze) for a network-enforced asset
+//	POST /v1/issuer/damp-policy/{id}/complete  supply the recompiled CMR, the issuer signature and the respend
 //	POST /v1/issuer/freeze              freeze/unfreeze a user
 //	POST /v1/issuer/categories          set a user's categories
 //	POST /v1/issuer/rules               update an asset's policy rules
@@ -165,6 +167,8 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /v1/issuer/assets", s.issuerAuth(s.handleIssue))
 	mux.HandleFunc("POST /v1/issuer/damp-assets", s.issuerAuth(s.handleDampIssuePrepare))
 	mux.HandleFunc("POST /v1/issuer/damp-assets/{id}/complete", s.issuerAuth(s.handleDampIssueComplete))
+	mux.HandleFunc("POST /v1/issuer/damp-policy", s.issuerAuth(s.handleDampPolicyPrepare))
+	mux.HandleFunc("POST /v1/issuer/damp-policy/{id}/complete", s.issuerAuth(s.handleDampPolicyComplete))
 	mux.HandleFunc("POST /v1/issuer/freeze", s.issuerAuth(s.handleFreeze))
 	mux.HandleFunc("POST /v1/issuer/categories", s.issuerAuth(s.handleCategories))
 	mux.HandleFunc("POST /v1/issuer/rules", s.issuerAuth(s.handleRules))

@@ -34,8 +34,8 @@ func goldenSnapshot(t *testing.T) *Snapshot {
 		PrevPi:        nil,
 		Tree:          TreeSMTv1,
 		Predicates: Predicates{
-			Blacklist: PredicateList{Root: hex.EncodeToString(blRoot[:]), Entries: []string{hex.EncodeToString(k1[:])}},
-			Whitelist: PredicateList{Root: hex.EncodeToString(wlRoot[:]), Entries: []string{hex.EncodeToString(owner[:])}},
+			Blacklist: PredicateList{Root: hex.EncodeToString(blRoot[:]), Entries: KeyEntries([]string{hex.EncodeToString(k1[:])})},
+			Whitelist: PredicateList{Root: hex.EncodeToString(wlRoot[:]), Entries: KeyEntries([]string{hex.EncodeToString(owner[:])})},
 			Limit:     &limit,
 			Windows:   []Window{{Class: "regS", From: 100, Until: 5000}},
 		},
@@ -159,7 +159,7 @@ func TestSnapshotValidateRefusals(t *testing.T) {
 			s.Pi = strings.Repeat("ee", 32)
 		}, "pi mismatch"},
 		{"tampered entry changes root", func(s *Snapshot) {
-			s.Predicates.Whitelist.Entries[0] = strings.Repeat("56", 32)
+			s.Predicates.Whitelist.Entries[0] = PredicateEntry{Key: strings.Repeat("56", 32)}
 		}, "whitelist.root mismatch"},
 		{"bad version", func(s *Snapshot) { s.V = 2 }, "v must be 1"},
 		{"unsupported tree", func(s *Snapshot) { s.Tree = "cmt-v1" }, "not supported"},
@@ -187,7 +187,7 @@ func TestSnapshotValidateRefusals(t *testing.T) {
 			s.Predicates.Blacklist.Entries = append(s.Predicates.Blacklist.Entries, s.Predicates.Blacklist.Entries[0])
 		}, "duplicate entry"},
 		{"malformed entry hex", func(s *Snapshot) {
-			s.Predicates.Blacklist.Entries[0] = "zz"
+			s.Predicates.Blacklist.Entries[0] = PredicateEntry{Key: "zz"}
 		}, "must be 32-byte hex"},
 	}
 	for _, tc := range cases {
@@ -259,12 +259,13 @@ func TestSnapshotDMTv1MatchesVectors(t *testing.T) {
 		VerifierAsset  string `json:"verifier_asset"`
 		VerifierAmount uint64 `json:"verifier_amount"`
 		Policy         struct {
-			Pi                      string   `json:"pi"`
-			Seq                     uint64   `json:"seq"`
-			WhitelistRoot           string   `json:"whitelist_root"`
-			WhitelistEntries        []string `json:"whitelist_entries"`
-			BlacklistRoot           string   `json:"blacklist_root"`
-			BlacklistedOutpointKeys []string `json:"blacklisted_outpoint_keys"`
+			Pi                      string           `json:"pi"`
+			Seq                     uint64           `json:"seq"`
+			WhitelistRoot           string           `json:"whitelist_root"`
+			WhitelistEntries        []PredicateEntry `json:"whitelist_entries"`
+			BlacklistRoot           string           `json:"blacklist_root"`
+			BlacklistedOutpointKeys []string         `json:"blacklisted_outpoint_keys"`
+			TransferLimit           uint64           `json:"transfer_limit"`
 		} `json:"policy"`
 	}
 	if err := json.Unmarshal(raw, &v); err != nil {
@@ -275,11 +276,14 @@ func TestSnapshotDMTv1MatchesVectors(t *testing.T) {
 		Pi: v.Policy.Pi, Seq: v.Policy.Seq, PrevPi: nil, Tree: TreeDMTv1,
 		Predicates: Predicates{
 			Whitelist: PredicateList{Root: v.Policy.WhitelistRoot, Entries: v.Policy.WhitelistEntries},
+			// The transfer limit is committed into pi too, so a snapshot that omits one
+			// the deployed policy carries reproduces a different commitment.
+			Limit: limitOrNil(v.Policy.TransferLimit),
 			// The blacklist slot carries a real root now that the covenant
 			// enforces non-membership; omitting it here would commit the empty
 			// hash and reproduce a pi no deployed covenant answers to, which is
 			// exactly the divergence this test exists to catch.
-			Blacklist: PredicateList{Root: v.Policy.BlacklistRoot, Entries: v.Policy.BlacklistedOutpointKeys},
+			Blacklist: PredicateList{Root: v.Policy.BlacklistRoot, Entries: KeyEntries(v.Policy.BlacklistedOutpointKeys)},
 		},
 	}
 	if err := s.Validate(); err != nil {
@@ -326,8 +330,8 @@ func TestSnapshotDMTv1PredicateShape(t *testing.T) {
 			V: 1, Asset: strings.Repeat("11", 32), VerifierAsset: strings.Repeat("99", 32),
 			Q: 1, Seq: 0, Tree: TreeDMTv1,
 			Predicates: Predicates{
-				Blacklist: PredicateList{Root: hex.EncodeToString(emptyBl[:]), Entries: []string{}},
-				Whitelist: PredicateList{Root: hex.EncodeToString(wlRoot[:]), Entries: []string{hex.EncodeToString(wl[:])}},
+				Blacklist: PredicateList{Root: hex.EncodeToString(emptyBl[:]), Entries: []PredicateEntry{}},
+				Whitelist: PredicateList{Root: hex.EncodeToString(wlRoot[:]), Entries: KeyEntries([]string{hex.EncodeToString(wl[:])})},
 			},
 		}
 		pi, err := s.ComputePi()
@@ -369,7 +373,7 @@ func TestSnapshotDMTv1PredicateShape(t *testing.T) {
 		t.Fatal("the blacklist and whitelist trees must be different shapes")
 	}
 	frozen := base()
-	frozen.Predicates.Blacklist = PredicateList{Root: hex.EncodeToString(realBl[:]), Entries: []string{hex.EncodeToString(key[:])}}
+	frozen.Predicates.Blacklist = PredicateList{Root: hex.EncodeToString(realBl[:]), Entries: KeyEntries([]string{hex.EncodeToString(key[:])})}
 	pi, err := frozen.ComputePi()
 	if err != nil {
 		t.Fatal(err)
@@ -382,16 +386,84 @@ func TestSnapshotDMTv1PredicateShape(t *testing.T) {
 		t.Fatal("freezing an outpoint must change pi; otherwise the covenant is instantiated with the same policy")
 	}
 	mixedUp := base()
-	mixedUp.Predicates.Blacklist = PredicateList{Root: hex.EncodeToString(wrongShape[:]), Entries: []string{hex.EncodeToString(key[:])}}
+	mixedUp.Predicates.Blacklist = PredicateList{Root: hex.EncodeToString(wrongShape[:]), Entries: KeyEntries([]string{hex.EncodeToString(key[:])})}
 	if err := mixedUp.Validate(); err == nil || !strings.Contains(err.Error(), "blacklist.root mismatch") {
 		t.Fatalf("a blacklist root built with the wrong tree must be refused, got %v", err)
 	}
 
+	// The CLASS-KEYED windows array is still refused: no shipped program reads it,
+	// and publishing one would imply a rule that does not bind.
 	withWin := base()
 	withWin.Predicates.Windows = []Window{{Class: "regS", From: 1, Until: 2}}
-	if err := withWin.Validate(); err == nil || !strings.Contains(err.Error(), "must not carry height windows") {
-		t.Fatalf("dmt-v1 height windows must be refused, got %v", err)
+	if err := withWin.Validate(); err == nil || !strings.Contains(err.Error(), "class-keyed windows array") {
+		t.Fatalf("a dmt-v1 class-keyed windows array must be refused, got %v", err)
 	}
+
+	// PER-HOLDER bounds, by contrast, ARE enforced, and they are part of the leaf:
+	// a root computed from keys alone commits a policy that omits them, so adding a
+	// bound to an entry must change the root the document has to declare.
+	bounded := base()
+	bounded.Predicates.Whitelist.Entries[0].RecvAfter = 400
+	if err := bounded.Validate(); err == nil || !strings.Contains(err.Error(), "whitelist.root mismatch") {
+		t.Fatalf("a height bound must change the whitelist root, got %v", err)
+	}
+	// Fixed up, the same document validates and commits a DIFFERENT pi.
+	wlBounded, werr := WhitelistRootWithWindows([]WhitelistEntry{{Key: wlKey(t, bounded.Predicates.Whitelist.Entries[0].Key), RecvAfter: 400}})
+	if werr != nil {
+		t.Fatal(werr)
+	}
+	bounded.Predicates.Whitelist.Root = hex.EncodeToString(wlBounded[:])
+	pi, perr := bounded.ComputePi()
+	if perr != nil {
+		t.Fatal(perr)
+	}
+	bounded.Pi = hex.EncodeToString(pi[:])
+	if err := bounded.Validate(); err != nil {
+		t.Fatalf("a bounded holder entry must validate once its root is recomputed: %v", err)
+	}
+	if bounded.Pi == base().Pi {
+		t.Fatal("a receive window must change the policy commitment; otherwise it binds nothing")
+	}
+	// And it survives the canonical round trip as an OBJECT, while an unbounded
+	// entry stays a bare key, which is what keeps every pre-bounds document's hash
+	// and signature intact.
+	c, cerr := bounded.CanonicalJSON()
+	if cerr != nil {
+		t.Fatal(cerr)
+	}
+	if !strings.Contains(string(c), `"recv_after":400`) {
+		t.Fatalf("a bounded entry must serialize its bounds: %s", c)
+	}
+	var back Snapshot
+	if err := json.Unmarshal(c, &back); err != nil {
+		t.Fatal(err)
+	}
+	if back.Predicates.Whitelist.Entries[0].RecvAfter != 400 {
+		t.Fatalf("bounds must survive the round trip: %+v", back.Predicates.Whitelist.Entries)
+	}
+
+	// A frozen outpoint claiming a height bound is refused by name rather than
+	// surfacing as an unexplained root mismatch. (It round-trips unbounded, which
+	// is why the bare-key form is the one every blacklist entry uses.)
+	blBound := *frozen
+	blBound.Predicates.Blacklist.Entries = append([]PredicateEntry(nil), frozen.Predicates.Blacklist.Entries...)
+	if !blBound.Predicates.Blacklist.Entries[0].Unbounded() {
+		t.Fatal("a frozen outpoint must carry no height bounds")
+	}
+	blBound.Predicates.Blacklist.Entries[0].SendAfter = 7
+	if err := blBound.Validate(); err == nil || !strings.Contains(err.Error(), "carries no height bounds") {
+		t.Fatalf("a bounded blacklist entry must be refused by name, got %v", err)
+	}
+}
+
+// wlKey parses a hex key for the bounds test.
+func wlKey(t *testing.T, hexKey string) [32]byte {
+	t.Helper()
+	b, err := hex.DecodeString(hexKey)
+	if err != nil || len(b) != 32 {
+		t.Fatalf("bad key %q", hexKey)
+	}
+	return [32]byte(b)
 }
 
 // TestSnapshotSMTv1StillWorks: adding dmt-v1 changed nothing about the M2
@@ -416,4 +488,13 @@ func TestSnapshotSMTv1StillWorks(t *testing.T) {
 	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "dmt-v1") || !strings.Contains(err.Error(), "smt-v1") {
 		t.Fatalf("an unknown tree must be refused naming both supported values, got %v", err)
 	}
+}
+
+// limitOrNil renders a transfer limit as the snapshot format's optional field:
+// nil for "no limit", which is the only encoding of absence Validate accepts.
+func limitOrNil(limit uint64) *uint64 {
+	if limit == 0 {
+		return nil
+	}
+	return &limit
 }

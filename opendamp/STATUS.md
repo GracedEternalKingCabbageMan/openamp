@@ -398,8 +398,17 @@ Nothing in the covenant. What is left is integration and operations.
    signers.
 4. **Parallel verifier outputs** (design doc section 6). Untouched; the single
    verifier output is a spending race, which a busy asset will hit first.
-5. **Snapshot signing and publication.** `issuer_sig` over the canonical snapshot
-   belongs with M2's policy service.
+5. **Snapshot signing and publication — DONE, in M2.** The policy service
+   publishes seq 0 at issuance and seq n+1 on every policy update, chained by
+   `prev_pi`, and verifies the issuer signature over the canonical snapshot.
+   The freeze path lives there too: `POST /v1/issuer/damp-policy` recomputes
+   both roots and pi_{n+1} from the published chain and logs the reason before
+   anything is signed, and `.../complete` verifies the issuer signature and the
+   respend before broadcasting. What the policy service structurally CANNOT do
+   is build that respend itself: `sig_all_hash` and the `G(I)` witness need the
+   Simplicity transaction environment and the compiler, so the registrar
+   supplies the signed transaction, exactly as it supplies program identity at
+   issuance.
 6. **Golden CMR vectors under CI.** `vectors/addresses.json` pins U/P/G CMRs,
    tapleaf and TapData hashes, output keys, script pubkeys, control blocks, both
    chains' addresses, per-holder window bounds and the dmt-v1 constants. Nothing

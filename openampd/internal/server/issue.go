@@ -867,11 +867,26 @@ func (s *Server) handleHolders(w http.ResponseWriter, r *http.Request) {
 	}
 	var height int64
 	s.st.View(func(st *store.State) { height = st.Height })
-	httpJSON(w, map[string]any{"asset": asset.ID, "height": height, "holders": balances, "total_atoms": total})
+	resp := map[string]any{"asset": asset.ID, "height": height, "holders": balances, "total_atoms": total}
+	// For a network-enforced asset the register's population comes from the
+	// published holder list, whose members are keys rather than accounts. Naming
+	// the key beside its AID is what lets a console show WHO a row is when that
+	// holder never registered with this server.
+	if asset.Enforcement == "damp" && asset.Damp != nil {
+		keys := map[string]string{}
+		for _, e := range asset.Damp.Whitelist {
+			keys[store.AID([]string{e.Key})] = e.Key
+		}
+		resp["holder_keys"] = keys
+		resp["enforcement"] = "damp"
+	}
+	httpJSON(w, resp)
 }
 
 // handleSupply reports an asset's circulating supply as a purely chain-derived
-// figure: the sum of every registered holder's confirmed enclave balance. It is
+// figure: the sum of every holder's confirmed balance, scanned at enclaves for a
+// co-signed asset and at the whitelist's covenants for a network-enforced one
+// (holderBalances explains why the population differs). It is
 // never a stored counter, so a burn (OA-5) that spends enclave units into an
 // unspendable output lowers it and a reissuance (OA-6) that lands new units in
 // an enclave raises it, both as soon as the change confirms. The reissuance

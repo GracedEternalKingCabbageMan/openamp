@@ -15,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/GracedEternalKingCabbageMan/openamp/openampd/internal/damp"
 )
 
 type User struct {
@@ -135,14 +137,28 @@ type DampBinding struct {
 	HolderPubkey      string `json:"holder_pubkey"`       // x-only hex of the initial holder
 	Pi                string `json:"pi"`                  // pi_0, hex
 	WhitelistRoot     string `json:"whitelist_root"`      // dmt-v1 root, hex
-	Tree              string `json:"tree"`                // "dmt-v1"
-	UserCMR           string `json:"user_cmr"`
-	VerifierCMR       string `json:"verifier_cmr"`
-	IssuerCMR         string `json:"issuer_cmr"`
-	UserCovenantSPK   string `json:"user_covenant_spk"`     // C_U(initial holder), hex
-	UserCovenantAddr  string `json:"user_covenant_address"` // best-effort, node-decoded
-	VerifierSPK       string `json:"verifier_covenant_spk"`
-	VerifierAddr      string `json:"verifier_covenant_address"`
+	// Whitelist is the owner keys the CURRENT policy admits, kept in step with
+	// WhitelistRoot by every published seq. It is not decoration: a network-
+	// enforced asset's holders are raw x-only keys that need never register with
+	// this server, so the whitelist is the only enumeration of who can hold the
+	// asset, and therefore the only way an ownership report or a supply figure can
+	// know which covenant scripts to scan. Dropping it made both answer zero for a
+	// live asset, which reads as a truthful empty register rather than as a
+	// missing input. Absent on records written before that was fixed, so those
+	// fall back to the registered-user scan alone.
+	//
+	// Each entry carries the height bounds that bind that holder, and serializes as
+	// a bare key when it has none, so a record written before bounds existed stays
+	// byte-identical to what it was.
+	Whitelist        []damp.PredicateEntry `json:"whitelist,omitempty"`
+	Tree             string                `json:"tree"` // "dmt-v1"
+	UserCMR          string                `json:"user_cmr"`
+	VerifierCMR      string                `json:"verifier_cmr"`
+	IssuerCMR        string                `json:"issuer_cmr"`
+	UserCovenantSPK  string                `json:"user_covenant_spk"`     // C_U(initial holder), hex
+	UserCovenantAddr string                `json:"user_covenant_address"` // best-effort, node-decoded
+	VerifierSPK      string                `json:"verifier_covenant_spk"`
+	VerifierAddr     string                `json:"verifier_covenant_address"`
 }
 
 // TransferRecord supports velocity accounting; entries above a reorged-out
@@ -218,6 +234,17 @@ type State struct {
 	// can compile). Absent on documents written before damp issuance existed;
 	// initialised on load.
 	PendingDampIssuances map[string]*PendingDampIssuance `json:"pending_damp_issuances,omitempty"`
+	// PendingDampPolicies holds a network-enforced POLICY UPDATE between its two
+	// phases: prepare (which fixes the next whitelist/blacklist, pi_{n+1} and the
+	// snapshot the issuer signs) and complete (which needs the recompiled verifier
+	// CMR and the finished C_V respend, neither of which a Go server can produce).
+	// Absent on documents written before policy updates existed; initialised on
+	// load.
+	PendingDampPolicies map[string]*PendingDampPolicy `json:"pending_damp_policies,omitempty"`
+	// DampPolicies maps a completed policy-update id to the respend txid it
+	// broadcast, so a replayed complete returns that txid instead of driving a
+	// second broadcast. Absent on older documents; initialised on load.
+	DampPolicies map[string]string `json:"damp_policies,omitempty"`
 	// Snapshots maps an asset id to its published OpenDAMP policy snapshots in
 	// seq order (index == seq; the snapshot service enforces gapless append).
 	// Absent on documents written before M2; initialised on load.
@@ -280,6 +307,12 @@ func Open(dir string) (*Store, error) {
 	}
 	if s.state.PendingDampIssuances == nil {
 		s.state.PendingDampIssuances = map[string]*PendingDampIssuance{}
+	}
+	if s.state.PendingDampPolicies == nil {
+		s.state.PendingDampPolicies = map[string]*PendingDampPolicy{}
+	}
+	if s.state.DampPolicies == nil {
+		s.state.DampPolicies = map[string]string{}
 	}
 	return s, nil
 }
@@ -380,6 +413,117 @@ func (s *Store) GCPendingDampIssuances(ttl time.Duration) {
 				delete(st.PendingDampIssuances, id)
 			}
 		}
+		return nil
+	})
+}
+
+// --- network-enforced (OpenDAMP) policy updates -------------------------------
+
+// PendingDampPolicy is a policy update waiting for the two things this server
+// cannot produce: the CMR of the RECOMPILED verifier program P(pi_{n+1}), and
+// the finished spend of the current verifier output through the issuer path
+// G(I). Everything the completion needs to be checked against is recorded here
+// at prepare, so the policy that gets published is the policy whose reason was
+// logged before anything was signed.
+//
+// Whitelist/Blacklist are the NEXT policy's inline entries (owner keys and
+// outpoint keys, both 32-byte hex), kept so the completion can recompute pi from
+// stored state rather than trusting the supplied one. VerifierTxid/VerifierVout
+// pin the outpoint the respend must consume, so a transaction spending some
+// other coin is refused rather than broadcast.
+type PendingDampPolicy struct {
+	ID      string `json:"id"`
+	AssetID string `json:"asset_id"`
+	Reason  string `json:"reason"`
+
+	Seq    uint64 `json:"seq"`     // the seq this update publishes (current + 1)
+	PrevPi string `json:"prev_pi"` // the pi it chains from
+	Pi     string `json:"pi"`      // pi_{n+1}
+
+	// Whitelist carries the next policy's holders WITH their height bounds;
+	// Blacklist the frozen outpoints' 32-byte policy keys, which have no bounds.
+	Whitelist     []damp.PredicateEntry `json:"whitelist"`
+	Blacklist     []string              `json:"blacklist"`
+	WhitelistRoot string                `json:"whitelist_root"`
+	BlacklistRoot string                `json:"blacklist_root"`
+	// Added/Removed record the human-legible shape of the change for the
+	// transparency log and for the console that renders it. Blacklist entries are
+	// hashes, so the outpoints they came from are recorded here or lost.
+	AddedHolders     []string `json:"added_holders,omitempty"`
+	RemovedHolders   []string `json:"removed_holders,omitempty"`
+	AddedOutpoints   []string `json:"added_outpoints,omitempty"`   // "txid:vout"
+	RemovedOutpoints []string `json:"removed_outpoints,omitempty"` // "txid:vout"
+
+	VerifierAsset   string `json:"verifier_asset"`
+	VerifierAmount  uint64 `json:"verifier_amount"`
+	VerifierTxid    string `json:"verifier_txid"`
+	VerifierVout    uint32 `json:"verifier_vout"`
+	VerifierSPKPrev string `json:"verifier_spk_prev"`
+	VerifierCMRPrev string `json:"verifier_cmr_prev"`
+	IssuerUpdateKey string `json:"issuer_update_key"`
+
+	Snapshot       json.RawMessage `json:"snapshot"`         // canonical seq n+1 bytes
+	SnapshotHash   string          `json:"snapshot_hash"`    // SHA256 of those bytes
+	SnapshotSigMsg string          `json:"snapshot_sig_msg"` // the 32 bytes the issuer signs
+
+	Created time.Time `json:"created"`
+}
+
+// PutPendingDampPolicy persists a prepared policy update.
+func (s *Store) PutPendingDampPolicy(p *PendingDampPolicy) error {
+	return s.Update(func(st *State) error {
+		if st.PendingDampPolicies == nil {
+			st.PendingDampPolicies = map[string]*PendingDampPolicy{}
+		}
+		cp := *p
+		st.PendingDampPolicies[p.ID] = &cp
+		return nil
+	})
+}
+
+// GetPendingDampPolicy returns a copy of the prepared policy update, if present.
+func (s *Store) GetPendingDampPolicy(id string) (*PendingDampPolicy, bool) {
+	var out *PendingDampPolicy
+	s.View(func(st *State) {
+		if p, ok := st.PendingDampPolicies[id]; ok {
+			cp := *p
+			out = &cp
+		}
+	})
+	return out, out != nil
+}
+
+// GCPendingDampPolicies drops prepared policy updates older than ttl. An expired
+// prepare has cost nothing: no coin moved and no snapshot was published.
+func (s *Store) GCPendingDampPolicies(ttl time.Duration) {
+	_ = s.Update(func(st *State) error {
+		for id, p := range st.PendingDampPolicies {
+			if time.Since(p.Created) > ttl {
+				delete(st.PendingDampPolicies, id)
+			}
+		}
+		return nil
+	})
+}
+
+// GetDampPolicy returns the respend txid a completed policy update produced.
+func (s *Store) GetDampPolicy(id string) (string, bool) {
+	var txid string
+	var ok bool
+	s.View(func(st *State) { txid, ok = st.DampPolicies[id] })
+	return txid, ok
+}
+
+// MarkDampPolicy records the txid a policy update broadcast and consumes the
+// pending build, so a replay short-circuits to that txid and can never build or
+// broadcast a second respend. Mirrors MarkClawback's consume-once semantics.
+func (s *Store) MarkDampPolicy(id, txid string) error {
+	return s.Update(func(st *State) error {
+		if st.DampPolicies == nil {
+			st.DampPolicies = map[string]string{}
+		}
+		st.DampPolicies[id] = txid
+		delete(st.PendingDampPolicies, id)
 		return nil
 	})
 }

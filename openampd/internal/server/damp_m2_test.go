@@ -184,7 +184,7 @@ func m2Snapshot(t *testing.T, priv *btcec.PrivateKey, assetHex string, seq uint6
 		PrevPi:        prevPi,
 		Tree:          damp.TreeSMTv1,
 		Predicates: damp.Predicates{
-			Blacklist: damp.PredicateList{Root: hex.EncodeToString(root[:]), Entries: entries},
+			Blacklist: damp.PredicateList{Root: hex.EncodeToString(root[:]), Entries: damp.KeyEntries(entries)},
 		},
 	}
 	pi, err := s.ComputePi()

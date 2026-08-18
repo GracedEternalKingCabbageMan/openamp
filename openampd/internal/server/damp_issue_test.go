@@ -34,8 +34,16 @@ type dampVec struct {
 		GCMR string `json:"g_cmr"`
 	} `json:"programs"`
 	Policy struct {
-		WhitelistRoot    string   `json:"whitelist_root"`
-		WhitelistEntries []string `json:"whitelist_entries"`
+		WhitelistRoot string `json:"whitelist_root"`
+		// The vectors' holder entries carry the height bounds the covenant's
+		// whitelist leaf commits, so they deserialize as entries rather than keys.
+		// Issuance itself only ever produces UNBOUNDED entries (a lockup binds a
+		// height, and at issuance there is no height yet), so the root an issuance
+		// commits is recomputed from these keys without their bounds; the
+		// cross-language pin for the tree WITH bounds lives in internal/damp's
+		// TestSnapshotDMTv1PredicateShape.
+		WhitelistEntries []damp.PredicateEntry `json:"whitelist_entries"`
+		TransferLimit    uint64                `json:"transfer_limit"`
 	} `json:"policy"`
 	UserCovenants []struct {
 		OwnerXOnly   string `json:"owner_xonly"`
@@ -45,6 +53,16 @@ type dampVec struct {
 		ScriptPubKey string `json:"script_pubkey"`
 	} `json:"verifier_covenant"`
 	path string
+}
+
+// whitelistKeys is the vectors' holder keys without their height bounds, which is
+// what an issuance's holder list is.
+func (v dampVec) whitelistKeys() []string {
+	out := make([]string, 0, len(v.Policy.WhitelistEntries))
+	for _, e := range v.Policy.WhitelistEntries {
+		out = append(out, e.Key)
+	}
+	return out
 }
 
 func loadDampVectors(t *testing.T) dampVec {
@@ -175,8 +193,8 @@ func newDampServer(t *testing.T, v dampVec) (*Server, *store.Store, *dampNode) {
 		t.Fatalf("LoadProgramRegistry(%s): %v", v.path, err)
 	}
 	s := &Server{
-		cfg:     Config{FeeAsset: oa4FeeID, FeeSats: 100, DampRegistry: v.path},
-		st:      st, node: cl, wallet: cl,
+		cfg: Config{FeeAsset: oa4FeeID, FeeSats: 100, DampRegistry: v.path},
+		st:  st, node: cl, wallet: cl,
 		pending: map[string]*pendingTransfer{}, signer: NewLocalKeySigner(st),
 		dampReg: reg,
 	}
@@ -203,7 +221,7 @@ func dampPrepareBody(v dampVec) map[string]any {
 	return map[string]any{
 		"name": "Damp Bond", "ticker": "DBND", "precision": 2, "atoms": 500000,
 		"holder_pubkey":     v.UserCovenants[0].OwnerXOnly,
-		"whitelist":         v.Policy.WhitelistEntries,
+		"whitelist":         v.whitelistKeys(),
 		"verifier_amount":   1,
 		"issuer_update_key": v.UserCovenants[1].OwnerXOnly,
 		"burn_allowed":      false,
@@ -243,8 +261,22 @@ func TestDamp_FullIssuance(t *testing.T) {
 	}
 	// The whitelist root is the dmt-v1 root over the same entries the Rust side
 	// hashes, so it must match the vectors byte for byte.
-	if prep["whitelist_root"] != v.Policy.WhitelistRoot {
-		t.Fatalf("whitelist_root = %v, vectors say %s", prep["whitelist_root"], v.Policy.WhitelistRoot)
+	// The whitelist root is the dmt-v1 root over the same holder LEAVES the Rust
+	// side hashes. An issuance's leaves are unbounded, so the expected root is
+	// recomputed here from the vectors' keys; the vectors' own root covers a holder
+	// with a receive window, and internal/damp pins that one across languages.
+	wantWLRoot, wlErr := damp.WhitelistRoot(func() [][32]byte {
+		keys := make([][32]byte, 0, len(v.Policy.WhitelistEntries))
+		for _, e := range v.Policy.WhitelistEntries {
+			keys = append(keys, elements.MustHex32(e.Key))
+		}
+		return keys
+	}())
+	if wlErr != nil {
+		t.Fatal(wlErr)
+	}
+	if prep["whitelist_root"] != hex.EncodeToString(wantWLRoot[:]) {
+		t.Fatalf("whitelist_root = %v, the unbounded holder leaves hash to %x", prep["whitelist_root"], wantWLRoot)
 	}
 	if prep["tree"] != damp.TreeDMTv1 {
 		t.Fatalf("tree = %v, want %s", prep["tree"], damp.TreeDMTv1)
@@ -352,7 +384,7 @@ func TestDamp_FullIssuance(t *testing.T) {
 	if asset.Clawback {
 		t.Fatal("a network-enforced asset must have no clawback leaf")
 	}
-	if asset.Damp.Pi != pi || asset.Damp.WhitelistRoot != v.Policy.WhitelistRoot ||
+	if asset.Damp.Pi != pi || asset.Damp.WhitelistRoot != prep["whitelist_root"] ||
 		asset.Damp.VerifierAsset != vAssetID || asset.Damp.VerifierAmount != 1 ||
 		asset.Damp.UserCovenantSPK != wantUserSpk || asset.Damp.VerifierSPK != wantVSpk ||
 		asset.Damp.Tree != damp.TreeDMTv1 {

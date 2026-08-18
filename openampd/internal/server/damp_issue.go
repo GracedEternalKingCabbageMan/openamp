@@ -514,8 +514,12 @@ func (s *Server) handleDampIssuePrepare(w http.ResponseWriter, r *http.Request) 
 		V: 1, Asset: assetDisplay, VerifierAsset: vAssetDisplay, Q: q,
 		Pi: piHex, Seq: 0, PrevPi: nil, Tree: damp.TreeDMTv1,
 		Predicates: damp.Predicates{
-			Blacklist: damp.PredicateList{Root: hex.EncodeToString(blRoot[:]), Entries: []string{}},
-			Whitelist: damp.PredicateList{Root: hex.EncodeToString(wlRoot[:]), Entries: req.Whitelist},
+			Blacklist: damp.PredicateList{Root: hex.EncodeToString(blRoot[:]), Entries: []damp.PredicateEntry{}},
+			// The genesis holder list carries no height bounds. A lockup or a receive
+			// window is set by a later policy update, which is the only place bounds can
+			// come from anyway: they bind heights, and at issuance there is no height to
+			// bind them to yet.
+			Whitelist: damp.PredicateList{Root: hex.EncodeToString(wlRoot[:]), Entries: damp.KeyEntries(req.Whitelist)},
 		},
 	}
 	if err := snap.Validate(); err != nil {
@@ -548,7 +552,7 @@ func (s *Server) handleDampIssuePrepare(w http.ResponseWriter, r *http.Request) 
 		HolderPubkey: req.HolderPubkey, Whitelist: req.Whitelist, WhitelistRoot: hex.EncodeToString(wlRoot[:]),
 		VerifierAsset: vAssetDisplay, VerifierAmount: q, VerifierToken: displayHash(vTokenID), VerifierVout: 0,
 		VerifierIssueTxid: vTxid,
-		IssuerUpdateKey: req.IssuerUpdateKey, IssuerAID: req.IssuerAID, BurnAllowed: req.BurnAllowed,
+		IssuerUpdateKey:   req.IssuerUpdateKey, IssuerAID: req.IssuerAID, BurnAllowed: req.BurnAllowed,
 		PolicyPub: hex.EncodeToString(policyX[:]), PolicyRef: policyRef,
 		Contract: contract, ContractHash: displayHash(digest),
 		AssetID: assetDisplay, Entropy: displayHash(entropy), Token: displayHash(tokenID),
@@ -831,8 +835,14 @@ func (s *Server) handleDampIssueComplete(w http.ResponseWriter, r *http.Request)
 			VerifierAsset: p.VerifierAsset, VerifierAmount: p.VerifierAmount,
 			VerifierIssueTxid: p.VerifierIssueTxid, IssuerUpdateKey: p.IssuerUpdateKey,
 			HolderPubkey: p.HolderPubkey, Pi: p.Pi, WhitelistRoot: p.WhitelistRoot,
-			Tree:    damp.TreeDMTv1,
-			UserCMR: req.UserCMR, VerifierCMR: req.VerifierCMR, IssuerCMR: hex.EncodeToString(issuerCMR[:]),
+			// The whitelist is retained, not just its root: these keys are the only
+			// enumeration of this asset's possible holders (a damp holder never has to
+			// register with this server), so the ownership report and the supply figure
+			// derive their scan set from here. Later seqs keep it current through the
+			// policy-update path.
+			Whitelist: damp.KeyEntries(p.Whitelist),
+			Tree:      damp.TreeDMTv1,
+			UserCMR:   req.UserCMR, VerifierCMR: req.VerifierCMR, IssuerCMR: hex.EncodeToString(issuerCMR[:]),
 			UserCovenantSPK: hex.EncodeToString(userCov.ScriptPubKey()), UserCovenantAddr: userAddr,
 			VerifierSPK: verifierSpkHex, VerifierAddr: verifierAddr,
 		},
