@@ -145,7 +145,7 @@ type DampBinding struct {
 	// know which covenant scripts to scan. Dropping it made both answer zero for a
 	// live asset, which reads as a truthful empty register rather than as a
 	// missing input. Absent on records written before that was fixed, so those
-	// fall back to the registered-user scan alone.
+	// fall back to the published snapshot chain, which carries the same list.
 	//
 	// Each entry carries the height bounds that bind that holder, and serializes as
 	// a bare key when it has none, so a record written before bounds existed stays

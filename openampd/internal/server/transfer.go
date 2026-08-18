@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
 
+	"github.com/GracedEternalKingCabbageMan/openamp/openampd/internal/damp"
 	"github.com/GracedEternalKingCabbageMan/openamp/openampd/internal/elements"
 	"github.com/GracedEternalKingCabbageMan/openamp/openampd/internal/store"
 )
@@ -293,9 +295,26 @@ func (s *Server) holderBalances(asset *store.Asset) (map[string]uint64, error) {
 		spkToAID[spk] = aid
 		spks = append(spks, spk)
 	}
+	// The holder set of a network-enforced asset is its policy whitelist. The
+	// binding retains it, but an asset issued before the binding did must not
+	// report an empty register as if it were true, so fall back to the
+	// published snapshot chain, which is the authoritative policy record and
+	// is what a holder proves against anyway.
+	var dampHolders []damp.PredicateEntry
+	if asset.Enforcement == "damp" && asset.Damp != nil {
+		dampHolders = asset.Damp.Whitelist
+		if len(dampHolders) == 0 {
+			if latest, ok := s.st.LatestSnapshot(asset.ID); ok {
+				var snap damp.Snapshot
+				if err := json.Unmarshal(latest.Canonical, &snap); err == nil {
+					dampHolders = snap.Predicates.Whitelist.Entries
+				}
+			}
+		}
+	}
 	s.st.View(func(st *store.State) {
 		if asset.Enforcement == "damp" && asset.Damp != nil {
-			for _, e := range asset.Damp.Whitelist {
+			for _, e := range dampHolders {
 				raw, err := dampHolderSPK(asset, e.Key)
 				if err != nil {
 					scanErr = err
