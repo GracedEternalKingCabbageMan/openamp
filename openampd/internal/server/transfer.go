@@ -300,18 +300,7 @@ func (s *Server) holderBalances(asset *store.Asset) (map[string]uint64, error) {
 	// report an empty register as if it were true, so fall back to the
 	// published snapshot chain, which is the authoritative policy record and
 	// is what a holder proves against anyway.
-	var dampHolders []damp.PredicateEntry
-	if asset.Enforcement == "damp" && asset.Damp != nil {
-		dampHolders = asset.Damp.Whitelist
-		if len(dampHolders) == 0 {
-			if latest, ok := s.st.LatestSnapshot(asset.ID); ok {
-				var snap damp.Snapshot
-				if err := json.Unmarshal(latest.Canonical, &snap); err == nil {
-					dampHolders = snap.Predicates.Whitelist.Entries
-				}
-			}
-		}
-	}
+	dampHolders := s.dampHolderList(asset)
 	s.st.View(func(st *store.State) {
 		if asset.Enforcement == "damp" && asset.Damp != nil {
 			for _, e := range dampHolders {
@@ -1212,4 +1201,27 @@ func (s *Server) handleCosign(w http.ResponseWriter, r *http.Request) {
 	})
 	s.st.AppendLog("cosign", map[string]any{"txid": rawTxid, "sender": sender.AID, "asset": asset.ID, "atoms": sent})
 	httpJSON(w, map[string]any{"sigs": sigs})
+}
+
+// dampHolderList is the current holder list of a network-enforced asset: the
+// binding's whitelist, or the published snapshot chain when the binding predates
+// retaining it. Both reads and the register go through here so an ownership
+// report, a supply figure and the key names beside them can never disagree
+// about who holds the asset.
+func (s *Server) dampHolderList(asset *store.Asset) []damp.PredicateEntry {
+	if asset.Enforcement != "damp" || asset.Damp == nil {
+		return nil
+	}
+	if len(asset.Damp.Whitelist) > 0 {
+		return asset.Damp.Whitelist
+	}
+	latest, ok := s.st.LatestSnapshot(asset.ID)
+	if !ok {
+		return nil
+	}
+	var snap damp.Snapshot
+	if err := json.Unmarshal(latest.Canonical, &snap); err != nil {
+		return nil
+	}
+	return snap.Predicates.Whitelist.Entries
 }

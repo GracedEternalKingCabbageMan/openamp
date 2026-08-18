@@ -361,14 +361,14 @@ func (s *Server) handleIssue(w http.ResponseWriter, r *http.Request) {
 // unaffected); when present they add the registry-required entity block and an
 // operator-identity block, both committed by contract_hash.
 type issueRequest struct {
-	Name         string      `json:"name"`
-	Ticker       string      `json:"ticker"`
-	Precision    int         `json:"precision"`
-	Atoms        uint64      `json:"atoms"`
-	HolderAID    string      `json:"holder_aid"`
-	IssuerAID    string      `json:"issuer_aid"`
-	Clawback    *bool `json:"clawback,omitempty"`
-	BurnAllowed bool  `json:"burn_allowed"`
+	Name        string `json:"name"`
+	Ticker      string `json:"ticker"`
+	Precision   int    `json:"precision"`
+	Atoms       uint64 `json:"atoms"`
+	HolderAID   string `json:"holder_aid"`
+	IssuerAID   string `json:"issuer_aid"`
+	Clawback    *bool  `json:"clawback,omitempty"`
+	BurnAllowed bool   `json:"burn_allowed"`
 	// Confidential means ONLY "blind this mint transaction's outputs" (the
 	// enclave output to the holder's derived key, token/fee-change to per-call
 	// blech32 wallet addresses). It is NOT an asset property: confidentiality is
@@ -874,7 +874,7 @@ func (s *Server) handleHolders(w http.ResponseWriter, r *http.Request) {
 	// holder never registered with this server.
 	if asset.Enforcement == "damp" && asset.Damp != nil {
 		keys := map[string]string{}
-		for _, e := range asset.Damp.Whitelist {
+		for _, e := range s.dampHolderList(asset) {
 			keys[store.AID([]string{e.Key})] = e.Key
 		}
 		resp["holder_keys"] = keys
