@@ -119,7 +119,7 @@ func (s *Server) handlePledgeCreate(w http.ResponseWriter, r *http.Request) {
 	// the collateral already sits, the lender's is the only place a seizure is
 	// allowed to deliver it. Refusing here rather than at seizure time means a
 	// lender cannot discover on default that they were never able to be paid.
-	holderTree, _, asset, err := s.enclaveFor(req.HolderAID, req.Asset)
+	_, _, asset, err := s.enclaveFor(req.HolderAID, req.Asset)
 	if err != nil {
 		httpErr(w, 404, "%v", err)
 		return
@@ -178,7 +178,6 @@ func (s *Server) handlePledgeCreate(w http.ResponseWriter, r *http.Request) {
 			have, already, free, req.Atoms)
 		return
 	}
-	_ = holderTree
 
 	height, err := s.node.GetBlockCount()
 	if err != nil {
@@ -397,13 +396,6 @@ func (s *Server) handlePledgeSeize(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, 404, "lender: %v", err)
 		return
 	}
-	issuerTree, _, _, err := s.enclaveFor(asset.IssuerAID, p.AssetID)
-	if err != nil {
-		httpErr(w, 500, "%v", err)
-		return
-	}
-	_ = issuerTree
-
 	var issuerPriv string
 	if asset.IssuerExternal {
 		if _, hasPolicy := s.signer.PolicyPubKey(asset.ID); !hasPolicy {
