@@ -42,6 +42,7 @@ func (s *Server) checkTransfer(tx *elements.Tx, asset *store.Asset, sender *stor
 	})
 
 	recipients := map[string]uint64{} // aid -> atoms received
+	var burned uint64                 // atoms destroyed, which also leave the sender
 	for i, out := range tx.Out {
 		if len(out.Asset) != 33 || out.Asset[0] != 1 {
 			return refuse("output %d: confidential or malformed asset in a restricted transfer", i)
@@ -59,6 +60,8 @@ func (s *Server) checkTransfer(tx *elements.Tx, asset *store.Asset, sender *stor
 			if !asset.BurnAllowed {
 				return refuse("burns are not permitted for this asset")
 			}
+			amt, _ := elements.ExplicitValueAmount(out.Value)
+			burned += amt
 			continue
 		}
 		u, ok := spkToUser[hex.EncodeToString(out.ScriptPubKey)]
@@ -72,6 +75,39 @@ func (s *Server) checkTransfer(tx *elements.Tx, asset *store.Asset, sender *stor
 		}
 		if u.Frozen && u.AID != asset.IssuerAID {
 			return refuse("recipient %s frozen", u.AID)
+		}
+	}
+
+	// Pledged collateral (Pignus Tier C). A restricted asset cannot be locked
+	// in a lending covenant -- it may only sit at an enclave output this server
+	// co-signs for -- so the collateral does not move at all and this check is
+	// what holds it: a holder may spend anything ABOVE their open pledges and
+	// nothing below. See internal/store/pledge.go for why that is the honest
+	// construction and what it costs the lender.
+	var pledged uint64
+	s.st.View(func(st *store.State) {
+		pledged = store.PledgedAtoms(st, asset.ID, sender.AID)
+	})
+	if pledged > 0 {
+		var leaving uint64 = burned
+		for aid, amt := range recipients {
+			if aid != sender.AID {
+				leaving += amt
+			}
+		}
+		if leaving > 0 {
+			balances, err := s.holderBalances(asset)
+			if err != nil {
+				return fmt.Errorf("pledge check needs a holder scan: %w", err)
+			}
+			have := balances[sender.AID]
+			if have < leaving || have-leaving < pledged {
+				return refuse(
+					"%d atoms are pledged as loan collateral; this transfer "+
+						"would leave %s holding %d. Repay or settle the loan "+
+						"first, or ask the issuer to release the pledge",
+					pledged, sender.AID, saturatingSub(have, leaving))
+			}
 		}
 	}
 
@@ -1224,4 +1260,15 @@ func (s *Server) dampHolderList(asset *store.Asset) []damp.PredicateEntry {
 		return nil
 	}
 	return snap.Predicates.Whitelist.Entries
+}
+
+
+// saturatingSub keeps a refusal message honest: an unsigned underflow would
+// report a holder as owning eighteen quintillion atoms, which is the sort of
+// number that makes someone stop reading the sentence that matters.
+func saturatingSub(a, b uint64) uint64 {
+	if b > a {
+		return 0
+	}
+	return a - b
 }

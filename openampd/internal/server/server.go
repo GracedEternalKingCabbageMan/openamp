@@ -24,6 +24,10 @@
 //	POST /v1/issuer/freeze              freeze/unfreeze a user
 //	POST /v1/issuer/categories          set a user's categories
 //	POST /v1/issuer/rules               update an asset's policy rules
+//	POST /v1/issuer/pledges             lock collateral for a Pignus loan (Tier C)
+//	GET  /v1/issuer/pledges             list pledges
+//	POST /v1/issuer/pledges/{id}/release  debt settled, holder free again (lender-signed)
+//	POST /v1/issuer/pledges/{id}/seize    default, collateral to the lender (lender-signed)
 //	POST /v1/issuer/clawback            claw back a holder's UTXOs (legacy: signs+broadcasts; external issuer: builds the L_claw sweep)
 //	POST /v1/issuer/clawback/{id}/complete  submit the external issuer's signatures -> broadcast
 //	POST /v1/issuer/burn                build a redeem burn (OA-5), holder-signed
@@ -173,6 +177,10 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /v1/issuer/categories", s.issuerAuth(s.handleCategories))
 	mux.HandleFunc("POST /v1/issuer/rules", s.issuerAuth(s.handleRules))
 	mux.HandleFunc("POST /v1/issuer/clawback", s.issuerAuth(s.handleClawback))
+	mux.HandleFunc("POST /v1/issuer/pledges", s.issuerAuth(s.handlePledgeCreate))
+	mux.HandleFunc("GET /v1/issuer/pledges", s.issuerAuth(s.handlePledgeList))
+	mux.HandleFunc("POST /v1/issuer/pledges/{id}/release", s.issuerAuth(s.handlePledgeRelease))
+	mux.HandleFunc("POST /v1/issuer/pledges/{id}/seize", s.issuerAuth(s.handlePledgeSeize))
 	mux.HandleFunc("POST /v1/issuer/clawback/{id}/complete", s.issuerAuth(s.handleClawbackComplete))
 	mux.HandleFunc("POST /v1/issuer/burn", s.issuerAuth(s.handleBurnBuild))
 	mux.HandleFunc("POST /v1/issuer/reissue", s.issuerAuth(s.handleReissue))

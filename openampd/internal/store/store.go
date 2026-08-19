@@ -223,6 +223,13 @@ type State struct {
 	// (M9), so replaying complete returns the same txid instead of driving a fresh
 	// broadcast. Absent on pre-M9 documents; initialised on load.
 	Clawbacks map[string]string `json:"clawbacks,omitempty"`
+	// Pledges lock restricted-asset holdings as loan collateral. A restricted
+	// asset cannot sit in a lending covenant -- it may only live at an enclave
+	// output this server co-signs for -- so the collateral never moves and the
+	// server refuses to move it instead. See internal/store/pledge.go for why
+	// that is the honest construction and what it costs. Absent on older
+	// documents; initialised on load.
+	Pledges map[string]*Pledge `json:"pledges,omitempty"`
 	// PendingClawbacks holds a two-phase clawback build (the assembled L_claw sweep
 	// and its leaf sighashes) awaiting the external issuer's signatures (M9). It
 	// persists so the build survives a restart between build and complete, exactly
@@ -702,6 +709,11 @@ func (s *Store) GCPendingTransfers(ttl time.Duration) {
 // external-issuer assets (Asset.IssuerExternal) ever create one; the legacy
 // server-held-key clawback still signs and broadcasts in a single call.
 type PendingClawback struct {
+	// PledgeID, when set, names the Pignus pledge this sweep settles. The
+	// completion path closes that pledge once the sweep is broadcast, so an
+	// external issuer's two-phase seizure ends in the same state a legacy
+	// one-call seizure does. Empty for an ordinary clawback.
+	PledgeID string `json:"pledge_id,omitempty"`
 	ID        string    `json:"id"`
 	TxHex     string    `json:"tx_hex"` // assembled L_claw sweep, enclave witnesses empty
 	AssetID   string    `json:"asset_id"`
@@ -766,6 +778,9 @@ func (s *Store) MarkClawback(id, txid string) error {
 		if st.Clawbacks == nil {
 			st.Clawbacks = map[string]string{}
 		}
+	if st.Pledges == nil {
+		st.Pledges = map[string]*Pledge{}
+	}
 		st.Clawbacks[id] = txid
 		delete(st.PendingClawbacks, id)
 		return nil
