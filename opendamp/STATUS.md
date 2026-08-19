@@ -322,6 +322,15 @@ using the Elements one-to-one rule these covenants are unspendable, and
 `attach_verifier` says so by name rather than emitting a transaction the node
 would reject.
 
+**On the live testnet that budget starts at height 101,200** (Sequentia Core
+24.3.0, `consensus.simplicity_budget4_height`). The rule only ever accepts more,
+so the gate is a flag day for the operators of a running chain rather than a
+correctness requirement; regtest and mainnet have it from genesis, which is why
+this suite is unaffected. The consequence for M4: **do not fund an OpenDAMP
+covenant on the live testnet below 101,200.** The builder cannot catch it,
+because it mirrors the post-activation rule -- it would produce a transaction
+the node rejects for want of budget.
+
 Proofs, from a passing run (a fresh chain each time, so the txids identify a run
 rather than being stable):
 
@@ -442,7 +451,8 @@ Nothing in the covenant. What is left is integration and operations.
    small saving against a 16x capacity cut, so D stays 16. It is one constant
    (`dmt::DEPTH`, which the covenant template reads) if an issuer ever wants
    otherwise.
-8. **Live testnet pilot** (M4). The anyone-can-spend hazard makes
-   `getdeploymentinfo` reporting simplicity active a hard precondition for
-   funding any covenant address, on any chain — and so is the node granting four
-   weight units per witness byte, which arrived in Sequentia Core 24.3.0.
+8. **Live testnet pilot** (M4). Two hard preconditions before funding any
+   covenant address. `getdeploymentinfo` must report simplicity active, because
+   an unenforced 0xbe leaf is anyone-can-spend. And the chain must be granting
+   four weight units per witness byte: Sequentia Core 24.3.0, and on the live
+   testnet **from height 101,200**, not before.
