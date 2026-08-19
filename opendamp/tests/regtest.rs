@@ -39,7 +39,6 @@ use opendamp::txbuild::{
     attach_simplicity, attach_verifier, build_transfer, complete_issuer_op, complete_transfer, covenant_env,
     p2tr_keypath_spk, sig_all_digest, sign_bip340, sign_fee_input, Ctx, IssuerReq, TransferReq,
 };
-use opendamp::tapscript::cv_spend_info;
 
 // ---------------------------------------------------------------- node driver
 
@@ -286,15 +285,20 @@ fn splice_verifier(
 /// cannot be turned into a pruned program at all, and the only submittable form
 /// still carries its FAIL nodes - which consensus refuses outright. Both doors
 /// are therefore shut, and this exercises the second one against the node.
+#[allow(clippy::too_many_arguments)]
 fn attach_unpruned_verifier(
     net: &Net,
     ctx: &Ctx,
     req: &TransferReq,
+    sender: &opendamp::programs::SenderWitness,
     slots: &opendamp::txbuild::VerifierSlots,
     sender_sk: &[u8; 32],
     fee_sk: &[u8; 32],
 ) -> opendamp::elements::Transaction {
-    let built = build_transfer(ctx, req).expect("skeleton builds");
+    // The unchecked builder: these probes exist precisely because the checked
+    // one refuses them, and the point is to make the NODE do the refusing.
+    let built = opendamp::txbuild::build_transfer_unchecked(ctx, req)
+        .expect("skeleton builds");
     let mut tx = built.tx.clone();
     let (_, u_cb) = opendamp::tapscript::cu_spend_info(ctx.u_cmr(), &req.sender);
     for idx in &built.user_inputs {
@@ -306,9 +310,18 @@ fn attach_unpruned_verifier(
         attach_simplicity(&mut tx, *idx, &ctx.user, w, Some(&env), &u_cb)
             .expect("U is satisfied regardless of policy");
     }
-    let (_, p_cb, _) = cv_spend_info(ctx.p_cmr(), ctx.g_cmr());
-    attach_verifier(&mut tx, &ctx.verifier, slots, None, &p_cb)
-        .expect("assembles unpruned");
+    let shape = built.shape;
+    let p_cb = ctx.verifier_spend().control_for(shape).unwrap().clone();
+    attach_verifier(
+        &mut tx,
+        ctx.verifier_for(shape).unwrap(),
+        shape,
+        sender,
+        slots,
+        None,
+        &p_cb,
+    )
+    .expect("assembles unpruned");
     sign_fee_input(net, &mut tx, &built.prevouts, built.fee_input, fee_sk).unwrap();
     tx
 }
@@ -316,13 +329,29 @@ fn attach_unpruned_verifier(
 /// Slots carrying a STALE membership proof: the realistic attempt by a holder
 /// who was removed from the whitelist and still has the proof that worked under
 /// the previous policy version.
-fn stale_slots(
+fn stale_witness(
     frozen_ctx: &Ctx,
     stale_ctx: &Ctx,
     built: &opendamp::txbuild::BuiltTransfer,
-) -> opendamp::txbuild::VerifierSlots {
-    let mut slots = opendamp::txbuild::VerifierSlots::default();
+) -> (opendamp::programs::SenderWitness, opendamp::txbuild::VerifierSlots) {
+    let mut slots = opendamp::txbuild::VerifierSlots::empty(built.shape);
+    let sender_key = built.a_inputs[0].1;
+    // The sender is now proven ONCE for the whole transfer, so the stale proof
+    // that used to sit in every input slot lives here instead. This is the
+    // realistic attempt: a holder removed from the whitelist, still holding the
+    // proof that worked under the previous policy version.
+    let sender = opendamp::programs::SenderWitness {
+        key: sender_key,
+        proof: stale_ctx
+            .wl_tree
+            .prove(&sender_key.serialize())
+            .expect("the stale policy did include this owner"),
+    };
+    let cu_sender = frozen_ctx.cu_info(&sender_key).script_pubkey;
     for (out_idx, owner) in &built.a_outputs {
+        if built.tx.output[*out_idx].script_pubkey == cu_sender {
+            continue; // change carries no proof at all any more
+        }
         let proof = stale_ctx
             .wl_tree
             .prove(&owner.serialize())
@@ -330,20 +359,16 @@ fn stale_slots(
             .expect("recipient is provable under one of the two policies");
         slots.outputs[*out_idx - 1] = Some((*owner, proof));
     }
-    for (in_idx, owner, outpoint) in &built.a_inputs {
-        let proof = stale_ctx
-            .wl_tree
-            .prove(&owner.serialize())
-            .expect("the stale policy did include this owner");
+    for (in_idx, _owner, outpoint) in &built.a_inputs {
         let k = opendamp::txbuild::outpoint_policy_key(outpoint);
         let interval = stale_ctx
             .bl_tree
             .prove_absent(&k)
             .or_else(|| frozen_ctx.bl_tree.prove_absent(&k))
             .expect("some policy version leaves this outpoint unlisted");
-        slots.inputs[*in_idx - 1] = Some((*owner, proof, interval));
+        slots.inputs[*in_idx - 1] = Some(interval);
     }
-    slots
+    (sender, slots)
 }
 
 // -------------------------------------------------------------------- the test
@@ -426,7 +451,9 @@ fn regtest_end_to_end() {
         .unwrap()
         .to_string();
     println!("U CMR {}", ctx0.u_cmr());
-    println!("P CMR (pi0) {}", ctx0.p_cmr());
+    for shape in opendamp::programs::SHAPES {
+        println!("P CMR (pi0) {:>5} {}", shape.name(), ctx0.p_cmr(shape).unwrap());
+    }
     println!("G CMR {}", ctx0.g_cmr());
     println!("C_U(alice) {}", cu_alice.address(net.address_params));
     println!("C_V(pi0)   {}", cv0.address(net.address_params));
@@ -484,9 +511,9 @@ fn regtest_end_to_end() {
     let (tx, report) = complete_transfer(&ctx0, &req, &alice_sk, &fee_sk, true)
         .expect("transfer satisfies U and P");
     println!(
-        "BUDGET: verifier witness {} B ({} B pad), cost {} milli-WU = {} WU, \
+        "BUDGET: verifier witness {} B (leaf {}), cost {} milli-WU = {} WU, \
          budget {} WU, headroom {} WU ({}%); user witnesses {:?} B; tx {} B",
-        report.verifier_witness, report.verifier_pad, report.verifier_cost,
+        report.verifier_witness, report.shape.name(), report.verifier_cost,
         report.verifier_weight(), report.verifier_budget(),
         report.verifier_budget() as i64 - report.verifier_weight() as i64,
         (report.verifier_budget() - report.verifier_weight()) * 100 / report.verifier_budget(),
@@ -494,9 +521,16 @@ fn regtest_end_to_end() {
     );
     let txid = node.cli(&["sendrawtransaction", &tx_hex(&tx)]);
     node.generate(1, &mine_addr);
-    assert!(
-        node.cli_json(&["getrawtransaction", &txid, "1"])["blockhash"].as_str().is_some(),
-        "transfer must confirm"
+    let confirmed = node.cli_json(&["getrawtransaction", &txid, "1"]);
+    assert!(confirmed["blockhash"].as_str().is_some(), "transfer must confirm");
+    // The node's own vsize, which is what a fee is charged on and what block
+    // capacity is measured in. Quoted in the design document, so it is read from
+    // the node rather than derived.
+    let vsize = confirmed["vsize"].as_u64().expect("vsize");
+    let per_block = 89_999 / vsize;
+    println!(
+        "SIZE: the canonical transfer is {vsize} vB, so {per_block} fit in a \
+         block of 89,999 vB (the padded single-shape program managed 12)"
     );
     println!("PROOF 2: alice->bob transfer, no third party: {txid}");
 
@@ -573,11 +607,21 @@ fn regtest_end_to_end() {
     let built = build_transfer(&ctx1, &probe).expect("skeleton");
     let slots = opendamp::txbuild::verifier_slots(&ctx1, &built).expect("all keys in pi1");
     let mut swapped = tx.clone();
-    let (_, p1_cb, _) = cv_spend_info(ctx1.p_cmr(), ctx1.g_cmr());
+    let shape = built.shape;
+    let sender_w = opendamp::txbuild::sender_witness(&ctx1, &alice).unwrap();
+    let p1_cb = ctx1.verifier_spend().control_for(shape).unwrap().clone();
     // P(pi0)'s program under P(pi1)'s control block: unpruned, because P(pi0)
     // cannot be satisfied by a payment to carol at all.
-    attach_verifier(&mut swapped, &ctx0.verifier, &slots, None, &p1_cb)
-        .expect("assembles");
+    attach_verifier(
+        &mut swapped,
+        ctx0.verifier_for(shape).unwrap(),
+        shape,
+        &sender_w,
+        &slots,
+        None,
+        &p1_cb,
+    )
+    .expect("assembles");
     let reason = reject_reason(&node, &swapped);
     println!("PROOF 4c: node rejects P(pi0) spending C_V(pi1): {reason}");
     assert!(
@@ -625,12 +669,25 @@ fn regtest_end_to_end() {
     println!("PROOF 7b: alice cannot spend - no owner proof exists under pi2: {err}");
 
     // Her stale proof from pi1 is the realistic attempt. It cannot be pruned...
-    let built = build_transfer(&ctx2, &frozen).expect("skeleton");
-    let stale = stale_slots(&ctx2, &ctx1, &built);
-    let (_, p_cb, _) = cv_spend_info(ctx2.p_cmr(), ctx2.g_cmr());
-    let p_env = covenant_env(&net, &built.tx, &built.prevouts, 0, ctx2.p_cmr(), p_cb.clone());
+    // Unchecked: the builder now refuses a frozen sender at preflight (that is
+    // PROOF 7b), so the skeleton for the stale-proof probe has to bypass it.
+    let built = opendamp::txbuild::build_transfer_unchecked(&ctx2, &frozen).expect("skeleton");
+    let (stale_sender, stale) = stale_witness(&ctx2, &ctx1, &built);
+    let shape = built.shape;
+    let p_cb = ctx2.verifier_spend().control_for(shape).unwrap().clone();
+    let p_env = covenant_env(
+        &net, &built.tx, &built.prevouts, 0, ctx2.p_cmr(shape).unwrap(), p_cb.clone(),
+    );
     let mut probe_tx = built.tx.clone();
-    let pruned = attach_verifier(&mut probe_tx, &ctx2.verifier, &stale, Some(&p_env), &p_cb);
+    let pruned = attach_verifier(
+        &mut probe_tx,
+        ctx2.verifier_for(shape).unwrap(),
+        shape,
+        &stale_sender,
+        &stale,
+        Some(&p_env),
+        &p_cb,
+    );
     assert!(pruned.is_err(), "a stale proof must not satisfy the new whitelist root");
     println!(
         "PROOF 7c: alice's stale pi1 proof fails the pi2 whitelist fold: {}",
@@ -639,7 +696,8 @@ fn regtest_end_to_end() {
 
     // ...so the only submittable form keeps its FAIL nodes, and the node
     // refuses that outright. Both doors shut.
-    let unpruned = attach_unpruned_verifier(&net, &ctx2, &frozen, &stale, &alice_sk, &fee_sk);
+    let unpruned =
+        attach_unpruned_verifier(&net, &ctx2, &frozen, &stale_sender, &stale, &alice_sk, &fee_sk);
     let reason = reject_reason(&node, &unpruned);
     println!("PROOF 7d: node rejects the only submittable form of it: {reason}");
     assert!(reason.contains("FAIL node"), "expected a FAIL-node refusal: {reason}");
@@ -728,18 +786,30 @@ fn regtest_end_to_end() {
     println!("PROOF 8b: alice cannot spend the listed outpoint - no interval covers it: {err}");
 
     // The pre-blacklist interval proof is stale in exactly the same way.
-    let built = build_transfer(&ctx4, &listed).expect("skeleton");
-    let stale = stale_slots(&ctx4, &ctx3, &built);
-    let (_, p_cb, _) = cv_spend_info(ctx4.p_cmr(), ctx4.g_cmr());
-    let p_env = covenant_env(&net, &built.tx, &built.prevouts, 0, ctx4.p_cmr(), p_cb.clone());
+    let built = opendamp::txbuild::build_transfer_unchecked(&ctx4, &listed).expect("skeleton");
+    let (stale_sender, stale) = stale_witness(&ctx4, &ctx3, &built);
+    let shape = built.shape;
+    let p_cb = ctx4.verifier_spend().control_for(shape).unwrap().clone();
+    let p_env = covenant_env(
+        &net, &built.tx, &built.prevouts, 0, ctx4.p_cmr(shape).unwrap(), p_cb.clone(),
+    );
     let mut probe_tx = built.tx.clone();
-    let pruned = attach_verifier(&mut probe_tx, &ctx4.verifier, &stale, Some(&p_env), &p_cb);
+    let pruned = attach_verifier(
+        &mut probe_tx,
+        ctx4.verifier_for(shape).unwrap(),
+        shape,
+        &stale_sender,
+        &stale,
+        Some(&p_env),
+        &p_cb,
+    );
     assert!(pruned.is_err(), "a stale interval proof must not satisfy the new blacklist root");
     println!(
         "PROOF 8c: the pre-freeze interval proof fails the pi4 blacklist root: {}",
         pruned.err().unwrap()
     );
-    let unpruned = attach_unpruned_verifier(&net, &ctx4, &listed, &stale, &alice_sk, &fee_sk);
+    let unpruned =
+        attach_unpruned_verifier(&net, &ctx4, &listed, &stale_sender, &stale, &alice_sk, &fee_sk);
     let reason = reject_reason(&node, &unpruned);
     println!("PROOF 8d: node rejects the only submittable form of it: {reason}");
     assert!(reason.contains("FAIL node"), "expected a FAIL-node refusal: {reason}");
@@ -784,7 +854,7 @@ fn regtest_end_to_end() {
             .collect()
     };
     let ctx6 = Ctx::with_policy(
-        net, params, issuer, entries(&[alice, bob, carol]), &[], limit,
+        net, params, issuer, entries(&[alice, bob, carol]), &[], limit, 6,
     )
     .expect("pi6 compiles");
     let upd = IssuerReq {
@@ -847,7 +917,7 @@ fn regtest_end_to_end() {
         opendamp::dmt::Entry { key: carol.serialize(), send_after: 0, recv_after: bound },
     ];
     let ctx7 = Ctx::with_policy(
-        net, params, issuer, windowed, &[], opendamp::programs::NO_LIMIT,
+        net, params, issuer, windowed, &[], opendamp::programs::NO_LIMIT, 7,
     )
     .expect("pi7 compiles");
     let upd = IssuerReq {
@@ -931,25 +1001,107 @@ fn regtest_end_to_end() {
     let (o, v) = node.find_vout(&txid, &fee_spk);
     fee = Utxo { outpoint: o, value: v };
 
-    // ================= 6. HALT (last: it ends all transfers)
-    let halt = IssuerReq {
+    // ================= 11. A RECEIVE WINDOW MUST NOT STOP CHANGE
+    //
+    // recv_after restricts ACQUISITION. Applying it to a sender's own change
+    // turns it into a spend prohibition: a holder inside a Reg S window could
+    // not transact at all unless a UTXO happened to equal the payment exactly.
+    // The covenant now recognises change by script equality against the sender's
+    // own C_U and exempts it from the fold, the window and the explicit-value
+    // requirement. Alice pays bob (unrestricted) a fraction of a UTXO, so she
+    // must produce change, while she herself is under a receive window.
+    let here = node.cli_json(&["getblockcount"]).as_u64().unwrap() as u32;
+    let far = here + 1000;
+    let alice_cannot_receive = vec![
+        opendamp::dmt::Entry { key: alice.serialize(), send_after: 0, recv_after: far },
+        opendamp::dmt::Entry::unrestricted(bob.serialize()),
+        opendamp::dmt::Entry::unrestricted(carol.serialize()),
+    ];
+    let ctx8 = Ctx::with_policy(
+        net, params, issuer, alice_cannot_receive, &[], opendamp::programs::NO_LIMIT, 8,
+    )
+    .expect("pi8 compiles");
+    let upd = IssuerReq {
         verifier_outpoint: verifier_op,
-        halt_spk: Some(p2tr_keypath_spk(&bob)),
+        halt_spk: None,
         fee_utxo: (fee.outpoint, policy_asset, fee.value),
         fee_key,
         fee_amount,
         fee_change_spk: fee_spk.clone(),
     };
-    let tx = complete_issuer_op(&ctx7, None, &halt, &issuer_sk, &fee_sk).expect("halt");
+    let tx = complete_issuer_op(&ctx7, Some(&ctx8), &upd, &issuer_sk, &fee_sk).expect("pi8");
     let txid = node.cli(&["sendrawtransaction", &tx_hex(&tx)]);
     node.generate(1, &mine_addr);
-    println!("PROOF 6a: halt - V leaves the covenant: {txid}");
+    println!(
+        "PROOF 11a: issuer update pi7->pi8: alice cannot RECEIVE until height {far}: {txid}"
+    );
+    verifier_op = OutPoint::new(Txid::from_str(&txid).unwrap(), 0);
+    let (o, v) = node.find_vout(&txid, &fee_spk);
+    fee = Utxo { outpoint: o, value: v };
+
+    let partial = make_req(alice, &alice_a, bob, alice_a.value / 4, verifier_op, &fee);
+    assert_eq!(partial.locktime, 0, "no height is claimed, and none is needed");
+    let (tx, _) = complete_transfer(&ctx8, &partial, &alice_sk, &fee_sk, true)
+        .expect("change is not an acquisition, so alice's receive window does not bind it");
+    let txid = node.cli(&["sendrawtransaction", &tx_hex(&tx)]);
+    node.generate(1, &mine_addr);
+    println!(
+        "PROOF 11b: alice spends a quarter of her UTXO and keeps the change, while \
+         under a receive window that does not open for {} blocks: {txid}",
+        far - here
+    );
+    verifier_op = OutPoint::new(Txid::from_str(&txid).unwrap(), 0);
+    let (o, v) = node.find_vout(&txid, &cu_alice.script_pubkey);
+    alice_a = Utxo { outpoint: o, value: v };
+    let (o, v) = node.find_vout(&txid, &fee_spk);
+    fee = Utxo { outpoint: o, value: v };
+
+    // ...and the window still binds a real acquisition. Bob paying alice is
+    // refused, which is the half of the rule that must keep working.
+    let to_alice = make_req(bob, &bob_a, alice, 1_000_000, verifier_op, &fee);
+    let err = complete_transfer(&ctx8, &to_alice, &bob_sk, &fee_sk, true)
+        .err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(
+        err.contains(&far.to_string()),
+        "a payment TO a holder inside their receive window must still be refused: {err}"
+    );
+    println!("PROOF 11c: paying alice is still refused while her window is shut: {err}");
+
+    // ================= 6. HALT (last: it ends all transfers)
+    //
+    // A halt BURNS the verifier asset. Confinement rests on an invariant no
+    // covenant can check - q of V never exists outside a verifier covenant - and
+    // parking V at an ordinary address breaks it: whoever holds that key can put
+    // it at input zero and let any holder spend their C_U with no policy applied.
+    // An OP_RETURN output can never be an input, so a burn leaves no such output
+    // in existence.
+    let halt = IssuerReq::halt_to_burn(
+        verifier_op,
+        (fee.outpoint, policy_asset, fee.value),
+        fee_key,
+        fee_amount,
+        fee_spk.clone(),
+    );
+    assert!(!halt.halt_leaves_live_verifier_asset());
+    let tx = complete_issuer_op(&ctx8, None, &halt, &issuer_sk, &fee_sk).expect("halt");
+    let txid = node.cli(&["sendrawtransaction", &tx_hex(&tx)]);
+    node.generate(1, &mine_addr);
+    println!("PROOF 6a: halt - V is burned to OP_RETURN, not parked: {txid}");
     let halted_op = OutPoint::new(Txid::from_str(&txid).unwrap(), 0);
     let (o, v) = node.find_vout(&txid, &fee_spk);
     fee = Utxo { outpoint: o, value: v };
 
+    // The burned output is not in the UTXO set at all, so there is nothing to
+    // put at input zero: A is frozen, which is what a halt is supposed to mean.
+    let gone = node.cli(&["gettxout", &txid, "0"]);
+    assert!(
+        gone.trim().is_empty() || gone.trim() == "null",
+        "an OP_RETURN output must not be in the UTXO set: {gone}"
+    );
+    println!("PROOF 6c: the burned verifier output is not in the UTXO set at all");
+
     let post = make_req(alice, &alice_a, carol, 10_000_000, halted_op, &fee);
-    let (tx, _) = complete_transfer(&ctx7, &post, &alice_sk, &fee_sk, false)
+    let (tx, _) = complete_transfer(&ctx8, &post, &alice_sk, &fee_sk, false)
         .expect("assembles unvalidated");
     let reason = reject_reason(&node, &tx);
     println!("PROOF 6b: node rejects any transfer after the halt: {reason}");
@@ -993,17 +1145,29 @@ fn bad_witness_cannot_be_pruned() {
         recipient_spk_override: None,
     };
     let built = build_transfer(&ctx, &req).unwrap();
-    let mut slots = opendamp::txbuild::verifier_slots(&ctx, &built).unwrap();
-    // Alice's key with BOB's membership proof: the script check still passes, so
-    // only the whitelist fold can reject it.
-    let bobs_proof = ctx.wl_tree.prove(&bob.serialize()).unwrap();
-    if let Some((k, _, iv)) = slots.inputs[0].clone() {
-        slots.inputs[0] = Some((k, bobs_proof, iv));
-    }
-    let (_, p_cb, _) = cv_spend_info(ctx.p_cmr(), ctx.g_cmr());
-    let env = covenant_env(&net, &built.tx, &built.prevouts, 0, ctx.p_cmr(), p_cb.clone());
+    let slots = opendamp::txbuild::verifier_slots(&ctx, &built).unwrap();
+    // Alice's inputs with BOB's membership proof presented as the sender: the
+    // per-input script check binds each input to C_U(sender), so claiming bob's
+    // identity for alice's coins fails there, and the fold fails too.
+    let bad_sender = opendamp::programs::SenderWitness {
+        key: alice,
+        proof: ctx.wl_tree.prove(&bob.serialize()).unwrap(),
+    };
+    let shape = built.shape;
+    let p_cb = ctx.verifier_spend().control_for(shape).unwrap().clone();
+    let env = covenant_env(
+        &net, &built.tx, &built.prevouts, 0, ctx.p_cmr(shape).unwrap(), p_cb.clone(),
+    );
     let mut tx = built.tx.clone();
-    let pruned = attach_verifier(&mut tx, &ctx.verifier, &slots, Some(&env), &p_cb);
+    let pruned = attach_verifier(
+        &mut tx,
+        ctx.verifier_for(shape).unwrap(),
+        shape,
+        &bad_sender,
+        &slots,
+        Some(&env),
+        &p_cb,
+    );
     assert!(
         pruned.is_err(),
         "a witness with a mismatched membership proof must not prune"

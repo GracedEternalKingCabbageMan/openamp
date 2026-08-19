@@ -13,17 +13,23 @@ import (
 )
 
 // goldenSnapshot builds the fixed, fully populated snapshot the goldens pin:
-// one blacklisted outpoint, one whitelisted owner key, a limit and a window.
+// one blacklisted outpoint, one whitelisted owner key and a limit.
+//
+// It is dmt-v1, which is now the only format. There is no windows array: a
+// height bound belongs to the holder it binds, inside that holder's whitelist
+// leaf, and the separate class-keyed array no shipped covenant reads is refused.
 func goldenSnapshot(t *testing.T) *Snapshot {
 	t.Helper()
-	bl := NewSMT()
 	k1 := OutpointKey(rep(0x44), 0)
-	bl.Insert(k1)
-	blRoot := bl.Root()
-	wl := NewSMT()
+	blRoot, err := BlacklistRoot([][32]byte{k1})
+	if err != nil {
+		t.Fatal(err)
+	}
 	owner := rep(0x55)
-	wl.Insert(owner)
-	wlRoot := wl.Root()
+	wlRoot, err := WhitelistRoot([][32]byte{owner})
+	if err != nil {
+		t.Fatal(err)
+	}
 	limit := uint64(500000)
 	s := &Snapshot{
 		V:             1,
@@ -32,12 +38,11 @@ func goldenSnapshot(t *testing.T) *Snapshot {
 		Q:             1000,
 		Seq:           0,
 		PrevPi:        nil,
-		Tree:          TreeSMTv1,
+		Tree:          TreeDMTv1,
 		Predicates: Predicates{
 			Blacklist: PredicateList{Root: hex.EncodeToString(blRoot[:]), Entries: KeyEntries([]string{hex.EncodeToString(k1[:])})},
 			Whitelist: PredicateList{Root: hex.EncodeToString(wlRoot[:]), Entries: KeyEntries([]string{hex.EncodeToString(owner[:])})},
 			Limit:     &limit,
-			Windows:   []Window{{Class: "regS", From: 100, Until: 5000}},
 		},
 	}
 	pi, err := s.ComputePi()
@@ -52,8 +57,8 @@ func goldenSnapshot(t *testing.T) *Snapshot {
 // Regenerate only for a deliberate, versioned format break: deployed
 // snapshots are content-addressed by this exact serialization.
 const (
-	goldenSnapCanonical = `{"asset":"1111111111111111111111111111111111111111111111111111111111111111","pi":"37071e69e8a360ec9dea456788a74a627228d1a83495073ca5d7fb6eaa2d23a7","predicates":{"blacklist":{"entries":["dead7603eb8f756e0eb3afc21be8c6595b9be48c0f362de122dbb649f2005aad"],"root":"465343f213d06c8bab3b4d2cc711433472db9633df15e6e6ec7ea3a58282afd1"},"limit":500000,"whitelist":{"entries":["5555555555555555555555555555555555555555555555555555555555555555"],"root":"1d0a8871fd268940bcd59ae3a46265d43d3a6f1a4c06826ea0fff13f9caa1cab"},"windows":[{"class":"regS","from":100,"until":5000}]},"prev_pi":null,"q":1000,"seq":0,"tree":"smt-v1","v":1,"verifier_asset":"9999999999999999999999999999999999999999999999999999999999999999"}`
-	goldenSnapHash      = "915539b157f3bbc82fa8a5303fc2f02745dd3d76ae867aad18738897d06283d1"
+	goldenSnapCanonical = `{"asset":"1111111111111111111111111111111111111111111111111111111111111111","pi":"7bdf6d16e0972d0d5324cdc78c3dd4b6553e5c3c50fb17d33e67ecc1917863e5","predicates":{"blacklist":{"entries":["dead7603eb8f756e0eb3afc21be8c6595b9be48c0f362de122dbb649f2005aad"],"root":"499599756f50dd571eafdf0eba9cf6cd40a549934f23c98721c6b03e7e02657e"},"limit":500000,"whitelist":{"entries":["5555555555555555555555555555555555555555555555555555555555555555"],"root":"fb2b848c2ac275155613e3c9f01a2dac9d04e52ad0882fd40bc5e93c1f44fe2d"},"windows":null},"prev_pi":null,"q":1000,"seq":0,"tree":"dmt-v1","v":1,"verifier_asset":"9999999999999999999999999999999999999999999999999999999999999999"}`
+	goldenSnapHash      = "165420c88662e76ab319d09b88b02f38290efc27f5bd50cf08a3e61d3777c998"
 )
 
 // TestSnapshotCanonicalGolden pins the canonical bytes, the hash, and the pi
@@ -77,7 +82,7 @@ func TestSnapshotCanonicalGolden(t *testing.T) {
 	if hex.EncodeToString(h[:]) != goldenSnapHash {
 		t.Fatalf("snapshot hash changed:\n got  %x\n want %s", h, goldenSnapHash)
 	}
-	if s.Pi != "37071e69e8a360ec9dea456788a74a627228d1a83495073ca5d7fb6eaa2d23a7" {
+	if s.Pi != "7bdf6d16e0972d0d5324cdc78c3dd4b6553e5c3c50fb17d33e67ecc1917863e5" {
 		t.Fatalf("golden pi changed: %s", s.Pi)
 	}
 }
@@ -88,7 +93,7 @@ func TestSnapshotCanonicalGolden(t *testing.T) {
 func TestSnapshotCanonicalizationStability(t *testing.T) {
 	// Field order A: the golden order. Field order B: reversed top-level and
 	// nested orders, plus a bogus issuer_sig that canonicalization must drop.
-	orderB := `{"verifier_asset":"9999999999999999999999999999999999999999999999999999999999999999","v":1,"tree":"smt-v1","seq":0,"q":1000,"prev_pi":null,"predicates":{"windows":[{"until":5000,"from":100,"class":"regS"}],"whitelist":{"root":"1d0a8871fd268940bcd59ae3a46265d43d3a6f1a4c06826ea0fff13f9caa1cab","entries":["5555555555555555555555555555555555555555555555555555555555555555"]},"limit":500000,"blacklist":{"root":"465343f213d06c8bab3b4d2cc711433472db9633df15e6e6ec7ea3a58282afd1","entries":["dead7603eb8f756e0eb3afc21be8c6595b9be48c0f362de122dbb649f2005aad"]}},"pi":"37071e69e8a360ec9dea456788a74a627228d1a83495073ca5d7fb6eaa2d23a7","issuer_sig":"` + strings.Repeat("ab", 64) + `","asset":"1111111111111111111111111111111111111111111111111111111111111111"}`
+	orderB := `{"verifier_asset":"9999999999999999999999999999999999999999999999999999999999999999","v":1,"tree":"dmt-v1","seq":0,"q":1000,"prev_pi":null,"predicates":{"whitelist":{"root":"fb2b848c2ac275155613e3c9f01a2dac9d04e52ad0882fd40bc5e93c1f44fe2d","entries":["5555555555555555555555555555555555555555555555555555555555555555"]},"limit":500000,"blacklist":{"root":"499599756f50dd571eafdf0eba9cf6cd40a549934f23c98721c6b03e7e02657e","entries":["dead7603eb8f756e0eb3afc21be8c6595b9be48c0f362de122dbb649f2005aad"]}},"pi":"7bdf6d16e0972d0d5324cdc78c3dd4b6553e5c3c50fb17d33e67ecc1917863e5","issuer_sig":"` + strings.Repeat("ab", 64) + `","asset":"1111111111111111111111111111111111111111111111111111111111111111"}`
 	for i, in := range []string{goldenSnapCanonical, orderB} {
 		var s Snapshot
 		if err := json.Unmarshal([]byte(in), &s); err != nil {
@@ -182,10 +187,10 @@ func TestSnapshotValidateRefusals(t *testing.T) {
 		}, "inline entries are required"},
 		{"absent predicate with entries", func(s *Snapshot) {
 			s.Predicates.Blacklist.Root = ""
-		}, "must be fully absent"},
-		{"duplicate entry", func(s *Snapshot) {
+		}, "must carry a blacklist root"},
+		{"duplicate key", func(s *Snapshot) {
 			s.Predicates.Blacklist.Entries = append(s.Predicates.Blacklist.Entries, s.Predicates.Blacklist.Entries[0])
-		}, "duplicate entry"},
+		}, "duplicate key"},
 		{"malformed entry hex", func(s *Snapshot) {
 			s.Predicates.Blacklist.Entries[0] = PredicateEntry{Key: "zz"}
 		}, "must be 32-byte hex"},
@@ -205,17 +210,31 @@ func TestSnapshotValidateRefusals(t *testing.T) {
 	}
 }
 
-// TestSnapshotMinimal: a snapshot with every predicate absent validates, its
-// rules_root is the all-absent commitment, and enabled-but-empty stays
-// distinct from absent.
+// TestSnapshotMinimal: the leanest snapshot a covenant can answer to still
+// carries BOTH roots. There is no such thing as an absent whitelist or an
+// absent blacklist under dmt-v1: the covenant reads both on every transfer, so
+// "freeze nothing" is the empty interval tree's root like any other root, never
+// zeros, and a policy that omits one is malformed rather than permissive.
 func TestSnapshotMinimal(t *testing.T) {
+	blRoot, err := BlacklistRoot(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wlRoot, err := WhitelistRoot(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	s := &Snapshot{
 		V:             1,
 		Asset:         strings.Repeat("11", 32),
 		VerifierAsset: strings.Repeat("99", 32),
 		Q:             1,
 		Seq:           0,
-		Tree:          TreeSMTv1,
+		Tree:          TreeDMTv1,
+		Predicates: Predicates{
+			Blacklist: PredicateList{Root: hex.EncodeToString(blRoot[:])},
+			Whitelist: PredicateList{Root: hex.EncodeToString(wlRoot[:])},
+		},
 	}
 	pi, err := s.ComputePi()
 	if err != nil {
@@ -226,17 +245,16 @@ func TestSnapshotMinimal(t *testing.T) {
 		t.Fatalf("minimal snapshot must validate: %v", err)
 	}
 
-	// Enabled-but-empty blacklist (root = EmptyRoot) commits differently from
-	// an absent one.
-	s2 := *s
-	er := EmptyRoot()
-	s2.Predicates.Blacklist = PredicateList{Root: hex.EncodeToString(er[:])}
-	pi2, err := s2.ComputePi()
-	if err != nil {
-		t.Fatal(err)
+	// An empty blacklist is not a zero commitment.
+	if blRoot == [32]byte{} {
+		t.Fatal("the empty blacklist must commit to the guard interval, not to zeros")
 	}
-	if hex.EncodeToString(pi2[:]) == s.Pi {
-		t.Fatal("enabled-but-empty predicate must commit differently from absent")
+
+	// Dropping a root is malformed, not permissive.
+	s2 := *s
+	s2.Predicates.Blacklist = PredicateList{}
+	if err := s2.Validate(); err == nil {
+		t.Fatal("a dmt-v1 snapshot without a blacklist root must be refused")
 	}
 }
 
@@ -466,22 +484,33 @@ func wlKey(t *testing.T, hexKey string) [32]byte {
 	return [32]byte(b)
 }
 
-// TestSnapshotSMTv1StillWorks: adding dmt-v1 changed nothing about the M2
-// document format. The golden snapshot is the pinned smt-v1 shape.
-func TestSnapshotSMTv1StillWorks(t *testing.T) {
+// TestSnapshotOnlyDMTv1IsAccepted: dmt-v1 is the one format, and anything else
+// is refused by name rather than half-checked.
+func TestSnapshotOnlyDMTv1IsAccepted(t *testing.T) {
 	s := goldenSnapshot(t)
-	if s.Tree != TreeSMTv1 {
-		t.Fatal("the golden snapshot is the smt-v1 shape")
+	if s.Tree != TreeDMTv1 {
+		t.Fatal("the golden snapshot is the dmt-v1 shape")
 	}
 	if err := s.Validate(); err != nil {
-		t.Fatalf("smt-v1 validation regressed: %v", err)
+		t.Fatalf("dmt-v1 validation regressed: %v", err)
+	}
+	for _, tree := range []string{"smt-v1", "cmt-v1", ""} {
+		bad := *s
+		bad.Tree = tree
+		err := bad.Validate()
+		if err == nil {
+			t.Fatalf("tree %q must be refused: no covenant can verify against it", tree)
+		}
+		if !strings.Contains(err.Error(), "dmt-v1") {
+			t.Fatalf("the refusal must name the format that does work: %v", err)
+		}
 	}
 	c, err := s.CanonicalJSON()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if string(c) != goldenSnapCanonical {
-		t.Fatalf("smt-v1 canonical bytes drifted:\n got: %s\nwant: %s", c, goldenSnapCanonical)
+		t.Fatalf("dmt-v1 canonical bytes drifted:\n got: %s\nwant: %s", c, goldenSnapCanonical)
 	}
 	// And an unknown tree is still refused, now naming both supported values.
 	s.Tree = "cmt-v1"

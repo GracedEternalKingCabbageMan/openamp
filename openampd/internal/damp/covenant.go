@@ -24,10 +24,17 @@ const PolicyVersion = 0x01
 // and therefore a different address, so these are loaded from a file the
 // operator controls rather than guessed, and the loader refuses partial sets.
 type ProgramRegistry struct {
-	UserCMR     [32]byte
-	VerifierCMR [32]byte
-	IssuerCMR   [32]byte
+	UserCMR [32]byte
+	// One primary program per transaction SHAPE, in menu order with the
+	// canonical shape first. They all commit to the same policy and all live in
+	// the one C_V(pi) address; see elements.VerifierCovenant.
+	VerifierCMRs [][32]byte
+	IssuerCMR    [32]byte
 }
+
+// VerifierCMR is the canonical shape's CMR, which is the one a wallet uses for
+// an ordinary transfer.
+func (r *ProgramRegistry) VerifierCMR() [32]byte { return r.VerifierCMRs[0] }
 
 // LoadProgramRegistry reads the CMR pinning file produced by `opendamp
 // registry` (or the vectors file, which carries the same fields under
@@ -37,36 +44,57 @@ func LoadProgramRegistry(path string) (*ProgramRegistry, error) {
 	if err != nil {
 		return nil, fmt.Errorf("program registry: %w", err)
 	}
+	type shapeDoc struct {
+		Shape string `json:"shape"`
+		CMR   string `json:"cmr"`
+	}
 	var doc struct {
 		Programs struct {
-			UCMR string `json:"u_cmr"`
-			PCMR string `json:"p_cmr"`
-			GCMR string `json:"g_cmr"`
+			UCMR   string     `json:"u_cmr"`
+			PCMR   string     `json:"p_cmr_canonical"`
+			GCMR   string     `json:"g_cmr"`
+			Shapes []shapeDoc `json:"verifier_shapes"`
 		} `json:"programs"`
-		UCMR string `json:"u_cmr"`
-		PCMR string `json:"p_cmr"`
-		GCMR string `json:"g_cmr"`
+		UCMR   string     `json:"u_cmr"`
+		PCMR   string     `json:"p_cmr_canonical"`
+		GCMR   string     `json:"g_cmr"`
+		Shapes []shapeDoc `json:"verifier_shapes"`
 	}
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		return nil, fmt.Errorf("program registry: %w", err)
 	}
-	u, p, g := doc.Programs.UCMR, doc.Programs.PCMR, doc.Programs.GCMR
-	if u == "" && p == "" && g == "" {
-		u, p, g = doc.UCMR, doc.PCMR, doc.GCMR
+	u, g, shapes := doc.Programs.UCMR, doc.Programs.GCMR, doc.Programs.Shapes
+	if u == "" && g == "" && len(shapes) == 0 {
+		u, g, shapes = doc.UCMR, doc.GCMR, doc.Shapes
 	}
-	if u == "" || p == "" || g == "" {
-		return nil, fmt.Errorf("program registry %s: needs u_cmr, p_cmr and g_cmr", path)
+	if u == "" || g == "" || len(shapes) == 0 {
+		return nil, fmt.Errorf(
+			"program registry %s: needs u_cmr, g_cmr and a non-empty verifier_shapes menu. "+
+				"A file carrying a single p_cmr predates the shape menu: regenerate it with "+
+				"`opendamp vectors`, because a one-leaf taptree is a different address",
+			path)
 	}
 	reg := &ProgramRegistry{}
-	for _, f := range []struct {
-		hex string
-		dst *[32]byte
-	}{{u, &reg.UserCMR}, {p, &reg.VerifierCMR}, {g, &reg.IssuerCMR}} {
-		b, err := hex.DecodeString(f.hex)
+	dec := func(field, h string, dst *[32]byte) error {
+		b, err := hex.DecodeString(h)
 		if err != nil || len(b) != 32 {
-			return nil, fmt.Errorf("program registry: %q is not a 32-byte CMR", f.hex)
+			return fmt.Errorf("program registry: %s %q is not a 32-byte CMR", field, h)
 		}
-		copy(f.dst[:], b)
+		copy(dst[:], b)
+		return nil
+	}
+	if err := dec("u_cmr", u, &reg.UserCMR); err != nil {
+		return nil, err
+	}
+	if err := dec("g_cmr", g, &reg.IssuerCMR); err != nil {
+		return nil, err
+	}
+	for _, sh := range shapes {
+		var c [32]byte
+		if err := dec("verifier_shapes["+sh.Shape+"]", sh.CMR, &c); err != nil {
+			return nil, err
+		}
+		reg.VerifierCMRs = append(reg.VerifierCMRs, c)
 	}
 	return reg, nil
 }

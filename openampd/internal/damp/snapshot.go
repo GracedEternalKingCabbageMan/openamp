@@ -235,61 +235,6 @@ func parseHex32(field, s string) ([32]byte, error) {
 	return out, nil
 }
 
-// predicateRoot recomputes a list predicate's commitment from its inline
-// entries and checks it against the declared root. It returns the 32-byte
-// commitment RulesRoot consumes: zeros for an absent predicate, the smt-v1
-// root otherwise.
-func predicateRoot(name string, p PredicateList) ([32]byte, error) {
-	if p.Root == "" {
-		if len(p.Entries) != 0 || p.URL != "" {
-			return [32]byte{}, fmt.Errorf("%s: entries/url present but root empty (absent predicate must be fully absent)", name)
-		}
-		return [32]byte{}, nil
-	}
-	declared, err := parseHex32(name+".root", p.Root)
-	if err != nil {
-		return [32]byte{}, err
-	}
-	if p.URL != "" && len(p.Entries) == 0 {
-		return [32]byte{}, fmt.Errorf("%s: url-only lists are not accepted; inline entries are required so the root is recomputable", name)
-	}
-	tree := NewSMT()
-	for i, e := range p.Entries {
-		// smt-v1 leaves are bare keys: there is no leaf shape for a height bound, so
-		// accepting one would commit a root that omits it and imply a window nothing
-		// enforces.
-		if !e.Unbounded() {
-			return [32]byte{}, fmt.Errorf("%s.entries[%d]: height bounds are a dmt-v1 leaf field; an smt-v1 document has nowhere to commit them", name, i)
-		}
-		k, err := parseHex32(fmt.Sprintf("%s.entries[%d]", name, i), e.Key)
-		if err != nil {
-			return [32]byte{}, err
-		}
-		if tree.Has(k) {
-			return [32]byte{}, fmt.Errorf("%s.entries[%d]: duplicate entry %s", name, i, e.Key)
-		}
-		tree.Insert(k)
-	}
-	if got := tree.Root(); got != declared {
-		return [32]byte{}, fmt.Errorf("%s.root mismatch: declared %s, entries hash to %x", name, p.Root, got)
-	}
-	return declared, nil
-}
-
-// WindowsHash commits a non-empty windows array:
-// H_"OpenDAMP/windows/v1"(canonical JSON of the array). An empty or nil
-// array commits to 32 zero bytes (predicate absent).
-func WindowsHash(windows []Window) ([32]byte, error) {
-	if len(windows) == 0 {
-		return [32]byte{}, nil
-	}
-	c, err := canonicalize(windows)
-	if err != nil {
-		return [32]byte{}, err
-	}
-	return taggedHash(TagWindows, c), nil
-}
-
 // dmtDeclaredRoot is the shared preamble of both dmt-v1 predicate roots: an
 // absent predicate is fully absent, a present one declares a root and carries
 // inline entries so that root is recomputable.
@@ -423,40 +368,14 @@ func (s *Snapshot) computePiDMT() ([32]byte, error) {
 	return PiCovenant(internal, s.Seq, RulesRootCovenant(bl, wl, limit, nil)), nil
 }
 
-// ComputePi derives the policy commitment the snapshot's contents imply. Which
-// construction applies is selected by the tree field: dmt-v1 is the covenant's
-// own commitment (computePiDMT), smt-v1 is the M2 document commitment below.
+// ComputePi derives the policy commitment the snapshot's contents imply. There
+// is one construction, the covenant's own: a snapshot that is not dmt-v1 is
+// refused by Validate before it gets here.
 func (s *Snapshot) ComputePi() ([32]byte, error) {
-	if s.Tree == TreeDMTv1 {
-		return s.computePiDMT()
+	if s.Tree != TreeDMTv1 {
+		return [32]byte{}, fmt.Errorf("tree %q is not %q", s.Tree, TreeDMTv1)
 	}
-	blRoot, err := predicateRoot("predicates.blacklist", s.Predicates.Blacklist)
-	if err != nil {
-		return [32]byte{}, err
-	}
-	wlRoot, err := predicateRoot("predicates.whitelist", s.Predicates.Whitelist)
-	if err != nil {
-		return [32]byte{}, err
-	}
-	var limit uint64
-	if s.Predicates.Limit != nil {
-		limit = *s.Predicates.Limit
-	}
-	wh, err := WindowsHash(s.Predicates.Windows)
-	if err != nil {
-		return [32]byte{}, err
-	}
-	asset, err := parseHex32("asset", s.Asset)
-	if err != nil {
-		return [32]byte{}, err
-	}
-	header := PolicyHeader{
-		Version:   uint8(s.V),
-		Asset:     asset,
-		Seq:       s.Seq,
-		RulesRoot: RulesRoot(blRoot, wlRoot, limit, wh),
-	}
-	return header.Commitment(), nil
+	return s.computePiDMT()
 }
 
 // Validate checks the snapshot's internal consistency: version and tree, hex
@@ -469,7 +388,6 @@ func (s *Snapshot) Validate() error {
 		return fmt.Errorf("v must be 1, got %d", s.V)
 	}
 	switch s.Tree {
-	case TreeSMTv1:
 	case TreeDMTv1:
 		// The consensus-bearing format. Both list predicates are real: the covenant
 		// reads a whitelist root AND a blacklist root, so both must be present and
@@ -498,7 +416,11 @@ func (s *Snapshot) Validate() error {
 			}
 		}
 	default:
-		return fmt.Errorf("tree %q not supported (this library implements %q and %q)", s.Tree, TreeDMTv1, TreeSMTv1)
+		return fmt.Errorf(
+			"tree %q not supported: %q is the only format any covenant verifies against. "+
+				"The design document once reserved smt-v1 and cmt-v1; neither fits the "+
+				"Simplicity budget, and a snapshot declaring one would commit funds to an "+
+				"address no holder could spend", s.Tree, TreeDMTv1)
 	}
 	if _, err := parseHex32("verifier_asset", s.VerifierAsset); err != nil {
 		return err

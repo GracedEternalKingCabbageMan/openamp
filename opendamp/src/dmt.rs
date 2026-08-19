@@ -8,6 +8,7 @@
 //!   slots n+1..65535 = GUARD_HI (32 x 0xff)
 //!   leaf(entry) = SHA256(0x00 || key || BE32(send_after) || BE32(recv_after))
 //!   node(l,r)   = SHA256(0x01 || l || r)   (no sorting: positional)
+//!   guard(k)    = SHA256(0x03 || k)        (structural padding, NOT a key)
 //!
 //! Membership proof: 16 sibling hashes bottom-up plus the leaf index (whose
 //! bit j says the running node is the right child at level j).
@@ -62,9 +63,29 @@ pub fn leaf_hash(entry: &Entry) -> [u8; 32] {
     ])
 }
 
-/// Leaf of a guard slot: the guard key with no windows.
+/// Leaf of a guard slot.
+///
+/// Guards exist to make the sorted sequence total -- every real key has a
+/// predecessor and a successor inside the tree -- and for nothing else. They are
+/// hashed under their OWN domain byte (0x03) rather than as key leaves, and that
+/// is a security property, not tidiness.
+///
+/// Under the original construction a guard was `leaf_hash(Entry::unrestricted(
+/// GUARD_LO or GUARD_HI))`: an ordinary 0x00-domain key leaf with unrestricted
+/// windows, sitting at slot 0 and in every padding slot. It therefore had a
+/// valid membership proof against the live whitelist root, and the covenant
+/// could not tell it apart from an approved key, because a recipient key enters
+/// C_U(Y) only through `H_TapData(Y)` -- a plain hash, which does not require Y
+/// to be a point on the curve. A holder could pay regulated units to
+/// `C_U(0xff..ff)`, satisfy confinement, the whitelist and the receive window,
+/// and destroy them permanently: neither guard is a valid x-only key, so U's
+/// `bip_0340_verify` can never succeed on that output, and v1 has no clawback
+/// and no redemption branch that could recover it.
+///
+/// Domain separation closes it at zero cost to the covenant, which still hashes
+/// exactly one domain byte per leaf. No 0x03 leaf can satisfy `wl_leaf`.
 fn guard_leaf(key: [u8; 32]) -> [u8; 32] {
-    leaf_hash(&Entry::unrestricted(key))
+    sha256_all(&[&[0x03], &key])
 }
 
 /// dmt-v1 INTERVAL leaf: `SHA256(0x02 || lo || hi)`. Used by the blacklist tree,
@@ -154,14 +175,15 @@ impl Tree {
         self.levels[DEPTH][0]
     }
 
-    /// Slot index of `key`, if present (guards are provable members too).
+    /// Slot index of `key`, if present.
+    ///
+    /// Guard values are NOT members: they occupy slots, but under domain 0x03,
+    /// so no proof of one can be exhibited as an approved key. Returning `None`
+    /// here keeps the library from manufacturing a proof the covenant would
+    /// reject anyway, and keeps `Tree` and the covenant agreeing on membership.
     pub fn slot_of(&self, key: &[u8; 32]) -> Option<u16> {
-        if *key == GUARD_LO {
-            return Some(0);
-        }
-        if *key == GUARD_HI {
-            // First padding slot.
-            return u16::try_from(self.entries.len() + 1).ok();
+        if *key == GUARD_LO || *key == GUARD_HI {
+            return None;
         }
         self.entries
             .binary_search_by_key(key, |e| e.key)
@@ -169,10 +191,10 @@ impl Tree {
             .map(|i| (i + 1) as u16)
     }
 
-    /// The committed entry for `key`, if approved.
+    /// The committed entry for `key`, if approved. Guards are not approved.
     pub fn entry_of(&self, key: &[u8; 32]) -> Option<Entry> {
         if *key == GUARD_LO || *key == GUARD_HI {
-            return Some(Entry::unrestricted(*key));
+            return None;
         }
         self.entries
             .binary_search_by_key(key, |e| e.key)
@@ -385,7 +407,7 @@ mod tests {
     fn membership_roundtrip() {
         let tree = Tree::new(vec![e(3), e(1), e(2)]).unwrap();
         let root = tree.root();
-        for key in [k(1), k(2), k(3), GUARD_LO, GUARD_HI] {
+        for key in [k(1), k(2), k(3)] {
             let proof = tree.prove(&key).expect("member");
             assert!(verify(&root, &key, &proof), "proof verifies");
         }
@@ -408,22 +430,56 @@ mod tests {
         assert!(Tree::new(vec![Entry::unrestricted(GUARD_HI)]).is_err());
     }
 
+    /// A guard slot must not be exhibitable as an approved key.
+    ///
+    /// It used to be. Both guards were ordinary 0x00-domain key leaves with
+    /// unrestricted windows, so `prove` returned a proof for either and the
+    /// covenant accepted it -- and because a recipient key reaches C_U(Y) only
+    /// through a hash, Y did not have to be a valid point. Paying regulated
+    /// units to C_U(GUARD_HI) therefore passed confinement, the whitelist and
+    /// the receive window, and burned them beyond any recovery the protocol has.
+    #[test]
+    fn guards_are_not_approved_keys() {
+        let tree = Tree::new(vec![e(1), e(2)]).unwrap();
+        let root = tree.root();
+        for guard in [GUARD_LO, GUARD_HI] {
+            assert!(tree.slot_of(&guard).is_none(), "a guard occupies no key slot");
+            assert!(tree.entry_of(&guard).is_none(), "a guard is not an entry");
+            assert!(tree.prove(&guard).is_none(), "a guard has no membership proof");
+            // And a hand-built proof cannot be made to verify either, because the
+            // guard slot hashes under a domain no key leaf can produce.
+            let forged = Proof {
+                entry: Entry::unrestricted(guard),
+                path: Path { siblings: [[0u8; 32]; DEPTH], index: 0 },
+            };
+            assert!(!verify(&root, &guard, &forged));
+        }
+        // The separation is the domain byte, and it is total.
+        assert_ne!(guard_leaf(GUARD_HI), leaf_hash(&Entry::unrestricted(GUARD_HI)));
+        assert_ne!(guard_leaf(GUARD_LO), leaf_hash(&Entry::unrestricted(GUARD_LO)));
+        assert_ne!(guard_leaf(GUARD_LO), interval_leaf_hash(&GUARD_LO, &GUARD_LO));
+    }
+
     /// Golden vectors pinning the format. The Go mirror in gomirror/dmt
     /// asserts the same literals, and SPEC-dmt-v1.md section 6 quotes them; a
     /// change here is a consensus-visible format change.
     #[test]
     fn golden_vectors() {
+        // Guard slots hash under their own domain byte (0x03), which is what
+        // stops one being exhibited as an approved key. These moved when that
+        // landed; the Go mirror and SPEC-dmt-v1.md section 6 quote the same
+        // literals.
         assert_eq!(
-            crate::hexutil::hex(&leaf_hash(&Entry::unrestricted(GUARD_LO))),
-            "9e1736c43d19118e6ce4302118af337109491ecc52757dfb949bad6a7940b0c2"
+            crate::hexutil::hex(&guard_leaf(GUARD_LO)),
+            "7324b5c72b51bb5d4c180f1109cfd347b60473882145841c39f3e584576296f9"
         );
         assert_eq!(
-            crate::hexutil::hex(&leaf_hash(&Entry::unrestricted(GUARD_HI))),
-            "dc8c3b446f21ee93e5ea4d016c916e8ffd952e3f594462fe0f2a0befe3580c59"
+            crate::hexutil::hex(&guard_leaf(GUARD_HI)),
+            "393363907768ca818617437791eeca0978c26a33c85a0ba2596ba50a72db6535"
         );
         assert_eq!(
             crate::hexutil::hex(&Tree::new(vec![]).unwrap().root()),
-            "b883626f07bded09c45c76719b43e85945c0ac41ee370d47932f269dd6eabfed"
+            "0aaadc74dfaa97f90c332b98884c3afecc5c5a54ae2344cab430fb2f77118e0b"
         );
 
         // The three-key whitelist of examples/snapshot-seq0.json, supplied out
@@ -440,7 +496,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             crate::hexutil::hex(&tree.root()),
-            "66327e6c8cf6cfff8e1c0661e2469d4aa5ae5aa65206003f6758ff1180619a50"
+            "4c99d9aa10b63129d71502a17e2c483b168fc2e6a7cab08aff82b3ca01d00eed"
         );
         assert_eq!(tree.slot_of(&alice), Some(1));
         assert_eq!(tree.slot_of(&carol), Some(2));

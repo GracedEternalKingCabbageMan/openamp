@@ -17,7 +17,9 @@ domains share the same node hashing and depth:
 - **key leaves** (`0x00`), used by the whitelist, prove membership of a key AND
   the two height windows committed for it (section 9);
 - **interval leaves** (`0x02`), used by the blacklist, prove *non*-membership of
-  a key by exhibiting the gap that contains it (section 7).
+  a key by exhibiting the gap that contains it (section 7);
+- **guard leaves** (`0x03`), structural padding that is provably not a key
+  (section 3).
 
 Both predicates are enforced in-covenant.
 
@@ -45,15 +47,18 @@ Let `k_1 < k_2 < ... < k_n` be the entries' keys, sorted **ascending by unsigned
 bytewise comparison** of their 32-byte encoding, and deduplicated. Then:
 
 ```
-slot 0            = GUARD_LO = 00 * 32,  windows (0, 0)
-slot i (1..=n)    = entry with key k_i
-slot n+1 .. 65535 = GUARD_HI = ff * 32,  windows (0, 0)
+slot 0            = guard(GUARD_LO), GUARD_LO = 00 * 32
+slot i (1..=n)    = leaf(entry with key k_i)
+slot n+1 .. 65535 = guard(GUARD_HI), GUARD_HI = ff * 32
 ```
 
 The guards make the sorted sequence total: every real key has a predecessor and
 a successor inside the tree, which is exactly what an adjacency (non-membership)
-proof needs. A key equal to `GUARD_LO` or `GUARD_HI` is **rejected** at build
-time, as is a duplicate key: both would make slot assignment ambiguous.
+proof needs. They are hashed as guard leaves, not key leaves, so a guard is
+**not a member**: `slot_of`, `entry_of` and `prove` all return nothing for one,
+and a hand-built proof cannot verify. A key equal to `GUARD_LO` or `GUARD_HI` is
+**rejected** at build time, as is a duplicate key: both would make slot
+assignment ambiguous.
 
 ## 3. Hashing
 
@@ -67,7 +72,21 @@ leaf(entry)       = SHA256( 0x00 || key
                             || BE32(send_after) || BE32(recv_after) )  (41 bytes)
 node(left,right)  = SHA256( 0x01 || left || right )                    (65 bytes)
 interval(lo,hi)   = SHA256( 0x02 || lo || hi )                         (65 bytes)
+guard(key)        = SHA256( 0x03 || key )                              (33 bytes)
 ```
+
+**Guards hash under their own domain byte, and that is a security property.**
+Guards exist to make the sorted sequence total -- every real key has a
+predecessor and a successor inside the tree -- and for nothing else. Until
+2026-08-19 a guard slot held `leaf(Entry{key, 0, 0})`: an ordinary key leaf, so
+it had a valid membership proof against the live whitelist root, and the
+covenant could not tell it from an approved key. A recipient key reaches
+`C_U(Y)` only through `H_TapData(Y)`, a plain hash, so Y does not have to be a
+point on the curve -- and a holder could pay regulated units to
+`C_U(0xff..ff)`, satisfy confinement, the whitelist and the receive window, and
+destroy them permanently, because neither guard is a valid x-only key and v1 has
+no clawback. Under `0x03` no guard slot can satisfy the covenant's `wl_leaf`,
+and the covenant still hashes exactly one domain byte per leaf.
 
 A whitelist leaf commits the key **and** its windows. Hashing the key alone
 produces a different root and every proof fails at consensus; this is the most
@@ -146,12 +165,16 @@ Pinned in `vectors/addresses.json` (`dmt_v1` object) and asserted by both
 implementations' tests:
 
 ```
-GUARD_LO           = 0000...00  (32 bytes), windows (0, 0)
-GUARD_HI           = ffff...ff  (32 bytes), windows (0, 0)
-leaf(GUARD_LO)     = 9e1736c43d19118e6ce4302118af337109491ecc52757dfb949bad6a7940b0c2
-leaf(GUARD_HI)     = dc8c3b446f21ee93e5ea4d016c916e8ffd952e3f594462fe0f2a0befe3580c59
-root(empty tree)   = b883626f07bded09c45c76719b43e85945c0ac41ee370d47932f269dd6eabfed
+GUARD_LO           = 0000...00  (32 bytes)
+GUARD_HI           = ffff...ff  (32 bytes)
+guard(GUARD_LO)    = 7324b5c72b51bb5d4c180f1109cfd347b60473882145841c39f3e584576296f9
+guard(GUARD_HI)    = 393363907768ca818617437791eeca0978c26a33c85a0ba2596ba50a72db6535
+root(empty tree)   = 0aaadc74dfaa97f90c332b98884c3afecc5c5a54ae2344cab430fb2f77118e0b
 ```
+
+These moved on 2026-08-19 when guards took their own domain byte. The blacklist
+constants in section 7 did NOT move: that tree's guards are interval
+*endpoints*, values inside a `0x02` leaf, never leaves of their own.
 
 and for the three-key whitelist of `examples/snapshot-seq0.json`
 (alice `1b84c556…`, bob `4d4b6cd1…`, carol `462779ad…`):
@@ -159,7 +182,7 @@ and for the three-key whitelist of `examples/snapshot-seq0.json`
 (all three unrestricted, windows `(0, 0)`):
 
 ```
-root = 66327e6c8cf6cfff8e1c0661e2469d4aa5ae5aa65206003f6758ff1180619a50
+root = 4c99d9aa10b63129d71502a17e2c483b168fc2e6a7cab08aff82b3ca01d00eed
 slots: 0 = GUARD_LO
        1 = 1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f  (alice)
        2 = 462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b  (carol)

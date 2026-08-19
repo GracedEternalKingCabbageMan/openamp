@@ -101,6 +101,36 @@ func NodeHash(left, right [32]byte) [32]byte {
 	return out
 }
 
+// GuardLeafHash returns SHA256(0x03 || key), the leaf of a structural guard slot.
+//
+// Guards exist to make the sorted sequence total -- every real key has a
+// predecessor and a successor inside the tree -- and for nothing else. Hashing
+// them under their OWN domain byte rather than as key leaves is a security
+// property, not tidiness.
+//
+// Under the original construction a guard was LeafHash(Unrestricted(GuardLo or
+// GuardHi)): an ordinary 0x00-domain key leaf with unrestricted windows, sitting
+// at slot 0 and in every padding slot. It therefore had a valid membership proof
+// against the live whitelist root, and the covenant could not tell it apart from
+// an approved key, because a recipient key enters C_U(Y) only through
+// H_TapData(Y) -- a plain hash, which does not require Y to be a point on the
+// curve. A holder could pay regulated units to C_U(0xff..ff), satisfy
+// confinement, the whitelist and the receive window, and destroy them
+// permanently: neither guard is a valid x-only key, so U's BIP340 check can
+// never succeed on that output, and v1 has no clawback and no redemption branch.
+//
+// Domain separation closes it at zero cost to the covenant, which still hashes
+// exactly one domain byte per leaf. No 0x03 leaf can satisfy the covenant's
+// wl_leaf.
+func GuardLeafHash(key Key) [32]byte {
+	h := sha256.New()
+	h.Write([]byte{0x03})
+	h.Write(key[:])
+	var out [32]byte
+	copy(out[:], h.Sum(nil))
+	return out
+}
+
 // Path is the Merkle path of a leaf: 16 sibling hashes bottom-up plus the leaf
 // slot. Bit j of Index (LSB first) is 1 exactly when the running node at level j
 // is the right child.
@@ -194,14 +224,14 @@ func New(entries []Entry) (*Tree, error) {
 	}
 
 	pad := make([][32]byte, Depth+1)
-	pad[0] = LeafHash(Unrestricted(GuardHi))
+	pad[0] = GuardLeafHash(GuardHi)
 	for j := 0; j < Depth; j++ {
 		pad[j+1] = NodeHash(pad[j], pad[j])
 	}
 
 	levels := make([][][32]byte, Depth+1)
 	level0 := make([][32]byte, 0, len(sorted)+1)
-	level0 = append(level0, LeafHash(Unrestricted(GuardLo)))
+	level0 = append(level0, GuardLeafHash(GuardLo))
 	for _, e := range sorted {
 		level0 = append(level0, LeafHash(e))
 	}
@@ -229,10 +259,12 @@ func (t *Tree) Entries() []Entry {
 	return out
 }
 
-// EntryOf returns the committed entry for key, if approved.
+// EntryOf returns the committed entry for key, if approved. Guards are not
+// approved: they occupy slots, but under domain 0x03, so no proof of one can be
+// exhibited as an approved key.
 func (t *Tree) EntryOf(key Key) (Entry, bool) {
 	if key == GuardLo || key == GuardHi {
-		return Unrestricted(key), true
+		return Entry{}, false
 	}
 	i := sort.Search(len(t.entries), func(i int) bool {
 		return bytes.Compare(t.entries[i].Key[:], key[:]) >= 0
@@ -248,14 +280,11 @@ func (t *Tree) Root() [32]byte {
 	return t.levels[Depth][0]
 }
 
-// SlotOf returns the leaf slot of key and whether it is present. Both guards are
-// members: GuardLo is slot 0 and GuardHi is the first padding slot.
+// SlotOf returns the leaf slot of key and whether it is present. Guard values
+// are NOT members; see GuardLeafHash.
 func (t *Tree) SlotOf(key Key) (uint16, bool) {
-	if key == GuardLo {
-		return 0, true
-	}
-	if key == GuardHi {
-		return uint16(len(t.entries) + 1), true
+	if key == GuardLo || key == GuardHi {
+		return 0, false
 	}
 	i := sort.Search(len(t.entries), func(i int) bool {
 		return bytes.Compare(t.entries[i].Key[:], key[:]) >= 0
@@ -290,40 +319,6 @@ func (t *Tree) Prove(key Key) (*Proof, bool) {
 		idx >>= 1
 	}
 	return p, true
-}
-
-// Adjacent returns the two keys bracketing an absent key: the greatest member
-// below it and the least member above it, together with their proofs. This is
-// the non-membership (blacklist) construction of SPEC-dmt-v1.md section 7. It
-// is provided for the policy server; the covenant in this version does NOT
-// verify non-membership.
-func (t *Tree) Adjacent(key Key) (lo, hi Key, loProof, hiProof *Proof, ok bool) {
-	if _, present := t.SlotOf(key); present {
-		return lo, hi, nil, nil, false
-	}
-	// Slot sequence including guards: 0=GuardLo, 1..n=keys, n+1=GuardHi.
-	i := sort.Search(len(t.entries), func(i int) bool {
-		return bytes.Compare(t.entries[i].Key[:], key[:]) >= 0
-	})
-	// i is the count of real keys below `key`, so the predecessor is slot i and
-	// the successor is slot i+1 in the guarded sequence.
-	lo = GuardLo
-	if i > 0 {
-		lo = t.entries[i-1].Key
-	}
-	hi = GuardHi
-	if i < len(t.entries) {
-		hi = t.entries[i].Key
-	}
-	loProof, ok = t.Prove(lo)
-	if !ok {
-		return lo, hi, nil, nil, false
-	}
-	hiProof, ok = t.Prove(hi)
-	if !ok {
-		return lo, hi, nil, nil, false
-	}
-	return lo, hi, loProof, hiProof, true
 }
 
 // ---------------------------------------------------------------- blacklist

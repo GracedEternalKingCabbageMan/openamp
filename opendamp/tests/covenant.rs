@@ -71,10 +71,24 @@ fn programs_compile_and_have_stable_shape() {
     let cv = ctx.cv_info();
     assert_eq!(cu.script_pubkey.len(), 34);
     assert_eq!(cv.script_pubkey.len(), 34);
-    assert_ne!(ctx.u_cmr(), ctx.p_cmr());
     println!("U   CMR {}", ctx.u_cmr());
-    println!("P   CMR {}", ctx.p_cmr());
     println!("G   CMR {}", ctx.g_cmr());
+    // Every shape is a distinct program with a distinct CMR, and none of them
+    // collides with U or G. They all live in the one C_V address.
+    let mut cmrs = vec![ctx.u_cmr(), ctx.g_cmr()];
+    for shape in opendamp::programs::SHAPES {
+        let cmr = ctx.p_cmr(shape).expect("shape is in the menu");
+        println!("P   CMR {:>5} {}", shape.name(), cmr);
+        assert!(!cmrs.contains(&cmr), "{shape} duplicates another program's CMR");
+        cmrs.push(cmr);
+        // ...and each has its own control block against the same output key.
+        let cb = ctx.verifier_spend().control_for(shape).expect("control block");
+        assert!(cb.verify_taproot_commitment(
+            &opendamp::elements::secp256k1_zkp::Secp256k1::verification_only(),
+            &opendamp::elements::schnorr::TweakedPublicKey::new(cv.output_key),
+            &opendamp::elements::Script::from(cmr.as_ref().to_vec()),
+        ), "{shape}'s control block must open against C_V");
+    }
 }
 
 #[test]
@@ -88,19 +102,37 @@ fn transfer_satisfies_all_covenants_on_the_bitmachine() {
         .expect("transfer satisfies U and P");
     assert_eq!(tx.input.len(), 3);
     println!(
-        "verifier input: witness {} B ({} B of it pad), cost {} milli-WU = {} WU, \
+        "verifier input: leaf {}, witness {} B, cost {} milli-WU = {} WU, \
          budget {} WU, headroom {} WU",
+        report.shape.name(),
         report.verifier_witness,
-        report.verifier_pad,
         report.verifier_cost,
         report.verifier_weight(),
         report.verifier_budget(),
         report.verifier_budget() as i64 - report.verifier_weight() as i64,
     );
     println!("user inputs: witness sizes {:?} B", report.user_witnesses);
-    // Simplicity budget: witness size + 50, capped at 4,000,050 WU.
-    assert!(report.verifier_budget() < 4_000_050);
-    assert!(report.verifier_weight() <= report.verifier_budget());
+    // There is no padding any more: the functional witness alone has to buy the
+    // budget, which is only true because a witness byte buys four weight units
+    // on this chain. If that stops holding, this is where it shows.
+    assert!(report.verifier_budget() <= 4_000_050);
+    assert!(
+        report.verifier_weight() <= report.verifier_budget(),
+        "cost {} WU exceeds the {} WU a {} B witness buys",
+        report.verifier_weight(),
+        report.verifier_budget(),
+        report.verifier_witness,
+    );
+    // The canonical transfer must take the canonical leaf.
+    assert_eq!(report.shape, opendamp::programs::CANONICAL);
+    // And the whole thing must be a fraction of what the padded single-shape
+    // program cost: that program's witness was 26,830 B.
+    assert!(
+        report.verifier_witness < 6_000,
+        "verifier witness is {} B; the point of dropping the pad was to be far \
+         under the 26,830 B the padded program carried",
+        report.verifier_witness,
+    );
 }
 
 #[test]

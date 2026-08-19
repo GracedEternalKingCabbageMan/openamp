@@ -9,15 +9,48 @@ through issuance, registry validation) is not in scope.
 Nothing here is deployed to any live chain.
 
 **The headline: every predicate the design document specifies for the covenant is
-now enforced by consensus — confinement, the whitelist, the blacklist, the
-transfer limit and the height windows. Removing a holder from the whitelist stops
-that holder SPENDING; listing an outpoint stops that UTXO alone; a limit caps what
+enforced by consensus — confinement, the whitelist, the blacklist, the transfer
+limit and the height windows. Removing a holder from the whitelist stops that
+holder SPENDING; listing an outpoint stops that UTXO alone; a limit caps what
 leaves a sender in one transfer; a lockup or receive window binds to a height.
 Every one of them is proved against a real node (section 4).**
 
-Section 2 is empty of unenforced covenant predicates. What remains off-chain is
-what the design document itself puts off-chain (velocity, holder caps), plus the
-non-covenant work listed in section 6.
+**And the covenants no longer carry any padding.** A canonical transfer is
+**1,582 vB**, the node's own vsize, against roughly 7,459 vB before. Two things
+did it: Sequentia now grants four weight units of Simplicity execution per
+witness byte instead of one, and P is compiled once per transaction *shape*
+rather than once for the widest transfer imaginable. Section 3.
+
+## 0. What the 2026-08-19 review changed
+
+An adversarial review of this crate against the DAMP paper found three defects
+and one false claim. All four are fixed here; they are called out because two of
+them were silent, and because one of the fixes is not the one the review
+proposed.
+
+1. **A guard slot was a provable whitelist member.** `dmt-v1` put `GUARD_LO` and
+   `GUARD_HI` in the tree as ordinary `0x00`-domain key leaves with unrestricted
+   windows, so `Tree::prove` returned a valid proof for either. The covenant
+   could not tell one from an approved key, because a recipient key reaches
+   `C_U(Y)` only through `H_TapData(Y)` — a plain hash, which does not require Y
+   to be a point on the curve. A holder could pay regulated units to
+   `C_U(0xff..ff)`, satisfy confinement, the whitelist and the receive window,
+   and destroy them permanently: neither guard is a valid x-only key, so U's
+   BIP340 check can never succeed and v1 has no clawback. Guards now hash under
+   their own domain byte, `0x03`, at zero cost to the covenant.
+2. **A receive window bound the sender's own change.** `recv_after` restricts
+   acquisition; applying it to change turned it into a spend prohibition, so a
+   holder inside a Reg S window could not transact at all unless a UTXO happened
+   to equal the payment exactly. Change is now recognised by script equality
+   against the sender's own `C_U` and exempt from the window, the membership
+   fold and the explicit-value requirement.
+3. **pi was not committed.** The design document said `C_V(pi)` commits to one
+   policy *version*; the program took the roots and the limit, so it committed
+   to one rule *set*, and a rollback to an earlier snapshot with identical rules
+   would have reused the same address. pi is now a compile-time parameter that
+   reaches the DAG, for 2,807 milli-weight-units.
+4. **The confinement invariant was unstated, and the halt broke it.** See
+   section 2 — this is the one where the proposed fix did not survive contact.
 
 ## 1. Enforced by consensus (proved on elementsregtest)
 
@@ -37,52 +70,53 @@ Every item below fails at the node — not merely in the builder — when violat
 4. **Verifier presence.** Input 0 carries explicit asset V in amount exactly q.
 
 U enforces custody, not policy. A frozen holder still satisfies U for their own
-coins; it is P(pi) that stops them.
+coins; it is P(pi) that stops them. What check 4 does *not* establish is in
+section 2.
 
-### P(pi), the verifier primary path (`programs/verifier.simf`)
+### P(pi), the verifier primary path (`programs/verifier.simf.in`)
 
 1. **Position and identity.** Current input index is 0, carrying explicit V in
    amount exactly q.
 2. **Verifier recreation.** Output 0 carries explicit V in amount exactly q and
    its script hash equals the current input's script hash, so C_V(pi) is
    recreated at the same address under the same policy.
-3. **Owner scan over inputs 1..3** (`num_inputs <= 4` asserted; see section 3
-   for why 4). For every input carrying A:
+3. **The sender, proven once.** A witness-supplied key with one dmt-v1
+   membership proof against `WL_ROOT`, and its committed lockup applied through
+   `check_lock_height(send_after)`. **This is the freeze.**
+4. **Owner scan over the input slots** (`num_inputs <= N_max` asserted). For
+   every input carrying A:
    - its asset id must be **explicit** (a blinded input fails — see below);
-   - its script must equal `C_U(X_i)` for the witness-supplied owner key `X_i`,
-     which binds `X_i` to that input;
-   - `X_i` must be a member of the committed whitelist — **this is the freeze**;
-   - `X_i`'s **lockup** must have expired (`check_lock_height(send_after)`);
-   - every regulated input must have the **same** owner (section 5);
+   - its script must equal `C_U(sender)`, which is what makes "all regulated
+     inputs share one owner" structural rather than a separate assertion;
    - the input's outpoint must **not** be in the committed blacklist, proven by
      exhibiting the dmt-v1 interval leaf that strictly contains
      `SHA256(txid || BE32(vout))` — **this is the per-outpoint freeze**;
    - and at least one input must carry A, so only a holder can advance the
      verifier output.
-4. **Confinement scan over outputs 1..5** (`num_outputs <= 6` asserted). For
-   every output that exists:
+5. **Confinement scan over the output slots** (`num_outputs <= N_max` asserted).
+   For every output that exists:
    - the asset id must be **explicit**;
-   - an output carrying A must pay `C_U(Y)` for the witness-supplied recipient
-     key `Y`, rebuilt with the taproot-construction jets;
-   - that `Y` must carry a whitelist membership proof;
-   - `Y`'s **receive window** must have opened (`check_lock_height(recv_after)`)
-     — the Reg S pattern.
-5. **Transfer limit.** The sum of every A output paying an owner *other than the
+   - an output carrying A must either pay `C_U(sender)`, in which case it is
+     **change** and needs no proof, no receive window and no explicit value; or
+     pay `C_U(Y)` for a witness-supplied recipient key `Y`, which must carry a
+     whitelist membership proof, must have an open receive window
+     (`check_lock_height(recv_after)` — the Reg S pattern), and must expose an
+     explicit value.
+6. **Transfer limit.** The sum of every A output paying an owner *other than the
    sender* must not exceed the committed limit, computed with an overflow check
-   so a wrapping sum cannot slip under it. Change — an output paying the sender
-   back — does not count and may keep a blinded value; a payment to anyone else
-   must expose an explicit value, or the limit could be evaded behind a value
-   commitment. Change is identified by **recipient key equal to the sender's**,
-   never by output position, which the spender chooses.
-6. **A is never a fee output.** Enforced by the same script equality as 4: a fee
+   so a wrapping sum cannot slip under it.
+7. **A is never a fee output.** Enforced by the same script equality as 5: a fee
    output has an empty scriptPubKey, whose hash can never equal a P2TR script's.
    Fee outputs in *other* assets pass, which is what the any-asset fee market
    requires.
+8. **pi is committed** (check 0 in the source), so the address distinguishes a
+   policy version from a different version with identical rules.
 
-Both bounds are **asserted, not assumed**. Without `num_inputs <= 4` an extra
-regulated input would sit past the scan and spend unchecked; likewise for
+Both bounds are **asserted, not assumed**. Without `num_inputs <= N_max` an
+extra regulated input would sit past the scan and spend unchecked; likewise for
 outputs. Exceeding either bound makes the transaction unspendable rather than
-unchecked.
+unchecked — and the builder refuses to construct one, naming the bound
+(`tests/builder.rs`), which it previously did for outputs only.
 
 **On blinded inputs.** Scanned inputs must carry explicit asset ids, not only
 outputs. The confinement induction already implies no blinded A UTXO can exist,
@@ -94,14 +128,14 @@ matches transparent-by-default and is what the builder does anyway.
 ### G(I), the issuer path (`programs/issuer.simf`)
 
 `bip_0340_verify(I, sig_all_hash, sigma)` — the update path (recreate C_V under
-pi') and the halt path (send V anywhere else). Compromise of I permits policy
-revocation or denial of service, never theft: no path lets the issuer spend a
-holder's C_U output.
+pi') and the halt path (burn V). Compromise of I permits policy revocation or
+denial of service, never theft: no path lets the issuer spend a holder's C_U
+output.
 
 ### Structural properties that follow
 
-- **The policy version is bound into the address.** Both roots enter P through
-  its compile-time arguments, so a different whitelist *or* blacklist root is a
+- **The policy version is bound into the address.** The roots, the limit and pi
+  all enter P through its compile-time arguments, so a different policy is a
   different CMR and therefore a different C_V address. P(pi0) cannot spend
   C_V(pi1) (proof 4c).
 - **A proof is bound to what it authorises.** The covenant recomputes C_U(key)
@@ -110,7 +144,7 @@ holder's C_U output.
   4b) nor to spend someone else's input (proof 7e).
 - **A stale proof is worthless.** A proof valid under the previous policy
   version fails the new root (proofs 7c, 8c).
-- **Halt is effective.** Once V leaves C_V nothing can satisfy input 0 (6b).
+- **Halt is effective.** Once V is burned nothing can satisfy input 0 (6b, 6c).
 
 ### Why a bad proof cannot be submitted at all
 
@@ -134,7 +168,40 @@ Both doors are shut, and the regtest test walks through both.
 (blacklist), 3.3 (whitelist), 3.4 (transfer limit) and 3.5 (height windows) are
 all live, along with the confinement core of 2.1–2.3.
 
-What is deliberately outside the covenant:
+### The invariant no covenant can check
+
+U's check 4 asks that *some* output carrying q of V sits at input zero. It does
+not ask that the output is a verifier covenant, and U cannot: C_V(pi) is a
+different address for every policy version, while U is fixed for the life of the
+asset and committed inside every C_U address. So confinement rests on
+
+> **q units of V must never exist outside a verifier covenant.**
+
+If that is broken, whoever controls the stray output can place it at input zero
+and let any holder spend their C_U with no whitelist, no blacklist, no limit and
+no window, on their own signature alone.
+
+The review proposed closing this in U, by requiring output zero to recreate
+input zero's script unless the issuer signed. **It was implemented and then
+removed, because it does not work**: a holder of stray V pays it back to the
+same address, which satisfies the equality exactly. Simplicity exposes another
+input's script pubkey but not which leaf it executed, so nothing a fixed U can
+read distinguishes a real C_V(pi) from an imitation. Keeping the check would
+have cost a witness field and a branch in exchange for reassurance it could not
+provide.
+
+What closes it is operational, and the tooling now enforces both halves:
+
+- **A halt BURNS V.** `IssuerReq::halt_to_burn` sends it to a bare `OP_RETURN`,
+  which can never be an input, so after a halt no q-of-V output exists at all
+  and A is frozen — which is what a halt is supposed to mean.
+  `halt_leaves_live_verifier_asset()` names the alternative for a caller that
+  insists on parking it somewhere spendable.
+- **V's reissuance authority is as sensitive as I.** Minting q of V to an
+  ordinary address is a complete bypass. Retaining it to run parallel verifier
+  outputs means retaining a second key of the same criticality.
+
+### Deliberately outside the covenant
 
 - **Velocity and holder caps** (design doc 3.6). These need global chain state a
   covenant cannot see; the design document puts them with the registrar, and they
@@ -144,7 +211,7 @@ What is deliberately outside the covenant:
   values are permitted on change and on non-A outputs, and are untested here.
 - **Redemption.** No redemption branch, as the design document specifies for v1.
 
-And a rule the tooling now enforces rather than warns about: the snapshot parser
+And a rule the tooling enforces rather than warns about: the snapshot parser
 uses `deny_unknown_fields` throughout, so a predicate this build cannot enforce is
 a **hard error**, not an ignored field. An issuer cannot publish a policy that
 does not bind. A `limit` of 0 is likewise refused, because it would forbid every
@@ -152,102 +219,87 @@ payment and is almost certainly a mistake for "no limit" (which is `null`).
 
 ## 3. Budget: measured, not estimated
 
-Simplicity buys execution budget with witness bytes — budget = serialized
-witness-stack size + 50 weight units, capped at 4,000,050 — while the cost side
-is a **static** bound over the whole program DAG that does not shrink when a
-branch goes untaken.
+Simplicity buys execution budget with witness bytes, and on Sequentia one
+witness byte buys **four** weight units of execution rather than one
+(`SIMPLICITY_BUDGET_PER_WITNESS_BYTE`, `src/script/script.h` in the node),
+capped at 4,000,050. The cost side is a **static** bound over the whole program
+DAG that does not shrink when a branch goes untaken.
 
-Measured for a transfer with one regulated input and two A outputs (payment plus
-change), at `N_max_inputs = 4`, `N_max_outputs = 6`, `D = 16`:
+That multiplier is why there is no padding. Under the one-to-one rule the
+verifier's functional witness was a few kilobytes against a cost bound of twenty
+thousand weight units, so it had to haul 22,528 bytes of inert data that existed
+only to be counted — every node storing and relaying it, and the block it
+crowded out being the scarce thing. Four is chosen against the block: total
+Simplicity cost in a block is bounded by the block's weight times the
+multiplier, so a Sequentia block at 400,000 weight units admits at most
+1,600,000 weight units of Simplicity work, against the 4,000,000 Liquid already
+accepts at a 4,000,000-weight block and a multiplier of one.
+
+### The shape menu
+
+P is compiled once per **shape** — a pair (N_max_inputs, N_max_outputs) — and
+every shape is a leaf of the same C_V(pi) taptree. A single program sized for
+the widest transfer charges every ordinary transfer for slots it never touches,
+because the cost bound is static. Each leaf asserts its own bounds, so a narrow
+leaf cannot be used for a wide transaction, and `programs::shape_for` picks the
+narrowest leaf that fits.
+
+| leaf | inputs | outputs | static cost | min witness stack | margin |
+|---|---|---|---|---|---|
+| `p3x5` **canonical** | 3 | 5 |  7,523,320 mWU | 3,739 B | 1.99x |
+| `p3x4` | 3 | 4 |  6,413,483 mWU | 3,718 B | 2.33x |
+| `p4x6` | 4 | 6 |  9,667,652 mWU | 3,785 B | 1.57x |
+| `p5x7` | 5 | 7 | 11,812,618 mWU | 3,834 B | 1.30x |
+
+"Min witness stack" is the smallest witness a legitimate spend can present — the
+sender proof, one filled input slot and one filled output slot — which is the
+worst case, because anything richer carries more proof bytes and therefore buys
+*more* budget against an unchanged static cost. `tests/cost_profile.rs` asserts
+every margin, so a widened scan fails there rather than producing an unspendable
+leaf.
+
+No shape has fewer than three inputs, and that is forced: a transfer cannot pay
+its fee in A, and the verifier input's q of V is returned whole to output zero,
+so the fee must come from an ordinary input that is neither. The 1-input shapes
+an earlier sizing exercise considered could not have paid a fee at all.
+
+Leaf depths put the canonical shape alone at depth 1, so the leaf a wallet
+reaches for most often carries a 65-byte control block and the rest carry 129.
+
+### Measured, for the canonical transfer
 
 | quantity | value |
 |---|---|
-| P(pi) static cost | 21,831,549 milli-WU = **21,832 WU** |
-| P(pi) witness stack | **26,830 B** (22,528 B of it pad) |
-| P(pi) budget bought | **26,880 WU** |
-| headroom | **5,048 WU**, a 23% margin over cost |
+| P(pi) static cost | 7,411,916 milli-WU = **7,412 WU** |
+| P(pi) witness stack | **3,634 B**, none of it padding |
+| P(pi) budget bought | 14,586 WU |
+| headroom | **7,174 WU**, 49% |
 | U witness stack (per user input) | **633 B** |
-| U static cost | 228,208 milli-WU = 229 WU, against 683 WU bought |
-| finalized transfer size | ~28 kB |
+| finalized transfer | 4,858 B, **1,582 vB** |
+| per block, at 89,999 vB of payload | **56** (was 12) |
 
-The consensus cap of 4,000,050 WU is nowhere near; the binding constraint is what
-the padding costs in fees and block space. Standard-transaction limits are
-satisfied — the 80-byte stack-item limit applies only to tapscript (leaf version
-0xc0), not to Simplicity leaves (0xbe).
-
-That margin is the **worst** case, measured with only one of three input
-slots and two of five output slots carrying proofs. Cost is static, so filling
-more slots leaves it unchanged while each additional proof adds witness bytes and
-therefore budget: a fuller transfer has *more* headroom, not less.
-
-Cost per check, from `tests/cost_profile.rs` (which asserts these bands, so
-arithmetic that stops holding fails a test rather than a node):
+### Where the cost goes
 
 | component | static cost |
 |---|---|
-| whole P(pi), unpruned | 21,998,655 milli-WU |
-| one OUTPUT slot (asset + amount + C_U(Y) + whitelist fold + window) | 1,441,203 = **1,441 WU** |
-| one INPUT slot (asset + C_U(X) + whitelist fold + window + blacklist) | 2,423,316 = **2,423 WU** |
-| ...of which blacklist non-membership | 928,521 = 929 WU |
-| ...of which the two 256-bit comparisons | 93,658 = 94 WU |
-| a dmt-v1 membership fold, D = 16 | 796,234 = 796 WU |
-| the transfer limit, marginal (single sender + change detection + sum + bound) | 73,756 = **74 WU** |
-| the height windows, marginal (lock jets + two words per leaf) | 184,312 = **184 WU** |
+| whole P(pi), canonical shape | 7,523,320 mWU |
+| whitelist folds, whole program | 3,981,170 mWU |
+| blacklist non-membership, both input slots | 1,855,218 mWU |
+| committing pi | 2,807 mWU |
 
-A used output slot's witness is 569 B and a used input slot's is 1,161 B, each
-buying an equal number of WU back, so an output check costs ~872 WU net and an
-input check ~1,262 WU net.
+The whitelist folds still dominate, and would dominate more but for hoisting:
+because all regulated inputs of a transfer belong to one owner, the sender is
+proven **once** and each input slot then only compares its script against
+`C_U(sender)`. That removed a 16-level Merkle fold and a taproot reconstruction
+from every input slot after the first, and removed the recipient key and proof
+from the witness of every change output.
 
-### The last two predicates were cheap; landing them was not
-
-The limit and the windows cost **258 WU between them** — the windows because the
-bounds ride inside the whitelist leaf that was already being folded, so they add
-no Merkle work at all, and the limit because it is arithmetic rather than hashing.
-
-Landing them nonetheless raised P(pi) by 2,567 WU at equal pad (16,268 → 18,835
-WU before the pad was grown). The difference is restructuring, not enforcement:
-`check_output` now reads `output_amount` rather than only `output_asset`, returns
-a `u64`, and every whitelist slot's witness grew from a 2-tuple to a 4-tuple. Both
-figures are quoted because only one of them answers "what does this rule cost",
-and the other answers "what did this change cost".
-
-### Why N_max_inputs = 4 and N_max_outputs = 6
-
-Both were 8 before the owner scan existed. Adding seven input slots would have
-cost ~7,100 WU of static budget, which the pad can buy but only by growing the
-transaction to roughly 27 kB. Right-sizing the bounds to what a transfer actually
-needs was the better trade, and it kept the transaction near its previous size
-while adding both new checks:
-
-- **6 outputs**: verifier recreation, up to two payments, sender change,
-  fee-asset change, and the fee output.
-- **4 inputs**: the verifier, up to **two** regulated inputs, and one fee input.
-
-The limitation to state plainly: **a transfer may spend at most two UTXOs of A**.
-A holder with more must consolidate across several transactions. Raising it is a
-budget purchase — ~2,015 WU and ~65 pad words per extra input slot, about 2 kB of
-transaction — not a design change.
-
-### Why there is a pad at all, and why it is shaped this way
-
-Three approaches were tried; only the third works:
-
-1. **Taproot annex padding** — what `rust-simplicity`'s `Cost::get_padding`
-   produces — is unusable: `IsWitnessStandard` rejects any taproot spend carrying
-   an annex, so it would not relay.
-2. **A bounded list (`List<u8, N>`)** is cost-neutral: the type's own static cost
-   grows about as fast per byte of bound as the budget that byte buys. Measured:
-   at bound 8192 the deficit was 9,714 B; at bound 32768, 33,999 B.
-3. **A fixed-size array, read on every execution.** `[u256; 704]` costs ~306
-   milli-WU per byte and buys 1,000. It must be *read*: an unused witness is
-   dropped by pruning (pinned by `tests/pruning.rs`: 32 B survives when one word
-   is read, 1024 B when all are absorbed), and pruning is mandatory. `absorb`
-   touches every word with `eq_256(x, x)` — always true, no semantics.
-
-`BUDGET_PAD_WORDS` in `src/programs.rs` must equal both the array length and the
-`array_fold` bound in `programs/verifier.simf`. `attach_verifier` re-checks the
-budget on every build and fails loudly rather than emitting a transaction the
-node would reject.
+One number worth keeping in view: a whitelist slot's fold costs about 796,000
+milli-weight-units while the jets it executes sum to about 58,000. The compiled
+program costs roughly **thirteen times** the jets it runs, so the dominant term
+is SimplicityHL's structural overhead rather than the cryptography. If a
+hand-written program or a later compiler closes even half of that, every number
+above improves with it.
 
 ## 4. Regtest proof (the acceptance bar)
 
@@ -265,61 +317,36 @@ simplicity **active before any 0xbe output is funded** — an unenforced Simplic
 leaf is anyone-can-spend, so funding one on a chain without the rule active would
 be a fund-loss bug, not a test failure.
 
-From the run of 2026-08-17 (a fresh chain each run, so these identify a passing
-run rather than being stable):
+The node must also grant four weight units per witness byte. On a node still
+using the Elements one-to-one rule these covenants are unspendable, and
+`attach_verifier` says so by name rather than emitting a transaction the node
+would reject.
+
+Proofs, from a passing run (a fresh chain each time, so the txids identify a run
+rather than being stable):
 
 | proof | result |
 |---|---|
-| 1. issue A and V, fund C_U(alice) and C_V(pi0 = wl {alice,bob}) | `ebb2dbb6…`, `802f2535…` |
-| 2. alice → bob, **no third party signature** | `68ca9c7102408121d38cee47eda6ff317be7dae1ac8dc022d9c525380037676b` |
-| 3a. builder/BitMachine refuses an unconfined A output | `Jet failed during execution` |
-| 3b. **node** rejects it | `Assertion failed inside jet` |
-| 4a. builder refuses carol as recipient (no proof under pi0) | `not in the whitelist` |
-| 4b. **node** rejects bob's proof reused to pay carol | `Assertion failed inside jet` |
+| 1. issue A and V, fund C_U(alice) and C_V(pi0) | funded |
+| 2. alice → bob, **no third party signature** | confirms; 1,582 vB |
+| 3a/3b. an unconfined A output: builder, then **node** | `Jet failed` / `Assertion failed inside jet` |
+| 4a/4b. carol unproven, then bob's proof reused to pay carol | builder refuses / **node** refuses |
 | 4c. **node** rejects P(pi0) spending C_V(pi1) | `Witness program hash mismatch` |
-| 5a. issuer update pi0 → pi1 (adds carol) | `99c830f28c896e75b7d60c67701ee041d83604443481ccaff0f82e4746e8dcf8` |
-| 5b. alice → carol under pi1 | `764fa7d031da324463a7f93c8aa028e0aad703b87c824761eb3ff9e8b2c9fee3` |
-| **7a. issuer update pi1 → pi2 REMOVING alice (the freeze)** | `b4c8d17a4ce28b4644bd759eb1e2031d976c3dcf49756305b481d6d8ccb261a9` |
-| 7b. alice cannot spend: no owner proof exists under pi2 | `owner key 1b84c556… is not in the whitelist: these coins are frozen` |
-| 7c. her stale pi1 proof fails the pi2 fold, so it cannot be pruned | `Jet failed during execution` |
-| 7d. **node** rejects the only submittable form of it | `Program has FAIL node` |
-| 7e. **node** rejects bob's whitelisted identity used for alice's input | `Assertion failed inside jet` |
-| 7f. bob still spends under pi2 — the freeze is per holder | `90b28afc4d6627855dd2d0c99c714a6c9eeed392925a7b759d2e4e9d96675f18` |
-| 7g. issuer update pi2 → pi3 restoring alice | `3ace58dc1da331d0ff90c9f7f5cffb93d6abba0dccbf57deb40f85c0796639c5` |
-| 7h. alice spends again — the freeze is reversible | `0b2d5b441a49bc43a87cbfeea64eacfadc0d613afb5cfd39a209198bb65fe4b5` |
-| **8a. issuer update pi3 → pi4 blacklisting one of alice's outpoints** | `1cf9bc14204f2a6f2aae4ce74e35e8d8e8209b0a0737c266c9d764a6fbf59804` |
-| 8b. alice cannot spend that outpoint: no interval covers it | `outpoint …:2 is blacklisted: these coins are frozen` |
-| 8c. the pre-freeze interval proof fails the pi4 root | `Jet failed during execution` |
-| 8d. **node** rejects the only submittable form of it | `Program has FAIL node` |
-| 8e. issuer update pi4 → pi5 lifting the listing | `51977fe15af5865f125d929eae57beb398866503abeb94261b0ece6d82f06b00` |
-| 8f. the same outpoint spends once unlisted | `bfb09d1251569e81a2de0e9ccd015af1cf1146e773753d628375a16d367f7d9f` |
-| **9a. issuer update pi5 → pi6 setting a transfer limit of 20,000,000** | `bba0f2659980361e6e8e0e7076b19489eb5984cc5daf71a747cf0b021e7080de` |
-| 9b. builder refuses a payment of limit + 1 | `pays 20000001 atoms to other owners, over the committed transfer limit` |
-| 9c. **node** rejects the over-limit payment | `Assertion failed inside jet` |
-| 9d. a payment of exactly the limit confirms, alongside 120,000,000 of change that does **not** count | `58bff41c29119eb09647ab278cc3a3c3f384279e549101dc2259ee7c620bdc32` |
-| **10a. issuer update pi6 → pi7 at height 115: alice locked up, carol unable to receive, until height 120** | `4ac9c86e09db8e56a2625a6afef005282e727abc0e2df63a0c0f7a3d4d88a630` |
-| 10b. builder refuses a transfer claiming no height | `needs locktime >= 120 (a height window applies)` |
-| 10c. **consensus** rejects an honest claim of height 120 made at height 116 | `non-final` |
-| 10d. builder refuses an understated height | `needs locktime >= 120 … asks for 117` |
-| 10e. **node** rejects an understated height that is otherwise perfectly minable | `Assertion failed inside jet` |
-| 10f. the same honest transaction confirms once the chain reaches the bound | `944b021ad8653311f8ac7c82590322194c4ad839075655f3bc4338b38bd2103c` |
-| 6a. halt: V to a plain address | `d4d312bb07ead240d91c80ae47b9ed82d1ae761e469b21433657d8bf4cb1fed8` |
-| 6b. **node** rejects any transfer after the halt | `Witness program hash mismatch` |
+| 5a/5b. issuer update pi0 → pi1 (adds carol), then alice → carol | both confirm |
+| **7a. issuer update REMOVING alice (the freeze)** | confirms |
+| 7b–7e. alice cannot spend: no proof, stale proof unprunable, unpruned form refused, bob's identity refused | four distinct refusals |
+| 7f–7h. bob still spends; alice restored; alice spends again | the freeze is per holder and reversible |
+| **8a–8f. blacklist one outpoint, refuse it four ways, lift it, spend it** | per-outpoint freeze |
+| **9a–9d. a transfer limit, refused at limit+1 by builder and node, confirmed at exactly the limit with change that does not count** | limit binds |
+| **10a–10f. lockup and receive window: builder, consensus finality, and the covenant's own check, separately** | both halves of the height reduction |
+| **11a. issuer update: alice cannot RECEIVE for 1,000 blocks** | confirms |
+| **11b. alice spends a quarter of her UTXO and keeps the change anyway** | a receive window does not stop change |
+| **11c. paying alice is still refused while her window is shut** | and it still binds a real acquisition |
+| 6a/6c. halt: V burned to OP_RETURN, absent from the UTXO set | nothing left to put at input zero |
+| 6b. **node** rejects any transfer after the halt | `missing-inputs` |
 
-### Both halves of the height reduction, separately
-
-A covenant cannot read the chain height, so the windows work in two steps and the
-test proves each on its own:
-
-- **10c** is consensus refusing a claim that has not come true: the covenant was
-  satisfied by a locktime of 120, and the node still would not take the
-  transaction at height 116.
-- **10e** is the covenant refusing an understated claim: at height 122 a locktime
-  of 117 is perfectly minable, so the mempool's finality rule has nothing to say,
-  and the transaction is rejected on `check_lock_height` alone.
-
-Neither half is sufficient by itself, which is why both are asserted rather than
-one being inferred from the other.
+Proofs 11a–11c are new, and are the regression test for the change/receive-window
+defect: before the fix, 11b was impossible.
 
 ### On the refusal proofs, precisely
 
@@ -339,8 +366,9 @@ Two distinct techniques, because they prove different things:
   exists. So the test walks the two doors instead: pruning fails locally, and the
   unpruned form is refused by the node.
 
-`tests/covenant.rs` (7 tests) proves the same logic on the BitMachine against the
-exact `ElementsEnv` consensus uses, with no node.
+`tests/covenant.rs` proves the same logic on the BitMachine against the exact
+`ElementsEnv` consensus uses, with no node. `tests/builder.rs` covers the
+refusals the builder owns, and `tests/cost_profile.rs` the budget arithmetic.
 
 ## 5. Design decisions worth recording
 
@@ -349,46 +377,50 @@ regulated asset has its own U and CMR. A network-wide U reading A, V and q from
 the transaction pattern has no sound construction for q.
 
 **dmt-v1 instead of the design document's smt-v1/cmt-v1.** A depth-256 sparse
-Merkle tree costs 256 hash levels per proof, and the verifier needs up to eight.
-Depth 16 over a sorted dense tree (65,534 keys) is what fits.
+Merkle tree costs 256 hash levels per proof. Depth 16 over a sorted dense tree
+(65,534 keys) is what fits. Neither reserved alternative is implemented
+anywhere any more: `openampd` used to carry an smt-v1 document format whose
+validation skipped every consistency check dmt-v1 gets, and it is gone.
+
+**Guards hash under 0x03.** They exist to make the sorted sequence total and for
+nothing else, so they are not key leaves. See section 0 for what happened when
+they were.
 
 **The blacklist stores intervals, not keys.** Non-membership in a *dense* tree
 would otherwise need an adjacency argument over proof indices, and a dense tree
-gives no cheap handle on the index (it exists only as a direction bitmap, and
-SimplicityHL's folds do not expose the loop counter). Putting the gap in the leaf
-makes non-membership one ordinary membership proof: 928 WU per input instead of
-roughly double. Full construction, and why a listed key cannot be proven absent:
-`SPEC-dmt-v1.md` section 7.
+gives no cheap handle on the index. Putting the gap in the leaf makes
+non-membership one ordinary membership proof. Full construction, and why a
+listed key cannot be proven absent: `SPEC-dmt-v1.md` section 7.
 
-**All regulated inputs of a transfer must share one owner.** The transfer limit
-needs this twice over: a limit is per sender, and change is identified by the
-recipient key equalling the sender's, which presupposes a well-defined sender.
-Rather than make the rule conditional on a limit being set — two program shapes,
-and a subtle difference between them — it is unconditional. The cost is that two
-holders cannot co-spend into a single transfer. That is a stated v1 restriction,
-not an oversight, and it is cheap to lift later by making the check conditional.
+**All regulated inputs of a transfer share one owner.** The transfer limit needs
+this twice over: a limit is per sender, and change is identified relative to one.
+It is now structural rather than checked — every A input's script must equal
+`C_U(sender)` — which is both cheaper and harder to get wrong. The cost is that
+two holders cannot co-spend into a single transfer; that is a stated v1
+restriction.
 
-**Height windows live in the whitelist leaf, not a tree of their own.** A separate
-window tree would have meant a second membership fold per slot — 796 WU each,
-eight slots — for information that belongs to the same key the first fold already
-proves. Binding `send_after` and `recv_after` into the leaf makes them free and
-makes them unforgeable: a holder cannot claim a shorter lockup, because changing
-either bound changes the leaf and the path stops reaching the root.
+**Height windows live in the whitelist leaf, not a tree of their own.** A
+separate window tree would have meant a second membership fold per slot for
+information that belongs to the same key the first fold already proves. Binding
+`send_after` and `recv_after` into the leaf makes them free and makes them
+unforgeable.
 
 **Fixed input-zero position** for the verifier, as the design document accepts.
 
 Mirrors: `src/dmt.rs`, `gomirror/dmt/` (stdlib-only Go, tests asserting the same
-golden roots), and for the blacklist constants an independent Python
-recomputation as a third opinion.
+golden roots), and `openampd/internal/damp/dmt/`. The Go side also mirrors the
+verifier taptree, and `TestEveryShapeControlBlockMatchesVectors` checks every
+leaf's control block against the Rust vectors.
 
 ## 6. What remains
 
 Nothing in the covenant. What is left is integration and operations.
 
-1. **More than two regulated inputs per transfer.** A budget purchase, not a
-   design change: ~2,423 WU and ~110 pad words per extra input slot. Lifting the
-   single-sender restriction goes with it (make the owner-agreement check
-   conditional on a limit being committed).
+1. **More than three regulated inputs per transfer.** A wider shape is a leaf,
+   not a redesign: add it to `SHAPES` and the taptree grows by one leaf. The
+   menu stops at `p5x7` because the leaf count has to stay a power of two plus
+   the canonical leaf for the depth assignment to be a valid taptree, which is
+   asserted rather than assumed.
 2. **Confidential values on non-A outputs and on change.** Permitted by the
    covenant, untested; needs a regtest case with a blinded change output.
 3. **External signature ingestion in the CLI.** `transfer-build` prints each user
@@ -397,27 +429,20 @@ Nothing in the covenant. What is left is integration and operations.
    key. A `--sig INDEX:HEX` flag is the missing piece for hardware and FROST
    signers.
 4. **Parallel verifier outputs** (design doc section 6). Untouched; the single
-   verifier output is a spending race, which a busy asset will hit first.
-5. **Snapshot signing and publication — DONE, in M2.** The policy service
-   publishes seq 0 at issuance and seq n+1 on every policy update, chained by
-   `prev_pi`, and verifies the issuer signature over the canonical snapshot.
-   The freeze path lives there too: `POST /v1/issuer/damp-policy` recomputes
-   both roots and pi_{n+1} from the published chain and logs the reason before
-   anything is signed, and `.../complete` verifies the issuer signature and the
-   respend before broadcasting. What the policy service structurally CANNOT do
-   is build that respend itself: `sig_all_hash` and the `G(I)` witness need the
-   Simplicity transaction environment and the compiler, so the registrar
-   supplies the signed transaction, exactly as it supplies program identity at
-   issuance.
-6. **Golden CMR vectors under CI.** `vectors/addresses.json` pins U/P/G CMRs,
-   tapleaf and TapData hashes, output keys, script pubkeys, control blocks, both
-   chains' addresses, per-holder window bounds and the dmt-v1 constants. Nothing
-   yet fails a build when a CMR moves; it should.
-7. **Transaction size.** A transfer is ~28 kB, almost all of it budget padding.
-   That is a real fee cost on a live chain and the honest lever on it is the
-   Simplicity cost model, not this crate: every check here is already paid for at
-   the cheapest shape found. Reducing `D` from 16 to 12 (4,094 holders) would
-   save ~199 WU per fold across eight slots.
+   verifier output is a spending race, which a busy asset will hit before it
+   hits the 56-per-block size ceiling.
+5. **Snapshot signing and publication — DONE, in M2.**
+6. **Golden CMR vectors under CI.** `vectors/addresses.json` pins U/G CMRs and
+   every shape's CMR, tapleaf, control block and address, plus the dmt-v1
+   constants. The Go tests read it, so a CMR that moves without the vectors
+   moving fails there; nothing yet fails a *build*.
+7. **Tree depth.** D = 16 caps a whitelist at 65,534 holders. D = 12 would save
+   about 110 vB per transfer and cap it at 4,094. That trade was worth making
+   when the pad existed, because depth drove the pad; without a pad it is a
+   small saving against a 16x capacity cut, so D stays 16. It is one constant
+   (`dmt::DEPTH`, which the covenant template reads) if an issuer ever wants
+   otherwise.
 8. **Live testnet pilot** (M4). The anyone-can-spend hazard makes
    `getdeploymentinfo` reporting simplicity active a hard precondition for
-   funding any covenant address, on any chain.
+   funding any covenant address, on any chain — and so is the node granting four
+   weight units per witness byte, which arrived in Sequentia Core 24.3.0.

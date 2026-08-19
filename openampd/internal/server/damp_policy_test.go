@@ -68,7 +68,7 @@ func newDampPolicyFixture(t *testing.T) *dampPolicyFixture {
 	prepareID, _ := prep["prepare_id"].(string)
 	pi0, _ := prep["pi"].(string)
 	code, out := dampComplete(t, s, prepareID, map[string]any{
-		"user_cmr": v.Programs.UCMR, "verifier_cmr": v.Programs.PCMR, "issuer_cmr": v.Programs.GCMR,
+		"user_cmr": v.Programs.UCMR, "verifier_cmrs": v.shapeCMRs(), "issuer_cmr": v.Programs.GCMR,
 		"pi": pi0, "verifier_spk": v.VerifierCovenant.ScriptPubKey,
 	})
 	if code != 200 {
@@ -141,18 +141,25 @@ func (f *dampPolicyFixture) sign(t *testing.T, toSign string) string {
 // different program CMR, and the C_V scriptPubKey it derives. The CMR itself is
 // opaque to this server (it cannot compile Simplicity), which is exactly why the
 // checks it CAN make are the ones under test.
-func (f *dampPolicyFixture) nextVerifier(t *testing.T, marker byte) (cmrHex, spkHex string) {
+func (f *dampPolicyFixture) nextVerifier(t *testing.T, marker byte) (menu []string, spkHex string) {
 	t.Helper()
-	var cmr [32]byte
-	copy(cmr[:], mustHexBytes(f.v.Programs.PCMR))
-	cmr[0] ^= marker // any value other than the current program
+	// A whole new MENU, not one program: every shape is recompiled against the
+	// new policy, so every leaf of the taptree moves and so does the address.
+	next := f.v.shapeCMRBytes()
+	for i := range next {
+		next[i][0] ^= marker
+	}
 	g := [32]byte{}
 	copy(g[:], mustHexBytes(f.v.Programs.GCMR))
-	cov, err := elements.VerifierCovenant(cmr, g)
+	cov, err := elements.VerifierCovenant(next, g)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return hex.EncodeToString(cmr[:]), hex.EncodeToString(cov.ScriptPubKey())
+	out := make([]string, 0, len(next))
+	for _, c := range next {
+		out = append(out, hex.EncodeToString(c[:]))
+	}
+	return out, hex.EncodeToString(cov.ScriptPubKey())
 }
 
 // respend builds the finished issuer-path spend the way `opendamp issuer-update`
@@ -268,7 +275,7 @@ func TestDampPolicy_FreezeRemovesHolderAndAdvancesPi(t *testing.T) {
 	toSign, _ := prep["to_sign"].(string)
 	nextCMR, nextSPK := f.nextVerifier(t, 0x01)
 	code, out := f.policyComplete(t, policyID, map[string]any{
-		"sig": f.sign(t, toSign), "verifier_cmr": nextCMR, "verifier_spk": nextSPK,
+		"sig": f.sign(t, toSign), "verifier_cmrs": nextCMR, "verifier_spk": nextSPK,
 		"signed_tx": f.respend(f.vTxid, f.vVout, nextSPK),
 	})
 	if code != 200 {
@@ -306,7 +313,7 @@ func TestDampPolicy_FreezeRemovesHolderAndAdvancesPi(t *testing.T) {
 	// (and the next update's derive document) answers about what is on chain.
 	var bound *store.DampBinding
 	f.st.View(func(st *store.State) { bound = st.Assets[f.asset].Damp })
-	if bound.Pi != piNext || bound.VerifierCMR != nextCMR || bound.VerifierSPK != nextSPK {
+	if bound.Pi != piNext || !sameCMRMenu(bound.VerifierCMRs, nextCMR) || bound.VerifierSPK != nextSPK {
 		t.Fatalf("the asset binding did not move to the new policy: %+v", bound)
 	}
 	if len(bound.Whitelist) != len(f.v.whitelistKeys())-1 {
@@ -369,7 +376,7 @@ func TestDampPolicy_WrongSignatureRefused(t *testing.T) {
 	wrong, _ := elements.SignSchnorr(other.Serialize(), msg)
 
 	code, out := f.policyComplete(t, policyID, map[string]any{
-		"sig": hex.EncodeToString(wrong), "verifier_cmr": nextCMR, "verifier_spk": nextSPK,
+		"sig": hex.EncodeToString(wrong), "verifier_cmrs": nextCMR, "verifier_spk": nextSPK,
 		"signed_tx": f.respend(f.vTxid, f.vVout, nextSPK),
 	})
 	if code != 400 || !strings.Contains(fmt.Sprint(out["error"]), "does not verify") {
@@ -384,7 +391,7 @@ func TestDampPolicy_WrongSignatureRefused(t *testing.T) {
 	// Still retryable with the right signature, and the SAME id: a refusal does
 	// not consume the prepare.
 	code, out = f.policyComplete(t, policyID, map[string]any{
-		"sig": f.sign(t, toSign), "verifier_cmr": nextCMR, "verifier_spk": nextSPK,
+		"sig": f.sign(t, toSign), "verifier_cmrs": nextCMR, "verifier_spk": nextSPK,
 		"signed_tx": f.respend(f.vTxid, f.vVout, nextSPK),
 	})
 	if code != 200 {
@@ -409,7 +416,7 @@ func TestDampPolicy_StaleDerivationRefused(t *testing.T) {
 	// (a) The CURRENT program: a derivation that ran against the old policy. It
 	// would recreate the old C_V, so the freeze would publish and not bind.
 	code, out := f.policyComplete(t, policyID, map[string]any{
-		"sig": sig, "verifier_cmr": f.v.Programs.PCMR,
+		"sig": sig, "verifier_cmrs": f.v.shapeCMRs(),
 		"signed_tx": f.respend(f.vTxid, f.vVout, nextSPK),
 	})
 	if code != 409 || !strings.Contains(fmt.Sprint(out["error"]), "CURRENT policy") {
@@ -420,7 +427,7 @@ func TestDampPolicy_StaleDerivationRefused(t *testing.T) {
 	// error that would fund an address nothing can spend.
 	otherCMR, _ := f.nextVerifier(t, 0x04)
 	code, out = f.policyComplete(t, policyID, map[string]any{
-		"sig": sig, "verifier_cmr": otherCMR, "verifier_spk": nextSPK,
+		"sig": sig, "verifier_cmrs": otherCMR, "verifier_spk": nextSPK,
 		"signed_tx": f.respend(f.vTxid, f.vVout, nextSPK),
 	})
 	if code != 409 || !strings.Contains(fmt.Sprint(out["error"]), "verifier_spk mismatch") {
@@ -451,7 +458,7 @@ func TestDampPolicy_RespendShapeRefused(t *testing.T) {
 
 	// (a) Spends some other coin: not this asset's rules output at all.
 	code, out := f.policyComplete(t, policyID, map[string]any{
-		"sig": sig, "verifier_cmr": nextCMR, "verifier_spk": nextSPK,
+		"sig": sig, "verifier_cmrs": nextCMR, "verifier_spk": nextSPK,
 		"signed_tx": f.respend(strings.Repeat("bb", 32), 0, nextSPK),
 	})
 	if code != 409 || !strings.Contains(fmt.Sprint(out["error"]), "rules output") {
@@ -463,7 +470,7 @@ func TestDampPolicy_RespendShapeRefused(t *testing.T) {
 	// asset unable to transfer at all while a snapshot claimed otherwise.
 	_, strangerSPK := f.nextVerifier(t, 0x06)
 	code, out = f.policyComplete(t, policyID, map[string]any{
-		"sig": sig, "verifier_cmr": nextCMR, "verifier_spk": nextSPK,
+		"sig": sig, "verifier_cmrs": nextCMR, "verifier_spk": nextSPK,
 		"signed_tx": f.respend(f.vTxid, f.vVout, strangerSPK),
 	})
 	if code != 409 || !strings.Contains(fmt.Sprint(out["error"]), "does not recreate") {
@@ -491,7 +498,7 @@ func TestDampPolicy_ReplayIsIdempotent(t *testing.T) {
 	policyID, _ := prep["policy_id"].(string)
 	nextCMR, nextSPK := f.nextVerifier(t, 0x07)
 	body := map[string]any{
-		"sig": f.sign(t, prep["to_sign"].(string)), "verifier_cmr": nextCMR, "verifier_spk": nextSPK,
+		"sig": f.sign(t, prep["to_sign"].(string)), "verifier_cmrs": nextCMR, "verifier_spk": nextSPK,
 		"signed_tx": f.respend(f.vTxid, f.vVout, nextSPK),
 	}
 	code, first := f.policyComplete(t, policyID, body)
@@ -576,7 +583,7 @@ func TestDampPolicy_HeightBoundsRoundTrip(t *testing.T) {
 	policyID, _ := prep["policy_id"].(string)
 	nextCMR, nextSPK := f.nextVerifier(t, 0x11)
 	code, out := f.policyComplete(t, policyID, map[string]any{
-		"sig": f.sign(t, prep["to_sign"].(string)), "verifier_cmr": nextCMR, "verifier_spk": nextSPK,
+		"sig": f.sign(t, prep["to_sign"].(string)), "verifier_cmrs": nextCMR, "verifier_spk": nextSPK,
 		"signed_tx": f.respend(f.vTxid, f.vVout, nextSPK),
 	})
 	if code != 200 {
@@ -749,7 +756,7 @@ func TestDamp_RegisterComesFromTheHolderList(t *testing.T) {
 		ID: assetID, Ticker: "PILOT", Name: "Pilot", Precision: 0, Enforcement: "damp",
 		Damp: &store.DampBinding{
 			VerifierAsset: strings.Repeat("5a", 32), VerifierAmount: 1,
-			UserCMR: v.Programs.UCMR, VerifierCMR: v.Programs.PCMR, IssuerCMR: v.Programs.GCMR,
+			UserCMR: v.Programs.UCMR, VerifierCMR: v.Programs.PCMR, VerifierCMRs: v.shapeCMRs(), IssuerCMR: v.Programs.GCMR,
 			Whitelist: damp.KeyEntries([]string{keyA, keyB}), Tree: damp.TreeDMTv1,
 		},
 	}
