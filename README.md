@@ -249,7 +249,7 @@ curl -s localhost:8722/v1/transfers/<tid>/complete \
 curl -s localhost:8722/v1/log
 ```
 
-The same flow, driven programmatically against a regtest node, is the committed integration proof [`test/functional/feature_openamp_daemon.py`](https://github.com/GracedEternalKingCabbageMan/Sequentia/blob/claude/sequentia-bitcoin-sidechain-w6xady/test/functional/feature_openamp_daemon.py) in the node repository.
+The same flow, driven programmatically against a regtest node, is the committed integration proof [`test/functional/feature_openamp_daemon.py`](https://github.com/GracedEternalKingCabbageMan/Sequentia/blob/master/test/functional/feature_openamp_daemon.py) in the node repository.
 
 ## How openampd uses the Sequentia node
 
@@ -334,8 +334,8 @@ go test ./openampd/internal/elements
 
 ### Milestone artifacts
 
-- [`test/functional/feature_openamp_m0.py`](https://github.com/GracedEternalKingCabbageMan/Sequentia/blob/claude/sequentia-bitcoin-sidechain-w6xady/test/functional/feature_openamp_m0.py) (node repo): the M0 proof; demonstrates on regtest that enclave issuance, policy-co-signed transfer, clawback, and the contract-to-asset-ID binding all work against unmodified consensus.
-- [`test/functional/feature_openamp_daemon.py`](https://github.com/GracedEternalKingCabbageMan/Sequentia/blob/claude/sequentia-bitcoin-sidechain-w6xady/test/functional/feature_openamp_daemon.py) (node repo): end-to-end integration of a real `openampd` process with a regtest node, covering the hosted-transfer, rules, freeze, and clawback flows.
+- [`test/functional/feature_openamp_m0.py`](https://github.com/GracedEternalKingCabbageMan/Sequentia/blob/master/test/functional/feature_openamp_m0.py) (node repo): the M0 proof; demonstrates on regtest that enclave issuance, policy-co-signed transfer, clawback, and the contract-to-asset-ID binding all work against unmodified consensus.
+- [`test/functional/feature_openamp_daemon.py`](https://github.com/GracedEternalKingCabbageMan/Sequentia/blob/master/test/functional/feature_openamp_daemon.py) (node repo): end-to-end integration of a real `openampd` process with a regtest node, covering the hosted-transfer, rules, freeze, and clawback flows.
 - `openampd/internal/elements/testdata/vectors.json`: golden vectors proving the Go Elements primitives byte-exact against the node's test framework.
 
 ## Ecosystem
