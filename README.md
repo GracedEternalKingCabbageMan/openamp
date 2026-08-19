@@ -108,6 +108,8 @@ Witness stack for an enclave input, bottom to top: `<policy sig> <user sig> <lea
 | `POST /v1/issuer/assets` | Issue a co-signed restricted asset (requires `-demoissuer`) |
 | `POST /v1/issuer/damp-assets` | Prepare a network-enforced (OpenDAMP) asset (requires `-dampregistry`) |
 | `POST /v1/issuer/damp-assets/{id}/complete` | Supply the covenant CMRs and mint it |
+| `POST /v1/issuer/damp-policy` | Prepare a policy update (freeze/unfreeze/admit) for a network-enforced asset |
+| `POST /v1/issuer/damp-policy/{id}/complete` | Supply the recompiled CMR, the issuer signature and the respend |
 | `POST /v1/issuer/freeze` | Freeze or unfreeze a user |
 | `POST /v1/issuer/categories` | Set a user's categories |
 | `POST /v1/issuer/rules` | Replace an asset's policy rules |
@@ -174,6 +176,34 @@ The contract's `openamp` block gains `"enforcement": "damp"`, `verifier_asset`, 
 The genesis snapshot is published at seq 0 through the ordinary snapshot store, so `GET /v1/snapshots?asset=<id>` serves it like any other. Its `tree` is `dmt-v1`, the format the deployed covenants actually verify against, and a `dmt-v1` snapshot's `pi` is the covenant's own commitment (internal-order asset bytes, the covenant `rules_root`) rather than the `smt-v1` document commitment. It carries BOTH list predicates, because the covenant reads both: a whitelist root over recipient keys and a blacklist root over frozen outpoints. The genesis blacklist is **empty but not absent** — the empty interval tree still has a root (its guard interval), so "freeze nothing" is a commitment like any other and a missing root is a malformed policy rather than a permissive one. Blacklist entries are `SHA256(txid || BE32(vout))` with the txid in **internal** (consensus) byte order, not the reversed display form. Later policy versions go through `POST /v1/issuer/snapshots` and require the issuer signature as always.
 
 **Transaction shape limits are part of the covenant.** The deployed verifier program bounds its scan at `N_max_outputs = 6` and `N_max_inputs = 4`, so a single transfer may spend at most **two** UTXOs of the asset. That is a real operational constraint on a holder with fragmented coins, and it is committed into the program identity, so it cannot be raised for an asset already issued against it. The current bounds are pinned in `opendamp/vectors/addresses.json` under `programs`.
+
+### Policy updates: the freeze path for a network-enforced asset
+
+A co-signed asset is frozen by withholding a signature. A network-enforced one has no signature to withhold, so a freeze is a **publication plus a spend**: publish snapshot seq n+1 whose whitelist drops the holder (the covenant checks the owner key of every regulated input) and/or whose blacklist lists an outpoint (that UTXO alone stops moving), then respend the verifier output through the issuer path `G(I)` so the on-chain `C_V` commits to the new `pi`. Until that respend confirms, holders transfer under the OLD policy, because the old `C_V` is what their transfers spend. Both directions are reversible by a further update.
+
+This hits the same seam issuance does and resolves it the same way, so a policy update is also two phases.
+
+1. **`POST /v1/issuer/damp-policy`** takes a DELTA against the currently published policy, never a replacement set:
+
+   ```json
+   {"asset": "<id>",
+    "add_whitelist": ["<key>", {"key": "<key>", "send_after": 95200, "recv_after": 0}],
+    "remove_whitelist": ["<key>"],
+    "set_windows": [{"key": "<key>", "send_after": 95200, "recv_after": 0}],
+    "add_blacklist": [{"txid": "<display txid>", "vout": 3}],
+    "remove_blacklist": [{"txid": "<display txid>", "vout": 3}],
+    "reason": "court order 2026-1188"}
+   ```
+
+   `reason` is **required** and is written to the public transparency log BEFORE anything is signed, exactly as a clawback's is. The endpoint recomputes both roots and `pi_{n+1}` from the snapshot chain, builds and validates snapshot n+1, records a pending update, and returns `{"policy_id", "seq", "prev_pi", "pi_next", "whitelist", "blacklist", "change", "snapshot", "to_sign", "verifier_outpoint", "verifier_cmr_current", "derive_snapshot", "next"}`. Nothing is signed, published or broadcast. Refusals are the requests that would publish a policy the issuer did not mean: an empty holder list, a duplicate addition, a removal of something not listed, a change that changes nothing.
+
+2. **The issuer's toolchain** runs `opendamp derive --snapshot <derive_snapshot>` for the new `p_cmr` and `C_V(pi_{n+1})` address, and `opendamp issuer-update --snapshot <current> --next-snapshot <derive_snapshot> --request <fee coin> --issuer-privkey <key>` for the finished, signed respend. The issuer brings its own fee coin: this is the issuer's transaction, not the operator's.
+
+3. **`POST /v1/issuer/damp-policy/{id}/complete`** with `{"sig", "verifier_cmr", "verifier_spk": "<optional>", "signed_tx"}`. `sig` is the issuer update key's BIP340 signature over `to_sign` (the tagged snapshot hash), which is the same signature every published seq after 0 has always required, and it is checked FIRST. `verifier_cmr` must **differ** from the current one — an unchanged CMR means the derivation ran against the old policy — and a supplied `verifier_spk` must equal the address derived from it. `signed_tx` is checked structurally: it must consume the recorded verifier outpoint and recreate `C_V` at the new address carrying exactly q of the verifier asset. Only then does it run the mempool gate, broadcast, and publish seq n+1. Replaying a completed update returns the same txid with `"idempotent": true` and never broadcasts or publishes twice.
+
+   The authority split is issuance's, unchanged: this server cannot compile Simplicity and cannot produce a `G(I)` witness, so it is authoritative about POLICY (both roots, `pi`, the sequence, the reason, the record) and accepts a program identity it cannot compile only alongside the checks it can make.
+
+**Height bounds live in the whitelist leaf.** A whitelist entry is `SHA256(0x00 || key || BE32(send_after) || BE32(recv_after))`: `send_after` is the lockup binding the OWNER of a regulated input, `recv_after` the receive window binding the RECIPIENT of a regulated output, and zero means unbounded. In the snapshot document an unbounded entry is a **bare hex string** and a bounded one an **object**, so every document written before bounds existed still hashes and verifies exactly as it did. Computing a whitelist root from keys alone would publish a commitment that omits every bound, which is a `pi` no deployed program answers to.
 
 **On a network-enforced asset**, every co-signing path — `POST /v1/transfers`, `POST /v1/cosign`, `/v1/issuer/burn`, `/v1/issuer/reissue`, `/v1/issuer/clawback` — answers `409 {"error": "this asset is network-enforced: transfers are built by the holder from the published snapshot, not co-signed here"}`. The read paths stay useful instead of reporting an empty enclave: `GET /v1/users/{aid}/address` returns the holder's covenant address (no leaves, and `?confidential=1` is refused because the covenant must read explicit asset ids), and balance, holders and supply are scanned at the covenant scripts.
 
