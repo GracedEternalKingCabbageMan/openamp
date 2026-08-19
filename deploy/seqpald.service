@@ -1,0 +1,20 @@
+[Unit]
+Description=SeqPal gateway (static SPA + token-gated issuance proxy to openampd)
+After=network.target openampd.service
+Wants=openampd.service
+
+[Service]
+Type=simple
+# Reuses openampd's env file for OPENAMPD_ISSUER_TOKEN (same secret, box-only).
+EnvironmentFile=/root/sequentia/openampd.env
+ExecStart=/root/sequentia/openamp/openampd/seqpald \
+  -listen 127.0.0.1:8724 \
+  -openamp http://127.0.0.1:8722 \
+  -webroot /root/sequentia/SeqPal/dist \
+  -datadir /root/sequentia/seqpald-data \
+  -endpoint https://sequentiatestnet.com/openamp
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

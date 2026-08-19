@@ -839,7 +839,16 @@ func (s *Server) handleClawbackComplete(w http.ResponseWriter, r *http.Request) 
 		httpErr(w, 500, "persist clawback: %v", err)
 		return
 	}
-	httpJSON(w, map[string]any{"txid": txid, "atoms": pc.Atoms})
+	// A two-phase PLEDGE seizure ends here too, and must leave the pledge in
+	// the same closed state a one-call seizure does. Only after broadcast: a
+	// sweep that never reached the network must leave the collateral locked.
+	if pc.PledgeID != "" {
+		if err := s.markPledgeSeized(pc.PledgeID, txid, pc.Reason); err != nil {
+			httpErr(w, 500, "%v", err)
+			return
+		}
+	}
+	httpJSON(w, map[string]any{"txid": txid, "atoms": pc.Atoms, "pledge": pc.PledgeID})
 }
 
 // handleHolders is the ownership report: confirmed enclave balances per AID.
