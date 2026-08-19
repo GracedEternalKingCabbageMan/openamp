@@ -57,7 +57,7 @@ asset   = M(entropy, 0x00 * 32)
 token   = M(entropy, 0x01 || 0x00 * 31)     # reissuance token, explicit issuance
 ```
 
-All values in internal byte order; display hex is reversed. A verifier holding the contract JSON recomputes this chain and compares against the asset ID it observes on-chain. If they match, `openamp.policy_pubkey` provably governs the asset. Reference implementations: `derive_issuance_ids` in the M0 proof ([`test/functional/feature_openamp_m0.py`](https://github.com/GracedEternalKingCabbageMan/Sequentia/blob/claude/sequentia-bitcoin-sidechain-w6xady/test/functional/feature_openamp_m0.py) in the node repository, pure Python, no node code) and `DeriveIssuanceIDs` in [`openampd/internal/fastmerkle`](../openampd/internal/fastmerkle/fastmerkle.go) (Go, golden-vectored against the former).
+All values in internal byte order; display hex is reversed. A verifier holding the contract JSON recomputes this chain and compares against the asset ID it observes on-chain. If they match, `openamp.policy_pubkey` provably governs the asset. Reference implementations: `derive_issuance_ids` in the M0 proof ([`test/functional/feature_openamp_m0.py`](https://github.com/GracedEternalKingCabbageMan/Sequentia/blob/master/test/functional/feature_openamp_m0.py) in the node repository, pure Python, no node code) and `DeriveIssuanceIDs` in [`openampd/internal/fastmerkle`](../openampd/internal/fastmerkle/fastmerkle.go) (Go, golden-vectored against the former).
 
 ## 4. Enclave outputs
 
