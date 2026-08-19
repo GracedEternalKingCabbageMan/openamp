@@ -153,7 +153,10 @@ type DampBinding struct {
 	Whitelist        []damp.PredicateEntry `json:"whitelist,omitempty"`
 	Tree             string                `json:"tree"` // "dmt-v1"
 	UserCMR          string                `json:"user_cmr"`
+	// VerifierCMR is the CANONICAL shape's program. VerifierCMRs is the whole
+	// menu, in taptree order, which is what the address is derived from.
 	VerifierCMR      string                `json:"verifier_cmr"`
+	VerifierCMRs     []string              `json:"verifier_cmrs,omitempty"`
 	IssuerCMR        string                `json:"issuer_cmr"`
 	UserCovenantSPK  string                `json:"user_covenant_spk"`     // C_U(initial holder), hex
 	UserCovenantAddr string                `json:"user_covenant_address"` // best-effort, node-decoded
@@ -459,7 +462,8 @@ type PendingDampPolicy struct {
 	VerifierTxid    string `json:"verifier_txid"`
 	VerifierVout    uint32 `json:"verifier_vout"`
 	VerifierSPKPrev string `json:"verifier_spk_prev"`
-	VerifierCMRPrev string `json:"verifier_cmr_prev"`
+	VerifierCMRPrev  string   `json:"verifier_cmr_prev"`
+	VerifierCMRsPrev []string `json:"verifier_cmrs_prev,omitempty"`
 	IssuerUpdateKey string `json:"issuer_update_key"`
 
 	Snapshot       json.RawMessage `json:"snapshot"`         // canonical seq n+1 bytes

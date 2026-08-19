@@ -29,9 +29,13 @@ import (
 
 type dampVec struct {
 	Programs struct {
-		UCMR string `json:"u_cmr"`
-		PCMR string `json:"p_cmr"`
-		GCMR string `json:"g_cmr"`
+		UCMR   string `json:"u_cmr"`
+		PCMR   string `json:"p_cmr_canonical"`
+		GCMR   string `json:"g_cmr"`
+		Shapes []struct {
+			Shape string `json:"shape"`
+			CMR   string `json:"cmr"`
+		} `json:"verifier_shapes"`
 	} `json:"programs"`
 	Policy struct {
 		WhitelistRoot string `json:"whitelist_root"`
@@ -313,7 +317,7 @@ func TestDamp_FullIssuance(t *testing.T) {
 	}
 
 	code, out := dampComplete(t, s, prepareID, map[string]any{
-		"user_cmr": v.Programs.UCMR, "verifier_cmr": v.Programs.PCMR, "issuer_cmr": v.Programs.GCMR,
+		"user_cmr": v.Programs.UCMR, "verifier_cmrs": v.shapeCMRs(), "issuer_cmr": v.Programs.GCMR,
 		"pi": pi, "verifier_spk": v.VerifierCovenant.ScriptPubKey,
 	})
 	if code != 200 {
@@ -464,7 +468,7 @@ func TestDamp_FullIssuance(t *testing.T) {
 
 	// The prepare is consumed: a replay cannot mint a second time.
 	code, out = dampComplete(t, s, prepareID, map[string]any{
-		"user_cmr": v.Programs.UCMR, "verifier_cmr": v.Programs.PCMR, "pi": pi,
+		"user_cmr": v.Programs.UCMR, "verifier_cmrs": v.shapeCMRs(), "pi": pi,
 	})
 	if code != 404 {
 		t.Fatalf("replayed complete: want 404, got %d %v", code, out)
@@ -487,7 +491,7 @@ func TestDamp_PiMismatchRefused(t *testing.T) {
 	before := len(node.sends)
 
 	code, out := dampComplete(t, s, prep["prepare_id"].(string), map[string]any{
-		"user_cmr": v.Programs.UCMR, "verifier_cmr": v.Programs.PCMR,
+		"user_cmr": v.Programs.UCMR, "verifier_cmrs": v.shapeCMRs(),
 		"pi": strings.Repeat("11", 32),
 	})
 	if code != 409 {
@@ -522,7 +526,7 @@ func TestDamp_VerifierSPKMismatchRefused(t *testing.T) {
 	_, prep := dampPrepare(t, s, dampPrepareBody(v))
 	before := len(node.sends)
 	code, out := dampComplete(t, s, prep["prepare_id"].(string), map[string]any{
-		"user_cmr": v.Programs.UCMR, "verifier_cmr": v.Programs.PCMR,
+		"user_cmr": v.Programs.UCMR, "verifier_cmrs": v.shapeCMRs(),
 		"pi": prep["pi"], "verifier_spk": "5120" + strings.Repeat("cd", 32),
 	})
 	if code != 409 || !strings.Contains(out["error"].(string), "verifier_spk mismatch") {
@@ -629,7 +633,7 @@ func seedDampAsset(t *testing.T, s *Server, st *store.Store, v dampVec) (*store.
 			VerifierAsset: strings.Repeat("b2", 32), VerifierAmount: 1,
 			IssuerUpdateKey: v.UserCovenants[1].OwnerXOnly, HolderPubkey: v.UserCovenants[0].OwnerXOnly,
 			Pi: strings.Repeat("d1", 32), WhitelistRoot: v.Policy.WhitelistRoot, Tree: damp.TreeDMTv1,
-			UserCMR: v.Programs.UCMR, VerifierCMR: v.Programs.PCMR, IssuerCMR: v.Programs.GCMR,
+			UserCMR: v.Programs.UCMR, VerifierCMR: v.Programs.PCMR, VerifierCMRs: v.shapeCMRs(), IssuerCMR: v.Programs.GCMR,
 			UserCovenantSPK: v.UserCovenants[0].ScriptPubKey,
 			VerifierSPK:     v.VerifierCovenant.ScriptPubKey,
 		},
@@ -787,4 +791,25 @@ func TestDamp_CosignAssetUnaffected(t *testing.T) {
 	if strings.Contains(string(raw), `"damp"`) || strings.Contains(string(raw), `"enforcement"`) {
 		t.Fatalf("a cosign asset record must omit both keys: %s", raw)
 	}
+}
+
+// shapeCMRs is the ordered menu of primary-program CMRs: one per transaction
+// shape, canonical first. The verifier taptree is built from all of them, so a
+// caller that sends one is sending a different address.
+func (v *dampVec) shapeCMRs() []string {
+	out := make([]string, 0, len(v.Programs.Shapes))
+	for _, sh := range v.Programs.Shapes {
+		out = append(out, sh.CMR)
+	}
+	return out
+}
+
+func (v *dampVec) shapeCMRBytes() [][32]byte {
+	out := make([][32]byte, 0, len(v.Programs.Shapes))
+	for _, sh := range v.Programs.Shapes {
+		var c [32]byte
+		copy(c[:], mustHexBytes(sh.CMR))
+		out = append(out, c)
+	}
+	return out
 }

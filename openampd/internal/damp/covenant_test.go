@@ -1,6 +1,7 @@
 package damp
 
 import (
+	"strings"
 	"encoding/hex"
 	"encoding/json"
 	"os"
@@ -39,9 +40,13 @@ func TestCovenantPolicyMatchesVectors(t *testing.T) {
 			BlacklistedOutpointKeys []string `json:"blacklisted_outpoint_keys"`
 		} `json:"policy"`
 		Programs struct {
-			UCMR string `json:"u_cmr"`
-			PCMR string `json:"p_cmr"`
-			GCMR string `json:"g_cmr"`
+			UCMR   string `json:"u_cmr"`
+			PCMR   string `json:"p_cmr_canonical"`
+			GCMR   string `json:"g_cmr"`
+			Shapes []struct {
+				Shape string `json:"shape"`
+				CMR   string `json:"cmr"`
+			} `json:"verifier_shapes"`
 		} `json:"programs"`
 	}
 	if err := json.Unmarshal(raw, &v); err != nil {
@@ -115,8 +120,19 @@ func TestLoadProgramRegistryAcceptsVectors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadProgramRegistry: %v", err)
 	}
-	if reg.UserCMR == [32]byte{} || reg.VerifierCMR == [32]byte{} || reg.IssuerCMR == [32]byte{} {
+	if reg.UserCMR == [32]byte{} || reg.IssuerCMR == [32]byte{} {
 		t.Fatal("registry loaded a zero CMR")
+	}
+	if len(reg.VerifierCMRs) < 2 {
+		t.Fatalf("expected a menu of verifier shapes, got %d", len(reg.VerifierCMRs))
+	}
+	for i, c := range reg.VerifierCMRs {
+		if c == [32]byte{} {
+			t.Fatalf("verifier shape %d loaded a zero CMR", i)
+		}
+	}
+	if reg.VerifierCMR() != reg.VerifierCMRs[0] {
+		t.Fatal("the canonical shape must be the first leaf of the menu")
 	}
 }
 
@@ -127,6 +143,26 @@ func TestLoadProgramRegistryRefusesPartialSets(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := LoadProgramRegistry(p); err == nil {
-		t.Fatal("a registry missing p_cmr and g_cmr must be refused")
+		t.Fatal("a registry missing the verifier shape menu and g_cmr must be refused")
+	}
+}
+
+// A pinning file from before the shape menu must be refused with an
+// explanation, not read as a one-leaf taptree: that derives a real but WRONG
+// address, and the mistake would only surface when a holder could not spend.
+func TestLoadProgramRegistryRefusesAPreMenuFile(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "premenu.json")
+	z := hex.EncodeToString(make([]byte, 32))
+	body := `{"u_cmr":"` + z + `","p_cmr":"` + z + `","g_cmr":"` + z + `"}`
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadProgramRegistry(p)
+	if err == nil {
+		t.Fatal("a single p_cmr must not be accepted as a menu")
+	}
+	if !strings.Contains(err.Error(), "verifier_shapes") {
+		t.Fatalf("the error must name what is missing: %v", err)
 	}
 }

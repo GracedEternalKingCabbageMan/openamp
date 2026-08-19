@@ -27,17 +27,17 @@ const (
 	bob   = "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766"
 	carol = "462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b"
 
-	wantLeafGuardLo = "9e1736c43d19118e6ce4302118af337109491ecc52757dfb949bad6a7940b0c2"
-	wantLeafGuardHi = "dc8c3b446f21ee93e5ea4d016c916e8ffd952e3f594462fe0f2a0befe3580c59"
-	wantEmptyRoot   = "b883626f07bded09c45c76719b43e85945c0ac41ee370d47932f269dd6eabfed"
-	wantThreeRoot   = "66327e6c8cf6cfff8e1c0661e2469d4aa5ae5aa65206003f6758ff1180619a50"
+	wantLeafGuardLo = "7324b5c72b51bb5d4c180f1109cfd347b60473882145841c39f3e584576296f9"
+	wantLeafGuardHi = "393363907768ca818617437791eeca0978c26a33c85a0ba2596ba50a72db6535"
+	wantEmptyRoot   = "0aaadc74dfaa97f90c332b98884c3afecc5c5a54ae2344cab430fb2f77118e0b"
+	wantThreeRoot   = "4c99d9aa10b63129d71502a17e2c483b168fc2e6a7cab08aff82b3ca01d00eed"
 )
 
 func TestGuardLeafGoldenVectors(t *testing.T) {
-	if got := hex.EncodeToString(sliceOf(LeafHash(Unrestricted(GuardLo)))); got != wantLeafGuardLo {
+	if got := hex.EncodeToString(sliceOf(GuardLeafHash(GuardLo))); got != wantLeafGuardLo {
 		t.Errorf("leaf(GuardLo) = %s, want %s", got, wantLeafGuardLo)
 	}
-	if got := hex.EncodeToString(sliceOf(LeafHash(Unrestricted(GuardHi)))); got != wantLeafGuardHi {
+	if got := hex.EncodeToString(sliceOf(GuardLeafHash(GuardHi))); got != wantLeafGuardHi {
 		t.Errorf("leaf(GuardHi) = %s, want %s", got, wantLeafGuardHi)
 	}
 }
@@ -97,7 +97,7 @@ func TestMembershipRoundTrip(t *testing.T) {
 	}
 	root := tree.Root()
 	for _, k := range []Key{
-		mustKey(t, alice), mustKey(t, bob), mustKey(t, carol), GuardLo, GuardHi,
+		mustKey(t, alice), mustKey(t, bob), mustKey(t, carol),
 	} {
 		p, ok := tree.Prove(k)
 		if !ok {
@@ -172,58 +172,6 @@ func TestNodeHashIsPositional(t *testing.T) {
 	b := LeafHash(Unrestricted(mustKey(t, bob)))
 	if NodeHash(a, b) == NodeHash(b, a) {
 		t.Fatal("node() must NOT sort its children")
-	}
-}
-
-func TestAdjacencyBracketsAnAbsentKey(t *testing.T) {
-	tree, err := New([]Entry{Unrestricted(mustKey(t, alice)), Unrestricted(mustKey(t, bob))})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	root := tree.Root()
-	lo, hi, loProof, hiProof, ok := tree.Adjacent(mustKey(t, carol))
-	if !ok {
-		t.Fatal("carol is absent, so an adjacency proof must exist")
-	}
-	// carol (0x46..) sits between alice (0x1b..) and bob (0x4d..).
-	if lo != mustKey(t, alice) || hi != mustKey(t, bob) {
-		t.Errorf("bracket = (%x, %x), want (alice, bob)", lo, hi)
-	}
-	if !Verify(root, lo, loProof) || !Verify(root, hi, hiProof) {
-		t.Error("both bracket proofs must verify")
-	}
-	if hiProof.Path.Index != loProof.Path.Index+1 {
-		t.Errorf("bracket slots must be adjacent: %d then %d",
-			loProof.Path.Index, hiProof.Path.Index)
-	}
-	// A member has no adjacency proof.
-	if _, _, _, _, ok := tree.Adjacent(mustKey(t, alice)); ok {
-		t.Error("a member must not get an adjacency proof")
-	}
-}
-
-func TestAdjacencyUsesGuardsAtTheEdges(t *testing.T) {
-	tree, err := New([]Entry{Unrestricted(mustKey(t, bob))})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	// alice (0x1b..) is below the only member, so the low bracket is GuardLo.
-	lo, hi, _, _, ok := tree.Adjacent(mustKey(t, alice))
-	if !ok {
-		t.Fatal("expected an adjacency proof")
-	}
-	if lo != GuardLo || hi != mustKey(t, bob) {
-		t.Errorf("bracket = (%x, %x), want (GuardLo, bob)", lo, hi)
-	}
-	// A key above every member brackets against GuardHi.
-	var high Key
-	high[0] = 0xfe
-	lo, hi, _, _, ok = tree.Adjacent(high)
-	if !ok {
-		t.Fatal("expected an adjacency proof")
-	}
-	if lo != mustKey(t, bob) || hi != GuardHi {
-		t.Errorf("bracket = (%x, %x), want (bob, GuardHi)", lo, hi)
 	}
 }
 
@@ -412,5 +360,47 @@ func TestOutpointKeyIsTxidThenBigEndianVout(t *testing.T) {
 	}()
 	if got != want {
 		t.Errorf("OutpointKey = %x, want %x", got, want)
+	}
+}
+
+// A guard slot must not be exhibitable as an approved key.
+//
+// It used to be. Both guards were ordinary 0x00-domain key leaves with
+// unrestricted windows, so Prove returned a proof for either and the covenant
+// accepted it -- and because a recipient key reaches C_U(Y) only through a hash,
+// Y did not have to be a valid point. Paying regulated units to C_U(GuardHi)
+// therefore passed confinement, the whitelist and the receive window, and burned
+// them beyond any recovery the protocol has.
+func TestGuardsAreNotApprovedKeys(t *testing.T) {
+	tree, err := New([]Entry{Unrestricted(mustKey(t, alice)), Unrestricted(mustKey(t, bob))})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	root := tree.Root()
+	for name, guard := range map[string]Key{"GuardLo": GuardLo, "GuardHi": GuardHi} {
+		if _, ok := tree.SlotOf(guard); ok {
+			t.Errorf("%s must occupy no key slot", name)
+		}
+		if _, ok := tree.EntryOf(guard); ok {
+			t.Errorf("%s must not be an entry", name)
+		}
+		if _, ok := tree.Prove(guard); ok {
+			t.Errorf("%s must have no membership proof", name)
+		}
+		// A hand-built proof cannot be made to verify either: the guard slot
+		// hashes under a domain no key leaf can produce.
+		forged := &Proof{Entry: Unrestricted(guard)}
+		if Verify(root, guard, forged) {
+			t.Errorf("a forged %s proof must not verify", name)
+		}
+	}
+	if GuardLeafHash(GuardHi) == LeafHash(Entry{Key: GuardHi}) {
+		t.Error("a guard leaf must not collide with a key leaf")
+	}
+	if GuardLeafHash(GuardLo) == LeafHash(Entry{Key: GuardLo}) {
+		t.Error("a guard leaf must not collide with a key leaf")
+	}
+	if GuardLeafHash(GuardLo) == IntervalLeafHash(GuardLo, GuardLo) {
+		t.Error("a guard leaf must not collide with an interval leaf")
 	}
 }

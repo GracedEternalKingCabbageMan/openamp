@@ -23,15 +23,9 @@ use crate::dmt;
 use crate::net::Net;
 use crate::programs::{
     self, compile_issuer, compile_user, compile_verifier, satisfy_program, AssetParams,
-    SlotWitness,
+    InputSlotWitness, SenderWitness, Shape, SlotWitness,
 };
-use crate::tapscript::{cu_spend_info, cv_spend_info, CovenantSpendInfo};
-
-/// Maximum inputs and outputs the verifier program tolerates. It asserts both
-/// bounds, so a transaction exceeding either cannot be spent at all - an
-/// unscanned input or output would otherwise escape the covenant.
-pub const N_MAX_OUTPUTS: usize = programs::N_OUT_SLOTS + 1;
-pub const N_MAX_INPUTS: usize = programs::N_IN_SLOTS + 1;
+use crate::tapscript::{cu_spend_info, cv_spend_info, CovenantSpendInfo, VerifierSpendInfo};
 
 /// Everything derived from the per-asset constants and one policy version.
 pub struct Ctx {
@@ -41,14 +35,21 @@ pub struct Ctx {
     pub wl_tree: dmt::Tree,
     pub bl_tree: dmt::IntervalTree,
     pub limit: u64,
+    /// The policy commitment, which every verifier leaf commits to. `seq` is
+    /// the only thing in it the roots do not already determine, and it is what
+    /// makes two policy versions with identical rules distinguishable on chain.
+    pub seq: u64,
+    pub pi: [u8; 32],
     pub user: CompiledProgram,
-    pub verifier: CompiledProgram,
+    /// One primary program per `programs::SHAPES` entry, in that order.
+    pub verifiers: Vec<CompiledProgram>,
     pub issuer: CompiledProgram,
+    verifier_spend: VerifierSpendInfo,
 }
 
 impl Ctx {
     /// Convenience for the common case: unrestricted whitelist entries, no
-    /// blacklist, no transfer limit.
+    /// blacklist, no transfer limit, policy sequence 0.
     pub fn new(
         net: Net,
         params: AssetParams,
@@ -67,11 +68,14 @@ impl Ctx {
             entries,
             bl_outpoint_keys,
             programs::NO_LIMIT,
+            0,
         )
     }
 
     /// The full policy: whitelist entries (each with its height windows), the
-    /// blacklisted outpoint policy keys, and the transfer limit.
+    /// blacklisted outpoint policy keys, the transfer limit, and the policy
+    /// sequence number.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_policy(
         net: Net,
         params: AssetParams,
@@ -79,14 +83,41 @@ impl Ctx {
         wl_entries: Vec<dmt::Entry>,
         bl_outpoint_keys: &[[u8; 32]],
         limit: u64,
+        seq: u64,
     ) -> Result<Self, String> {
         let wl_tree = dmt::Tree::new(wl_entries)?;
         let bl_tree = dmt::IntervalTree::new(bl_outpoint_keys.to_vec())?;
         let user = compile_user(&params)?;
         let u_cmr = user.commit().cmr();
-        let verifier =
-            compile_verifier(&params, u_cmr, &wl_tree.root(), &bl_tree.root(), limit)?;
+
+        let rules_root = crate::policy::rules_root(
+            Some(bl_tree.root()),
+            Some(wl_tree.root()),
+            (limit != programs::NO_LIMIT).then_some(limit),
+            None,
+        );
+        let pi = crate::policy::pi(
+            programs::asset_internal_bytes(&params.asset_a),
+            seq,
+            rules_root,
+        );
+
+        let mut verifiers = Vec::with_capacity(programs::SHAPES.len());
+        for shape in programs::SHAPES {
+            verifiers.push(compile_verifier(
+                &params,
+                u_cmr,
+                &wl_tree.root(),
+                &bl_tree.root(),
+                limit,
+                &pi,
+                shape,
+            )?);
+        }
         let issuer = compile_issuer(&issuer_key)?;
+        let shape_cmrs: Vec<_> = verifiers.iter().map(|p| p.commit().cmr()).collect();
+        let verifier_spend = cv_spend_info(&shape_cmrs, issuer.commit().cmr())?;
+
         Ok(Ctx {
             net,
             params,
@@ -94,28 +125,43 @@ impl Ctx {
             wl_tree,
             bl_tree,
             limit,
+            seq,
+            pi,
             user,
-            verifier,
+            verifiers,
             issuer,
+            verifier_spend,
         })
     }
 
     pub fn u_cmr(&self) -> simplicityhl::simplicity::Cmr {
         self.user.commit().cmr()
     }
-    pub fn p_cmr(&self) -> simplicityhl::simplicity::Cmr {
-        self.verifier.commit().cmr()
-    }
     pub fn g_cmr(&self) -> simplicityhl::simplicity::Cmr {
         self.issuer.commit().cmr()
+    }
+    /// CMR of the primary program for `shape`.
+    pub fn p_cmr(&self, shape: Shape) -> Result<simplicityhl::simplicity::Cmr, String> {
+        Ok(self.verifier_for(shape)?.commit().cmr())
+    }
+    pub fn verifier_for(&self, shape: Shape) -> Result<&CompiledProgram, String> {
+        let idx = programs::SHAPES
+            .iter()
+            .position(|s| *s == shape)
+            .ok_or_else(|| format!("shape {shape} is not in the menu"))?;
+        Ok(&self.verifiers[idx])
     }
 
     pub fn cu_info(&self, owner: &XOnlyPublicKey) -> CovenantSpendInfo {
         cu_spend_info(self.u_cmr(), owner).0
     }
 
-    pub fn cv_info(&self) -> CovenantSpendInfo {
-        cv_spend_info(self.p_cmr(), self.g_cmr()).0
+    pub fn cv_info(&self) -> &CovenantSpendInfo {
+        &self.verifier_spend.info
+    }
+
+    pub fn verifier_spend(&self) -> &VerifierSpendInfo {
+        &self.verifier_spend
     }
 }
 
@@ -200,11 +246,13 @@ pub struct BuiltTransfer {
     /// Input indexes of the sender's C_U inputs.
     pub user_inputs: Vec<usize>,
     /// (input index, owner key, outpoint) for every input carrying asset A. The
-    /// verifier proves each owner is whitelisted and each outpoint unlisted, so
-    /// the builder has to know both.
+    /// verifier proves the owner once and each outpoint unlisted, so the builder
+    /// has to know both.
     pub a_inputs: Vec<(usize, XOnlyPublicKey, OutPoint)>,
     /// Input index of the fee UTXO.
     pub fee_input: usize,
+    /// The narrowest leaf of the verifier taptree that can spend this shape.
+    pub shape: Shape,
 }
 
 /// Build a transfer, refusing one the covenant would reject.
@@ -221,19 +269,26 @@ pub fn build_transfer(ctx: &Ctx, req: &TransferReq) -> Result<BuiltTransfer, Str
 
 /// The policy checks P(pi) will apply, evaluated locally so the builder can
 /// explain a refusal.
-pub fn preflight_policy(
-    ctx: &Ctx,
-    req: &TransferReq,
-    built: &BuiltTransfer,
-) -> Result<(), String> {
-    // Height windows: the covenant requires lockHeight >= each bound.
+pub fn preflight_policy(ctx: &Ctx, req: &TransferReq, built: &BuiltTransfer) -> Result<(), String> {
+    // Height windows: the covenant requires lockHeight >= each bound. The
+    // sender's lockup binds because they own every regulated input; a
+    // recipient's receive window binds only on a PAYMENT, never on the sender's
+    // own change, which is not an acquisition.
     let mut needed = 0u32;
-    for (_, owner, _) in &built.a_inputs {
-        if let Some(e) = ctx.wl_tree.entry_of(&owner.serialize()) {
-            needed = needed.max(e.send_after);
-        }
-    }
+    let sender_entry = ctx
+        .wl_tree
+        .entry_of(&req.sender.serialize())
+        .ok_or_else(|| {
+            format!(
+                "owner key {} is not in the whitelist: these coins are frozen",
+                req.sender
+            )
+        })?;
+    needed = needed.max(sender_entry.send_after);
     for (_, owner) in &built.a_outputs {
+        if *owner == req.sender {
+            continue; // change
+        }
         if let Some(e) = ctx.wl_tree.entry_of(&owner.serialize()) {
             needed = needed.max(e.recv_after);
         }
@@ -247,7 +302,7 @@ pub fn preflight_policy(
     }
 
     // Transfer limit: what leaves the sender's hands. Change does not count.
-    let paid = payments_to_others(req.sender, built);
+    let paid = payments_to_others(req.sender, built)?;
     if paid > ctx.limit {
         return Err(format!(
             "this transfer pays {paid} atoms to other owners, over the committed \
@@ -262,13 +317,33 @@ pub fn preflight_policy(
 /// sender. Identified by OWNER KEY, never by output position - a spender chooses
 /// positions, so treating "the last A output" as change would be an aliasing bug
 /// the covenant does not share.
-pub fn payments_to_others(sender: XOnlyPublicKey, built: &BuiltTransfer) -> u64 {
-    built
-        .a_outputs
-        .iter()
-        .filter(|(_, owner)| *owner != sender)
-        .map(|(i, _)| built.tx.output[*i].value.explicit().unwrap_or(0))
-        .sum()
+///
+/// A payment with a blinded value is an ERROR, not a zero. The covenant refuses
+/// one outright (`explicit_value` panics), so scoring it as zero here would let
+/// the preflight wave through a transfer the node then rejects for a reason the
+/// error message never mentioned - and, worse, would report an under-limit total
+/// for a transaction whose real total is unknown.
+pub fn payments_to_others(
+    sender: XOnlyPublicKey,
+    built: &BuiltTransfer,
+) -> Result<u64, String> {
+    let mut total: u64 = 0;
+    for (i, owner) in &built.a_outputs {
+        if *owner == sender {
+            continue; // change may stay blinded
+        }
+        let value = built.tx.output[*i].value.explicit().ok_or_else(|| {
+            format!(
+                "output {i} pays {owner} in the regulated asset with a blinded value; \
+                 a payment to another owner must expose its value or the transfer \
+                 limit could be evaded behind a commitment"
+            )
+        })?;
+        total = total
+            .checked_add(value)
+            .ok_or("payments to other owners overflow a u64")?;
+    }
+    Ok(total)
 }
 
 pub fn build_transfer_unchecked(ctx: &Ctx, req: &TransferReq) -> Result<BuiltTransfer, String> {
@@ -344,12 +419,12 @@ pub fn build_transfer_unchecked(ctx: &Ctx, req: &TransferReq) -> Result<BuiltTra
     }
     outputs.push(TxOut::new_fee(req.fee_amount, fee_asset));
 
-    if outputs.len() > N_MAX_OUTPUTS {
-        return Err(format!(
-            "{} outputs exceeds the covenant's N_max of {N_MAX_OUTPUTS}",
-            outputs.len()
-        ));
-    }
+    // The leaf that will spend this. `shape_for` refuses a transaction wider
+    // than every leaf in the menu, which is the check the builder used to make
+    // for outputs only: N_MAX_INPUTS existed as a constant and was never
+    // enforced, so three regulated inputs built cleanly and then died in the
+    // BitMachine with an opaque jet failure.
+    let shape = programs::shape_for(inputs.len(), outputs.len())?;
 
     if req.locktime >= 500_000_000 {
         return Err(format!(
@@ -372,16 +447,14 @@ pub fn build_transfer_unchecked(ctx: &Ctx, req: &TransferReq) -> Result<BuiltTra
         a_inputs,
         user_inputs,
         fee_input,
+        shape,
     })
 }
 
 /// The blacklist policy key of an outpoint. `OutPoint`'s txid is stored in
 /// internal byte order, which is exactly what the covenant hashes.
 pub fn outpoint_policy_key(outpoint: &OutPoint) -> [u8; 32] {
-    dmt::outpoint_key(
-        &outpoint.txid.to_byte_array(),
-        outpoint.vout,
-    )
+    dmt::outpoint_key(&outpoint.txid.to_byte_array(), outpoint.vout)
 }
 
 /// Script pubkey of a P2TR key-path output for `internal_key` (no tree).
@@ -391,11 +464,7 @@ pub fn p2tr_keypath_spk(internal_key: &XOnlyPublicKey) -> Script {
     let (out_key, _) = internal_key
         .add_tweak(&secp, &tweak)
         .expect("tweak is valid");
-    let mut spk = Vec::with_capacity(34);
-    spk.push(0x51);
-    spk.push(0x20);
-    spk.extend_from_slice(&out_key.serialize());
-    Script::from(spk)
+    crate::tapscript::p2tr_spk(&out_key)
 }
 
 fn elements_utxos(prevouts: &[TxOut]) -> Vec<ElementsUtxo> {
@@ -434,7 +503,10 @@ pub fn sig_all_digest(env: &ElementsEnv<Arc<Transaction>>) -> [u8; 32] {
     env.c_tx_env().sighash_all().to_byte_array()
 }
 
-pub fn sign_bip340(privkey: &[u8; 32], digest: &[u8; 32]) -> Result<([u8; 64], XOnlyPublicKey), String> {
+pub fn sign_bip340(
+    privkey: &[u8; 32],
+    digest: &[u8; 32],
+) -> Result<([u8; 64], XOnlyPublicKey), String> {
     let secp = Secp256k1::new();
     let sk = SecretKey::from_slice(privkey).map_err(|e| format!("bad private key: {e}"))?;
     let kp = Keypair::from_secret_key(&secp, &sk);
@@ -444,9 +516,32 @@ pub fn sign_bip340(privkey: &[u8; 32], digest: &[u8; 32]) -> Result<([u8; 64], X
     Ok((*sig.as_ref(), xonly))
 }
 
+/// Sequentia grants a Simplicity spend four weight units of execution budget per
+/// witness byte (`SIMPLICITY_BUDGET_PER_WITNESS_BYTE`, src/script/script.h in
+/// the node), plus a flat 50. Mirrored here so the builder refuses locally
+/// rather than emitting a transaction the node will reject.
+pub const BUDGET_PER_WITNESS_BYTE: u64 = 4;
+const BUDGET_OFFSET: u64 = 50;
+const BUDGET_MAX: u64 = 4_000_050;
+
+fn budget_milliweight(stack_bytes: usize) -> u64 {
+    (stack_bytes as u64 * BUDGET_PER_WITNESS_BYTE + BUDGET_OFFSET).min(BUDGET_MAX) * 1000
+}
+
+fn cost_milliweight(cost: simplicityhl::simplicity::Cost) -> u32 {
+    // Cost's inner value is private; its Debug form is `Cost(<milliweight>)`.
+    format!("{cost:?}")
+        .trim_start_matches("Cost(")
+        .trim_end_matches(')')
+        .parse()
+        .expect("Cost debug format is Cost(<n>)")
+}
+
 /// Attach the four-element Simplicity witness stack to input `index`.
 /// `env = Some(..)` prunes and locally executes (the honest path); `None`
 /// attaches without validation for building deliberately invalid txs.
+///
+/// Returns the witness stack size in bytes.
 pub fn attach_simplicity(
     tx: &mut Transaction,
     index: usize,
@@ -455,21 +550,12 @@ pub fn attach_simplicity(
     env: Option<&ElementsEnv<Arc<Transaction>>>,
     control_block: &simplicityhl::elements::taproot::ControlBlock,
 ) -> Result<usize, String> {
-    let node = satisfy_program(program, witness, env)?;
-    let (program_bytes, witness_bytes) = node.to_vec_with_witness();
-    let cmr = node.cmr();
-    let stack = vec![
-        witness_bytes,
-        program_bytes,
-        cmr.as_ref().to_vec(),
-        control_block.serialize(),
-    ];
-    let size: usize = stack.iter().map(Vec::len).sum();
-    let cost = node.bounds().cost;
-    if !cost.is_budget_valid(&stack) {
+    let (stack, size, cost) = simplicity_stack(program, witness, env, control_block)?;
+    if cost as u64 > budget_milliweight(size) {
         return Err(format!(
-            "input {index}: program cost {cost:?} exceeds the witness budget \
-             ({size} B stack); the witness needs padding"
+            "input {index}: program cost {cost} milli-WU exceeds the {} milli-WU a \
+             {size} B witness stack buys",
+            budget_milliweight(size)
         ));
     }
     tx.input[index].witness = TxInWitness {
@@ -481,24 +567,12 @@ pub fn attach_simplicity(
     Ok(size)
 }
 
-/// Attach the verifier program's witness to input 0 and verify that the
-/// resulting stack buys enough Simplicity execution budget.
-///
-/// Budget = serialized witness-stack size + 50 weight units; cost is a static
-/// bound over the whole program DAG. The program reserves a fixed-size inert
-/// pad (see BUDGET_PAD in verifier.simf) precisely so this check passes; if it
-/// ever fails, the program changed and BUDGET_PAD_LEN needs re-sizing rather
-/// than the transaction being patched.
-///
-/// Returns (witness stack size in bytes, pad length, cost in milli-WU).
-pub fn attach_verifier(
-    tx: &mut Transaction,
+fn simplicity_stack(
     program: &CompiledProgram,
-    slots: &VerifierSlots,
+    witness: simplicityhl::WitnessValues,
     env: Option<&ElementsEnv<Arc<Transaction>>>,
     control_block: &simplicityhl::elements::taproot::ControlBlock,
-) -> Result<(usize, usize, u32), String> {
-    let witness = programs::verifier_witness(&slots.outputs, &slots.inputs)?;
+) -> Result<(Vec<Vec<u8>>, usize, u32), String> {
     let node = satisfy_program(program, witness, env)?;
     let (program_bytes, witness_bytes) = node.to_vec_with_witness();
     let cmr = node.cmr();
@@ -508,13 +582,38 @@ pub fn attach_verifier(
         cmr.as_ref().to_vec(),
         control_block.serialize(),
     ];
-    let cost = node.bounds().cost;
     let size: usize = stack.iter().map(Vec::len).sum();
-    if !cost.is_budget_valid(&stack) {
+    let cost = cost_milliweight(node.bounds().cost);
+    Ok((stack, size, cost))
+}
+
+/// Attach the verifier program's witness to input 0 and verify that the
+/// resulting stack buys enough Simplicity execution budget.
+///
+/// There is no padding to size. Under the chain's budget rule every shape's
+/// functional witness already covers its own static cost; this check exists so
+/// that a change to the program which broke that fails here, loudly, rather
+/// than at a node.
+///
+/// Returns (witness stack size in bytes, cost in milli-WU).
+pub fn attach_verifier(
+    tx: &mut Transaction,
+    program: &CompiledProgram,
+    shape: Shape,
+    sender: &SenderWitness,
+    slots: &VerifierSlots,
+    env: Option<&ElementsEnv<Arc<Transaction>>>,
+    control_block: &simplicityhl::elements::taproot::ControlBlock,
+) -> Result<(usize, u32), String> {
+    let witness = programs::verifier_witness(shape, sender, &slots.outputs, &slots.inputs)?;
+    let (stack, size, cost) = simplicity_stack(program, witness, env, control_block)?;
+    if cost as u64 > budget_milliweight(size) {
         return Err(format!(
-            "verifier cost {cost:?} exceeds the budget bought by a {size} B \
-             witness stack; raise BUDGET_PAD_LEN (currently {})",
-            programs::BUDGET_PAD_LEN
+            "verifier shape {shape}: cost {cost} milli-WU exceeds the {} milli-WU a \
+             {size} B witness stack buys. Either the program grew or this chain is \
+             still granting one weight unit per witness byte, under which these \
+             covenants are unspendable by design",
+            budget_milliweight(size)
         ));
     }
     tx.input[0].witness = TxInWitness {
@@ -523,36 +622,60 @@ pub fn attach_verifier(
         script_witness: stack,
         pegin_witness: vec![],
     };
-    Ok((size, programs::BUDGET_PAD_LEN, cost_milliweight(cost)))
+    Ok((size, cost))
 }
 
-fn cost_milliweight(cost: simplicityhl::simplicity::Cost) -> u32 {
-    // Cost's inner value is private; its Debug form is `Cost(<milliweight>)`.
-    format!("{cost:?}")
-        .trim_start_matches("Cost(")
-        .trim_end_matches(')')
-        .parse()
-        .unwrap_or(0)
-}
-
-/// The verifier's per-slot witness: recipient proofs for outputs 1..7 and owner
-/// proofs for inputs 1..7.
-#[derive(Default)]
+/// The verifier's per-slot witness, sized for one shape.
 pub struct VerifierSlots {
-    pub outputs: [SlotWitness; programs::N_OUT_SLOTS],
-    pub inputs: [programs::InputSlotWitness; programs::N_IN_SLOTS],
+    pub outputs: Vec<SlotWitness>,
+    pub inputs: Vec<InputSlotWitness>,
 }
 
-/// Build the verifier witness slots for a transfer: every A output needs its
-/// recipient's membership proof, and every A input needs its owner's.
+impl VerifierSlots {
+    pub fn empty(shape: Shape) -> Self {
+        VerifierSlots {
+            outputs: vec![None; shape.n_out],
+            inputs: vec![None; shape.n_in],
+        }
+    }
+}
+
+/// The sender proof the verifier needs: one membership proof for the whole
+/// transfer, carrying the committed height windows.
+pub fn sender_witness(ctx: &Ctx, sender: &XOnlyPublicKey) -> Result<SenderWitness, String> {
+    let proof = ctx.wl_tree.prove(&sender.serialize()).ok_or_else(|| {
+        format!("owner key {sender} is not in the whitelist: these coins are frozen")
+    })?;
+    Ok(SenderWitness {
+        key: *sender,
+        proof,
+    })
+}
+
+/// Build the verifier witness slots for a transfer.
+///
+/// An A output paying the sender's own C_U is CHANGE and needs no slot witness
+/// at all: the covenant recognises it by script equality against the sender it
+/// already proved, and exempts it from the membership fold, the receive window
+/// and the explicit-value requirement.
 pub fn verifier_slots(ctx: &Ctx, built: &BuiltTransfer) -> Result<VerifierSlots, String> {
-    let mut slots = VerifierSlots::default();
+    let mut slots = VerifierSlots::empty(built.shape);
+    let sender = built
+        .a_inputs
+        .first()
+        .map(|(_, owner, _)| *owner)
+        .ok_or("a transfer must spend at least one regulated input")?;
+    let cu_sender_spk = ctx.cu_info(&sender).script_pubkey;
+
     for (out_idx, owner) in &built.a_outputs {
-        if *out_idx == 0 || *out_idx > programs::N_OUT_SLOTS {
+        if *out_idx == 0 || *out_idx > built.shape.n_out {
             return Err(format!(
-                "A output at index {out_idx}; the covenant scans 1..={}",
-                programs::N_OUT_SLOTS
+                "A output at index {out_idx}; shape {} scans 1..={}",
+                built.shape, built.shape.n_out
             ));
+        }
+        if built.tx.output[*out_idx].script_pubkey == cu_sender_spk {
+            continue; // change: proved by the sender proof, no slot witness
         }
         let proof = ctx
             .wl_tree
@@ -561,22 +684,26 @@ pub fn verifier_slots(ctx: &Ctx, built: &BuiltTransfer) -> Result<VerifierSlots,
         slots.outputs[*out_idx - 1] = Some((*owner, proof));
     }
     for (in_idx, owner, outpoint) in &built.a_inputs {
-        if *in_idx == 0 || *in_idx > programs::N_IN_SLOTS {
+        if *in_idx == 0 || *in_idx > built.shape.n_in {
             return Err(format!(
-                "A input at index {in_idx}; the covenant scans 1..={} \
-                 (at most {} regulated inputs per transfer)",
-                programs::N_IN_SLOTS,
-                programs::N_IN_SLOTS - 1
+                "A input at index {in_idx}; shape {} scans 1..={} (at most {} \
+                 regulated inputs per transfer)",
+                built.shape,
+                built.shape.n_in,
+                built.shape.max_regulated_inputs()
             ));
         }
-        let proof = ctx.wl_tree.prove(&owner.serialize()).ok_or_else(|| {
-            format!("owner key {owner} is not in the whitelist: these coins are frozen")
-        })?;
+        if *owner != sender {
+            return Err(format!(
+                "input {in_idx} belongs to {owner}, not to {sender}: every regulated \
+                 input of a transfer must have one owner"
+            ));
+        }
         let k = outpoint_policy_key(outpoint);
         let interval = ctx.bl_tree.prove_absent(&k).ok_or_else(|| {
             format!("outpoint {outpoint} is blacklisted: these coins are frozen")
         })?;
-        slots.inputs[*in_idx - 1] = Some((*owner, proof, interval));
+        slots.inputs[*in_idx - 1] = Some(interval);
     }
     Ok(slots)
 }
@@ -620,19 +747,19 @@ pub fn sign_fee_input(
 /// Per-input witness sizes of a finalized transfer, for budget reporting.
 #[derive(Debug)]
 pub struct WitnessReport {
-    /// Verifier input's witness stack size in bytes (padding included).
+    /// Which leaf of the verifier taptree spent it.
+    pub shape: Shape,
+    /// Verifier input's witness stack size in bytes.
     pub verifier_witness: usize,
-    /// How many of those bytes are inert budget padding.
-    pub verifier_pad: usize,
     /// Verifier program's static cost in milli-weight-units.
     pub verifier_cost: u32,
     pub user_witnesses: Vec<usize>,
 }
 
 impl WitnessReport {
-    /// Budget the verifier input buys, in weight units (stack size + 50).
+    /// Budget the verifier input buys, in weight units.
     pub fn verifier_budget(&self) -> usize {
-        self.verifier_witness + 50
+        (budget_milliweight(self.verifier_witness) / 1000) as usize
     }
 
     /// Weight units the verifier program consumes (cost rounded up).
@@ -660,6 +787,7 @@ pub fn complete_transfer(
         build_transfer_unchecked(ctx, req)?
     };
     let mut tx = built.tx.clone();
+    let shape = built.shape;
 
     // User inputs: sign and attach.
     let (_, u_cb) = cu_spend_info(ctx.u_cmr(), &req.sender);
@@ -694,43 +822,40 @@ pub fn complete_transfer(
     }
 
     // Verifier input 0.
-    let (_, p_cb, _) = cv_spend_info(ctx.p_cmr(), ctx.g_cmr());
+    let p_cmr = ctx.p_cmr(shape)?;
+    let p_cb = ctx.verifier_spend().control_for(shape)?.clone();
+    let sender_w = sender_witness(ctx, &req.sender)?;
     let slots = if validate {
         verifier_slots(ctx, &built)?
     } else {
         // Invalid-tx path: fill what we can, leave the rest None.
-        let mut slots = VerifierSlots::default();
+        let mut slots = VerifierSlots::empty(shape);
+        let cu_sender_spk = ctx.cu_info(&req.sender).script_pubkey;
         for (out_idx, owner) in &built.a_outputs {
-            if (1..=programs::N_OUT_SLOTS).contains(out_idx) {
+            if (1..=shape.n_out).contains(out_idx)
+                && built.tx.output[*out_idx].script_pubkey != cu_sender_spk
+            {
                 if let Some(proof) = ctx.wl_tree.prove(&owner.serialize()) {
                     slots.outputs[*out_idx - 1] = Some((*owner, proof));
                 }
             }
         }
-        for (in_idx, owner, outpoint) in &built.a_inputs {
-            if (1..=programs::N_IN_SLOTS).contains(in_idx) {
+        for (in_idx, _owner, outpoint) in &built.a_inputs {
+            if (1..=shape.n_in).contains(in_idx) {
                 let k = outpoint_policy_key(outpoint);
-                if let (Some(proof), Some(interval)) = (
-                    ctx.wl_tree.prove(&owner.serialize()),
-                    ctx.bl_tree.prove_absent(&k),
-                ) {
-                    slots.inputs[*in_idx - 1] = Some((*owner, proof, interval));
+                if let Some(interval) = ctx.bl_tree.prove_absent(&k) {
+                    slots.inputs[*in_idx - 1] = Some(interval);
                 }
             }
         }
         slots
     };
-    let p_env = covenant_env(
-        &ctx.net,
-        &built.tx,
-        &built.prevouts,
-        0,
-        ctx.p_cmr(),
-        p_cb.clone(),
-    );
-    let (verifier_witness, verifier_pad, verifier_cost) = attach_verifier(
+    let p_env = covenant_env(&ctx.net, &built.tx, &built.prevouts, 0, p_cmr, p_cb.clone());
+    let (verifier_witness, verifier_cost) = attach_verifier(
         &mut tx,
-        &ctx.verifier,
+        ctx.verifier_for(shape)?,
+        shape,
+        &sender_w,
         &slots,
         validate.then_some(&p_env),
         &p_cb,
@@ -742,8 +867,8 @@ pub fn complete_transfer(
     Ok((
         tx,
         WitnessReport {
+            shape,
             verifier_witness,
-            verifier_pad,
             verifier_cost,
             user_witnesses,
         },
@@ -752,6 +877,16 @@ pub fn complete_transfer(
 
 /// Issuer operation: policy update (recreate C_V under `new_ctx`) or halt
 /// (send the verifier output to `halt_spk`).
+///
+/// A HALT MUST BURN V. Confinement rests on an invariant no covenant can check:
+/// q units of V never exist outside a verifier covenant (see the header of
+/// `programs/user.simf`). Parking V at an ordinary address breaks it, and from
+/// that moment whoever holds the key can place it at input zero and let any
+/// holder spend their C_U with no policy applied at all. An OP_RETURN output can
+/// never be an input, so a burn leaves no such output in existence and A is
+/// frozen, which is what a halt is supposed to mean. `halt_to_burn` is the
+/// supported path; resuming means reissuing V, which is why the issuer keeps
+/// that authority - and why that authority is as sensitive as the issuer key.
 pub struct IssuerReq {
     pub verifier_outpoint: OutPoint,
     /// The context whose C_V(pi') receives V; None = halt.
@@ -760,6 +895,41 @@ pub struct IssuerReq {
     pub fee_key: XOnlyPublicKey,
     pub fee_amount: u64,
     pub fee_change_spk: Script,
+}
+
+/// A provably unspendable script: a bare `OP_RETURN`. The halt target.
+pub fn burn_spk() -> Script {
+    Script::from(vec![0x6a])
+}
+
+impl IssuerReq {
+    /// A halt that burns the verifier asset, which is the only halt that
+    /// actually halts. See the note on [`complete_issuer_op`].
+    pub fn halt_to_burn(
+        verifier_outpoint: OutPoint,
+        fee_utxo: (OutPoint, AssetId, u64),
+        fee_key: XOnlyPublicKey,
+        fee_amount: u64,
+        fee_change_spk: Script,
+    ) -> Self {
+        IssuerReq {
+            verifier_outpoint,
+            halt_spk: Some(burn_spk()),
+            fee_utxo,
+            fee_key,
+            fee_amount,
+            fee_change_spk,
+        }
+    }
+
+    /// True when this halt leaves a spendable q of V in existence, which is the
+    /// one thing confinement cannot survive.
+    pub fn halt_leaves_live_verifier_asset(&self) -> bool {
+        match &self.halt_spk {
+            None => false, // a policy update, not a halt
+            Some(spk) => !spk.is_op_return(),
+        }
+    }
 }
 
 pub fn complete_issuer_op(
@@ -809,7 +979,7 @@ pub fn complete_issuer_op(
     // G(I) reads no windows, so the issuer path needs no locktime.
 
     // Issuer leaf spend at input 0.
-    let (_, _, g_cb) = cv_spend_info(old_ctx.p_cmr(), old_ctx.g_cmr());
+    let g_cb = old_ctx.verifier_spend().issuer_control.clone();
     let env = covenant_env(&old_ctx.net, &tx, &prevouts, 0, old_ctx.g_cmr(), g_cb.clone());
     let digest = sig_all_digest(&env);
     let (sig, signer) = sign_bip340(issuer_privkey, &digest)?;

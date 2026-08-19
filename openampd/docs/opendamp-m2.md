@@ -8,13 +8,13 @@ deliberately refuses, and the wire formats it freezes.
 ## What M2 delivers
 
 - **`internal/damp`, the policy-commitment library**: the policy commitment
-  `pi` over a `PolicyHeader` (design doc 3.1), the `smt-v1` sparse Merkle tree
-  over 32-byte policy keys with membership and non-membership proofs, the
-  outpoint and owner-key policy keys, the fixed-order `rules_root` over the
-  four predicate commitments, and the `snapshot/v1` document with canonical
-  JSON, content hash, BIP340 issuer signature and self-validation. All
-  commitments are golden-vectored in the package tests; treat a golden change
-  as a format break.
+  `pi` over a `PolicyHeader` (design doc 3.1), the `dmt-v1` sorted dense Merkle
+  tree the covenants verify against (membership for the whitelist, interval
+  non-membership for the blacklist), the outpoint and owner-key policy keys,
+  the fixed-order `rules_root` over the four predicate commitments, and the
+  `snapshot/v1` document with canonical JSON, content hash, BIP340 issuer
+  signature and self-validation. All commitments are golden-vectored in the
+  package tests; treat a golden change as a format break.
 
 - **The snapshot service** (design doc section 4), live now because it is pure
   data plane:
@@ -50,8 +50,14 @@ deliberately refuses, and the wire formats it freezes.
   `enforcement`, `verifier_asset`, `verifier_amount`, `issuer_update_key`,
   `genesis_policy`, `genesis_snapshot_hash`) are documented at the refusal
   site in `internal/server/issue.go`.
-- **`cmt-v1` snapshots**: the library implements `smt-v1` only and
-  `Validate()` refuses any other `tree` value.
+- **Any `tree` but `dmt-v1`**: it is the only format any covenant can verify
+  against, and `Validate()` refuses the rest by name. The design document once
+  reserved `smt-v1` and `cmt-v1`, and the library did carry an `smt-v1`
+  document format with its own parallel `pi`; a depth-256 proof does not fit
+  the Simplicity budget, so nothing on chain could ever read it, and its
+  validation path skipped every consistency check `dmt-v1` gets. It was removed
+  on 2026-08-19: a snapshot declaring it would have committed funds to an
+  address no holder could spend.
 - **URL-only predicate lists**: the M2 snapshot service requires inline
   entries so the declared roots are always recomputable server-side.
 
@@ -66,43 +72,34 @@ testnet) are byte-identical before and after M2; the byte-identity tests in
 
 ## Wire formats frozen by M2
 
-### smt-v1
+### dmt-v1
 
-Fixed-depth (256) binary tree over 32-byte keys, present/absent values. Path
-bits are MSB-first (bit 0 is the top bit of the first key byte, 0 = left).
+A sorted dense Merkle tree of depth 16 (65,536 slots, 65,534 real keys). Slot 0
+and every slot above the real keys hold structural guards, so the key sequence
+is total and every real key has a predecessor and a successor.
 
-    leaf(present key) = SHA256(0x00 || key)
-    leaf(absent)      = 32 zero bytes
-    node              = SHA256(0x01 || left || right)
-    empty[0]          = 32 zero bytes
-    empty[h]          = SHA256(0x01 || empty[h-1] || empty[h-1])
+    leaf(entry)      = SHA256(0x00 || key || BE32(send_after) || BE32(recv_after))
+    node(left,right) = SHA256(0x01 || left || right)     (positional, NOT sorted)
+    interval(lo,hi)  = SHA256(0x02 || lo || hi)
+    guard(key)       = SHA256(0x03 || key)
 
-The empty tree's root is `empty[256]`
-(`6155289130893872355eac98042d22aefa2c2e708bea169402760e3b55f9a2dc`), which
-keeps an enabled-but-empty list distinct from an absent predicate (32 zero
-bytes in `rules_root`).
+Guards hash under their own domain byte, and that is a security property rather
+than tidiness: as ordinary key leaves they were provable whitelist members, and
+because a recipient key reaches `C_U(Y)` only through a hash, a holder could pay
+regulated units to `C_U(0xff..ff)` and destroy them permanently.
 
-Policy keys: blacklist entries are `SHA256(txid || BE32(vout))` over the
-display-order txid bytes; whitelist entries are the raw 32-byte x-only owner
-key.
+The whitelist proves membership; the blacklist stores the GAPS between listed
+keys and proves non-membership by exhibiting the interval that strictly contains
+the key, which is one ordinary membership proof rather than an adjacency
+argument. The empty blacklist still has a root (its guard interval), so "freeze
+nothing" is a commitment like any other.
 
-### smt-v1 proof encoding
+Policy keys: blacklist entries are `SHA256(txid || BE32(vout))` with the txid in
+**internal** (consensus) byte order, which is what the `input_prev_outpoint` jet
+yields; whitelist entries are the raw 32-byte x-only owner key.
 
-This encoding becomes the proof format inside Simplicity witnesses in M1/M3,
-so it is canonical and versioned:
-
-    byte 0      : 0x01 (proof format version)
-    bytes 1..32 : 256-bit sibling bitmap, MSB-first by depth (bit d set iff
-                  the sibling subtree at depth d along the key's path is
-                  non-empty)
-    then        : one 32-byte sibling hash per set bit, in increasing depth
-                  order
-
-Length is exactly `33 + 32 * popcount(bitmap)`. Verifiers substitute the
-precomputed empty-subtree hash for every unset bit and reject a proof that
-encodes an empty sibling explicitly, so each statement has exactly one valid
-encoding. Membership and non-membership use the same encoding and differ only
-in the leaf value.
+Byte-for-byte specification, golden vectors and the witness encoding the
+covenant consumes: `opendamp/SPEC-dmt-v1.md`.
 
 ### Commitments
 
@@ -110,8 +107,10 @@ in the leaf value.
     rules_root  = node(node(blacklist_root, whitelist_root),
                        node(limit_commitment, windows_hash))
     limit_commitment = H_"OpenDAMP/limit/v1"(BE64(limit)), or 32 zero bytes when no limit
-    windows_hash     = H_"OpenDAMP/windows/v1"(canonical JSON of the windows array),
-                       or 32 zero bytes when empty
+    windows_hash     = 32 zero bytes. A height bound belongs to the holder it
+                       binds, inside that holder's whitelist leaf; the separate
+                       class-keyed windows array no shipped covenant reads is
+                       refused by Validate rather than committed to
     snapshot hash    = SHA256(canonical JSON without issuer_sig)
     issuer_sig       = BIP340 over H_"OpenDAMP/snapshot/v1"(snapshot hash)
 

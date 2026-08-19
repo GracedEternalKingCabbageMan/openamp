@@ -26,7 +26,7 @@ use opendamp::hexutil::{hex, unhex, unhex32};
 use opendamp::net::Net;
 use opendamp::programs::{self, AssetParams};
 use opendamp::tapscript::{
-    cu_spend_info, cv_spend_info, simplicity_leaf_hash, tap_branch, tap_data_hash,
+    cu_spend_info, simplicity_leaf_hash, tap_branch, tap_data_hash,
 };
 use opendamp::txbuild::{
     build_transfer, complete_issuer_op, complete_transfer, covenant_env, sig_all_digest, Ctx,
@@ -254,25 +254,43 @@ fn load_snapshot(path: &str) -> Result<(Snapshot, Ctx), String> {
                 .into(),
         );
     }
-    let ctx = Ctx::with_policy(net, params, issuer, wl, &bl, limit)?;
+    let ctx = Ctx::with_policy(net, params, issuer, wl, &bl, limit, snap.seq)?;
     Ok((snap, ctx))
 }
 
-/// pi for this snapshot. Every commitment here is read by P(pi), so nothing in
-/// pi claims a rule that does not bind: the whitelist root also carries the
-/// height windows, since they live in its leaves.
+/// pi for this snapshot, as the covenant commits to it.
+///
+/// `Ctx` derives it from the same roots, limit and sequence number and passes
+/// it into every verifier leaf as a compile-time parameter, so this is a read
+/// rather than a recomputation: if the snapshot and the covenant disagreed
+/// about pi, the address would already be a different address.
 fn pi_of(snap: &Snapshot, ctx: &Ctx) -> [u8; 32] {
-    let rules = opendamp::policy::rules_root(
-        Some(ctx.bl_tree.root()),
-        Some(ctx.wl_tree.root()),
-        snap.predicates.limit,
-        None,
-    );
-    opendamp::policy::pi(
-        programs::asset_internal_bytes(&ctx.params.asset_a),
-        snap.seq,
-        rules,
-    )
+    debug_assert_eq!(snap.seq, ctx.seq);
+    ctx.pi
+}
+
+/// One document per verifier leaf: the menu, with each shape's CMR, tapleaf
+/// hash and control block. A wallet picks the narrowest shape that fits its
+/// transaction; every shape commits to the same policy, so they all live in one
+/// C_V(pi) address.
+fn verifier_leaf_docs(ctx: &Ctx) -> Result<serde_json::Value, String> {
+    let vs = ctx.verifier_spend();
+    let mut out = Vec::new();
+    for shape in programs::SHAPES {
+        let cmr = ctx.p_cmr(shape)?;
+        out.push(serde_json::json!({
+            "shape": shape.name(),
+            "max_inputs": shape.max_inputs(),
+            "max_outputs": shape.max_outputs(),
+            "max_regulated_inputs": shape.max_regulated_inputs(),
+            "canonical": shape == programs::CANONICAL,
+            "cmr": cmr.to_string(),
+            "tapleaf": hex(&simplicity_leaf_hash(cmr).to_byte_array()),
+            "control_block": hex(&vs.control_for(shape)?.serialize()),
+            "source": "programs/verifier.simf.in",
+        }));
+    }
+    Ok(serde_json::Value::Array(out))
 }
 
 // ------------------------------------------------------------- transfer request
@@ -412,7 +430,9 @@ fn cmd_derive(args: &Args) -> Result<(), String> {
     );
     println!("pi             {}", hex(&pi_of(&snap, &ctx)));
     println!("U   CMR        {}", ctx.u_cmr());
-    println!("P   CMR        {}", ctx.p_cmr());
+    for shape in programs::SHAPES {
+        println!("P   CMR {:>5}  {}", shape.name(), ctx.p_cmr(shape)?);
+    }
     println!("G   CMR        {}", ctx.g_cmr());
     let cv = ctx.cv_info();
     println!("C_V(pi) spk    {}", hex(cv.script_pubkey.as_bytes()));
@@ -460,13 +480,8 @@ fn cmd_registry(args: &Args) -> Result<(), String> {
                 "tapleaf": hex(&simplicity_leaf_hash(ctx.u_cmr()).to_byte_array()),
                 "source": "programs/user.simf",
             },
-            format!("opendamp/verifier/v1/{}/seq{}", ctx.params.asset_a, snap.seq): {
-                "cmr": ctx.p_cmr().to_string(),
-                "tapleaf": hex(&simplicity_leaf_hash(ctx.p_cmr()).to_byte_array()),
-                "source": "programs/verifier.simf",
-                "n_max_outputs": opendamp::txbuild::N_MAX_OUTPUTS,
-                "budget_pad_words": programs::BUDGET_PAD_WORDS,
-            },
+            format!("opendamp/verifier/v1/{}/seq{}", ctx.params.asset_a, snap.seq):
+                verifier_leaf_docs(&ctx)?,
             format!("opendamp/issuer/v1/{}", ctx.issuer_key): {
                 "cmr": ctx.g_cmr().to_string(),
                 "tapleaf": hex(&simplicity_leaf_hash(ctx.g_cmr()).to_byte_array()),
@@ -492,7 +507,8 @@ fn cmd_vectors(args: &Args) -> Result<(), String> {
     let regtest_params: &'static opendamp::elements::AddressParams =
         &opendamp::net::ELEMENTS_REGTEST_ADDRESS_PARAMS;
     let u_leaf = simplicity_leaf_hash(ctx.u_cmr()).to_byte_array();
-    let p_leaf = simplicity_leaf_hash(ctx.p_cmr()).to_byte_array();
+    let canonical_p_cmr = ctx.p_cmr(programs::CANONICAL)?;
+    let p_leaf = simplicity_leaf_hash(canonical_p_cmr).to_byte_array();
     let g_leaf = simplicity_leaf_hash(ctx.g_cmr()).to_byte_array();
 
     let mut owners = Vec::new();
@@ -518,7 +534,10 @@ fn cmd_vectors(args: &Args) -> Result<(), String> {
         }));
     }
 
-    let (cv, p_cb, g_cb) = cv_spend_info(ctx.p_cmr(), ctx.g_cmr());
+    let vs = ctx.verifier_spend();
+    let cv = ctx.cv_info();
+    let p_cb = vs.control_for(programs::CANONICAL)?.clone();
+    let g_cb = vs.issuer_control.clone();
     let doc = serde_json::json!({
         "v": 1,
         "note": "OpenDAMP taproot derivation golden vectors. TapLeaf/elements, \
@@ -552,13 +571,11 @@ fn cmd_vectors(args: &Args) -> Result<(), String> {
         "programs": {
             "u_cmr": ctx.u_cmr().to_string(),
             "u_tapleaf_hash": hex(&u_leaf),
-            "p_cmr": ctx.p_cmr().to_string(),
-            "p_tapleaf_hash": hex(&p_leaf),
+            "p_cmr_canonical": canonical_p_cmr.to_string(),
+            "p_tapleaf_hash_canonical": hex(&p_leaf),
             "g_cmr": ctx.g_cmr().to_string(),
             "g_tapleaf_hash": hex(&g_leaf),
-            "budget_pad_words": programs::BUDGET_PAD_WORDS,
-            "n_max_outputs": opendamp::txbuild::N_MAX_OUTPUTS,
-            "n_max_inputs": opendamp::txbuild::N_MAX_INPUTS,
+            "verifier_shapes": verifier_leaf_docs(&ctx)?,
         },
         "user_covenants": owners,
         "verifier_covenant": {
@@ -644,13 +661,9 @@ fn cmd_transfer_build(args: &Args) -> Result<(), String> {
         .iter()
         .enumerate()
         .filter_map(|(i, s)| {
-            s.as_ref().map(|(key, owner_proof, interval)| {
+            s.as_ref().map(|interval| {
                 serde_json::json!({
                     "input": i + 1,
-                    "owner": hex(&key.serialize()),
-                    "dmt_index": owner_proof.path.index,
-                    "send_after": owner_proof.entry.send_after,
-                    "recv_after": owner_proof.entry.recv_after,
                     "blacklist_interval": {
                         "lo": hex(&interval.lo),
                         "hi": hex(&interval.hi),
@@ -660,6 +673,16 @@ fn cmd_transfer_build(args: &Args) -> Result<(), String> {
             })
         })
         .collect();
+    // The sender is proven once for the whole transfer rather than once per
+    // regulated input: every one of them is required to be C_U(sender), so the
+    // membership fold and the lockup bound are the same fact each time.
+    let sender_w = opendamp::txbuild::sender_witness(&ctx, &req.sender)?;
+    let sender_proof = serde_json::json!({
+        "key": hex(&sender_w.key.serialize()),
+        "dmt_index": sender_w.proof.path.index,
+        "send_after": sender_w.proof.entry.send_after,
+        "recv_after": sender_w.proof.entry.recv_after,
+    });
 
     let doc = serde_json::json!({
         "unsigned_tx": hex(&built.tx.serialize()),
@@ -667,9 +690,11 @@ fn cmd_transfer_build(args: &Args) -> Result<(), String> {
             .map(|(i, k)| serde_json::json!({"output": i, "owner": hex(&k.serialize())}))
             .collect::<Vec<_>>(),
         "user_inputs": sighashes,
+        "verifier_shape": built.shape.name(),
         "whitelist_proofs": {
+            "sender": sender_proof,
             "recipients": output_proofs,
-            "owners": input_proofs,
+            "blacklist_non_membership": input_proofs,
         },
         "fee_input": built.fee_input,
     });
@@ -698,10 +723,10 @@ fn cmd_transfer_finalize(args: &Args) -> Result<(), String> {
     let (tx, report) =
         complete_transfer(&ctx, &req, &unhex32(sender_sk)?, &unhex32(fee_sk)?, true)?;
     eprintln!(
-        "verifier input: witness {} B ({} B pad), cost {} milli-WU = {} WU, \
+        "verifier input: leaf {}, witness {} B, cost {} milli-WU = {} WU, \
          budget {} WU, headroom {} WU",
+        report.shape.name(),
         report.verifier_witness,
-        report.verifier_pad,
         report.verifier_cost,
         report.verifier_weight(),
         report.verifier_budget(),

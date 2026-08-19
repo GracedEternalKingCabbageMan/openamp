@@ -5,48 +5,28 @@
 // doc/sequentia/opendamp-design.md sections 3 and 4:
 //
 //   - the policy commitment pi over a PolicyHeader (section 3.1),
-//   - the "smt-v1" sparse Merkle tree over 32-byte policy keys with
-//     membership and non-membership proofs (sections 3.2, 3.3),
+//   - the "dmt-v1" sorted dense Merkle tree the covenants verify against, in
+//     dmt/ and covenant.go (sections 3.2, 3.3),
 //   - the rules_root Merkle over the four predicate commitments,
 //   - the snapshot/v1 publication document (section 4) with canonical JSON,
 //     BIP340 issuer signature and self-validation.
 //
-// Everything here is consensus-adjacent: the SMT proof encoding becomes the
-// wire format inside Simplicity witnesses (M1/M3), and the snapshot canonical
-// bytes are content-addressed and committed into asset contracts. Treat every
-// byte layout in this package as frozen once an asset ships against it.
+// Everything here is consensus-adjacent: the proof encoding becomes the wire
+// format inside Simplicity witnesses (M1/M3), and the snapshot canonical bytes
+// are content-addressed and committed into asset contracts. Treat every byte
+// layout in this package as frozen once an asset ships against it.
 //
-// # smt-v1
+// # One tree, one pi
 //
-// A fixed-depth (256) binary tree over 32-byte keys mapping each key to
-// present/absent. Path bits are read MSB-first: bit d of a key (d = 0 is the
-// most significant bit of key[0]) selects the child at depth d, 0 = left.
-//
-//	leaf(present key) = SHA256(0x00 || key)
-//	leaf(absent)      = 32 zero bytes
-//	node              = SHA256(0x01 || left || right)
-//	empty[0]          = 32 zero bytes            (empty subtree of height 0)
-//	empty[h]          = SHA256(0x01 || empty[h-1] || empty[h-1])
-//
-// The root of an empty tree is empty[256] (a fixed non-zero constant), which
-// keeps "enabled but empty predicate" distinct from "predicate absent"
-// (all-zero commitment) in RulesRoot.
-//
-// # smt-v1 proof encoding (canonical, versioned)
-//
-//	byte 0        : 0x01 (proof format version)
-//	bytes 1..32   : 256-bit sibling bitmap. Bit d (depth d along the path,
-//	                0 = the sibling of the root's chosen child) is bit
-//	                (7 - d%8) of byte 1 + d/8, i.e. MSB-first, matching the
-//	                key bit order. Bit d is set iff the sibling subtree at
-//	                depth d is non-empty.
-//	then          : one 32-byte sibling hash per set bit, in increasing
-//	                depth order.
-//
-// A proof therefore has length 33 + 32*popcount(bitmap). Verification folds
-// from the leaf up, substituting the precomputed empty-subtree hash for every
-// unset bit. The same encoding serves membership (leaf = SHA256(0x00||key))
-// and non-membership (leaf = 32 zero bytes) proofs.
+// An earlier revision carried a second format, "smt-v1": a depth-256 sparse
+// Merkle tree from an early draft of the design document, with its own parallel
+// pi construction and its own proof encoding. Nothing on chain could read it --
+// a depth-256 proof does not fit the Simplicity budget, which is precisely why
+// dmt-v1 exists -- and it survived as a document format whose Validate path
+// skipped every consistency check dmt-v1 gets. A snapshot declaring it was
+// accepted almost unexamined and would have committed funds to an address no
+// holder could spend. It was removed on 2026-08-19, along with the second pi
+// construction, and Validate now refuses anything but dmt-v1 by name.
 package damp
 
 import (
@@ -62,26 +42,21 @@ const (
 	TagWindows  = "OpenDAMP/windows/v1"
 )
 
-// Snapshot "tree" values this library implements.
+// TreeDMTv1 is the only snapshot "tree" value this library implements, and the
+// only one any covenant can verify against (opendamp/SPEC-dmt-v1.md): a sorted
+// dense tree of depth 16. A dmt-v1 snapshot is therefore a CONSENSUS-BEARING
+// document, and its pi is the covenant's pi -- PiCovenant over INTERNAL-order
+// asset bytes and RulesRootCovenant, both in covenant.go.
 //
-//   - TreeSMTv1 is the design document's depth-256 sparse Merkle tree. It is
-//     the pure-M2 document format: nothing on chain reads it, and its pi is
-//     built from RulesRoot (below) over display-order asset bytes.
-//   - TreeDMTv1 is the tree the SHIPPED covenants actually verify against
-//     (opendamp/SPEC-dmt-v1.md): a sorted dense tree of depth 16. A dmt-v1
-//     snapshot is therefore a CONSENSUS-BEARING document, and its pi is the
-//     covenant's pi — PiCovenant over INTERNAL-order asset bytes and
-//     RulesRootCovenant, both in covenant.go. The two pi constructions are
-//     deliberately different and each is pinned to its own vectors; a snapshot
-//     declares which one applies by its tree field. Never compute one with the
-//     other's rules_root.
-//
-// The design doc also reserves "cmt-v1" (Cartesian Merkle tree), which is not
-// supported here; Validate refuses it.
-const (
-	TreeSMTv1 = "smt-v1"
-	TreeDMTv1 = "dmt-v1"
-)
+// An earlier revision also carried "smt-v1", a depth-256 sparse Merkle tree
+// from an early draft of the design document, with its own parallel pi
+// construction. Nothing on chain could read it: a depth-256 proof does not fit
+// the Simplicity budget, which is why dmt-v1 exists. It survived as a document
+// format whose Validate path skipped every consistency check dmt-v1 gets, so a
+// snapshot declaring it was accepted almost unexamined and would have locked
+// funds behind an address no holder could spend. It is gone, along with the
+// second pi construction, and Validate now refuses anything but dmt-v1.
+const TreeDMTv1 = "dmt-v1"
 
 // taggedHash is the BIP340 tagged hash: SHA256(SHA256(tag) || SHA256(tag) || msg).
 // Implemented locally (mirroring elements.TaggedHash) so this package's
@@ -148,23 +123,3 @@ func LimitCommitment(limit uint64) [32]byte {
 	return taggedHash(TagLimit, b[:])
 }
 
-// RulesRoot is the fixed-order Merkle root over the four predicate
-// commitments (design doc 3.1), using the smt-v1 interior node hash
-// SHA256(0x01 || left || right):
-//
-//	rules_root = node( node(blacklist_root, whitelist_root),
-//	                   node(limit_commitment, windows_hash) )
-//
-// An absent predicate commits to 32 zero bytes: pass a zero blacklistRoot /
-// whitelistRoot / windowsHash for a disabled predicate, and limit 0 for no
-// transfer limit (committed as zeros; nonzero limits commit via
-// LimitCommitment).
-func RulesRoot(blacklistRoot, whitelistRoot [32]byte, limit uint64, windowsHash [32]byte) [32]byte {
-	var limitC [32]byte
-	if limit != 0 {
-		limitC = LimitCommitment(limit)
-	}
-	left := nodeHash(blacklistRoot, whitelistRoot)
-	right := nodeHash(limitC, windowsHash)
-	return nodeHash(left, right)
-}

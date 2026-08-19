@@ -21,10 +21,46 @@
  *   (c) current input index != 0, current input carries explicit asset A
  *   (d) input 0 carries explicit verifier asset V in amount exactly Q
  *
+ * WHAT (d) DOES NOT SAY, and why there is no fix for it here.
+ *
+ * (d) asks that SOME output carrying q of V sits at input zero. It does not ask
+ * that the output is a verifier covenant, and U cannot ask that: C_V(pi) is a
+ * different address for every policy version, while U is fixed for the life of
+ * the asset and is committed inside every C_U address. So confinement rests on
+ * an invariant U cannot check --
+ *
+ *     q units of V must never exist outside a verifier covenant.
+ *
+ * -- and if it is ever broken, whoever controls that output can put it at input
+ * zero and let any holder spend their C_U with no whitelist, no blacklist, no
+ * limit and no window, on their own signature alone. This is the paper's
+ * construction (section 3.2) and the paper's assumption (section 5.1: "Every
+ * accepted verifier output carries q units of V"); it is stated here because it
+ * is load-bearing and easy to break by accident.
+ *
+ * Two operational consequences, both now enforced by the tooling rather than
+ * left to a runbook:
+ *
+ *   - A HALT must BURN V, not park it at an address. `txbuild::burn_spk` is the
+ *     default, and an OP_RETURN output can never be an input, so after a burn
+ *     halt no q-of-V output exists at all and A is frozen rather than freed.
+ *   - V's REISSUANCE authority is as sensitive as the issuer key I. Minting q of
+ *     V to an ordinary address is a complete bypass of the policy, so retaining
+ *     it to run parallel verifier outputs (design document section 6) means
+ *     retaining a second key of the same criticality.
+ *
+ * An earlier revision of this program tried to close the gap in the covenant, by
+ * requiring output 0 to recreate input 0's script unless the issuer signed. It
+ * does not work: a holder of stray V simply pays it back to the same address,
+ * which satisfies the equality exactly. Nothing a fixed U can read distinguishes
+ * a real C_V(pi) from an imitation, because Simplicity exposes another input's
+ * script pubkey but not which leaf it executed. The check was removed rather
+ * than kept as reassurance it could not provide.
+ *
  * Compile-time parameters (per asset):
- *   ASSET_A  - u256, asset id of the regulated asset (internal byte order)
- *   ASSET_V  - u256, asset id of the verifier asset  (internal byte order)
- *   AMOUNT_Q - u64, verifier amount in atoms
+ *   ASSET_A    - u256, asset id of the regulated asset (internal byte order)
+ *   ASSET_V    - u256, asset id of the verifier asset  (internal byte order)
+ *   AMOUNT_Q   - u64, verifier amount in atoms
  */
 
 fn tap_data_hash(x: u256) -> u256 {

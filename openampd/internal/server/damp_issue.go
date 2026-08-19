@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
@@ -165,8 +166,14 @@ type dampIssueRequest struct {
 // the compiled-program identities from `opendamp derive`, plus the pi that run
 // printed as the cross-check.
 type dampCompleteRequest struct {
-	UserCMR     string `json:"user_cmr"`
-	VerifierCMR string `json:"verifier_cmr"`
+	UserCMR string `json:"user_cmr"`
+	// VerifierCMRs is one CMR per transaction shape, in the order `opendamp
+	// derive` prints them (canonical first). They all commit to the same policy
+	// and all sit in the one C_V(pi) taptree, so the ORDER is part of the
+	// address. VerifierCMR is the pre-menu field and is refused with an
+	// explanation rather than misread as a one-leaf menu.
+	VerifierCMRs []string `json:"verifier_cmrs"`
+	VerifierCMR  string   `json:"verifier_cmr,omitempty"`
 	// IssuerCMR is optional: G takes only the issuer key as a parameter, so its
 	// CMR is stable across policies and the pinning file's g_cmr is right almost
 	// always. Supply it to override.
@@ -203,6 +210,57 @@ func parseXOnly(field, s string) ([32]byte, error) {
 	}
 	copy(out[:], b)
 	return out, nil
+}
+
+// parseCMRMenu turns the registrar's list of primary-program CMRs into the menu
+// the verifier taptree is built from. Order matters: it is the crate's SHAPES
+// order, canonical first, and a different order is a different address.
+//
+// A caller that sends only the old single `verifier_cmr` is refused rather than
+// silently treated as a one-leaf menu, because that derives a real but WRONG
+// address and the mistake would only surface when a holder could not spend.
+func parseCMRMenu(list []string, legacy string) ([][32]byte, error) {
+	if len(list) == 0 {
+		if strings.TrimSpace(legacy) != "" {
+			return nil, fmt.Errorf(
+				"verifier_cmr is the pre-menu field: OpenDAMP now compiles one primary " +
+					"program per transaction shape and puts them all in one C_V(pi) taptree. " +
+					"Send verifier_cmrs, in the order `opendamp derive` prints them")
+		}
+		return nil, fmt.Errorf("verifier_cmrs must list one CMR per verifier shape")
+	}
+	out := make([][32]byte, 0, len(list))
+	for i, h := range list {
+		c, err := parseCMR(fmt.Sprintf("verifier_cmrs[%d]", i), h)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, nil
+}
+
+// cmrHexList renders a menu for storage and comparison.
+func cmrHexList(menu [][32]byte) []string {
+	out := make([]string, 0, len(menu))
+	for _, c := range menu {
+		out = append(out, hex.EncodeToString(c[:]))
+	}
+	return out
+}
+
+// sameCMRMenu reports whether two menus are the same set of programs in the
+// same order, which is what "the policy did not change" means on chain.
+func sameCMRMenu(a, b []string) bool {
+	if len(a) != len(b) || len(a) == 0 {
+		return false
+	}
+	for i := range a {
+		if !strings.EqualFold(a[i], b[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 func parseCMR(field, s string) ([32]byte, error) {
@@ -646,7 +704,7 @@ func (s *Server) handleDampIssueComplete(w http.ResponseWriter, r *http.Request)
 		httpErr(w, 400, "%v", err)
 		return
 	}
-	verifierCMR, err := parseCMR("verifier_cmr", req.VerifierCMR)
+	verifierCMRs, err := parseCMRMenu(req.VerifierCMRs, req.VerifierCMR)
 	if err != nil {
 		httpErr(w, 400, "%v", err)
 		return
@@ -704,7 +762,7 @@ func (s *Server) handleDampIssueComplete(w http.ResponseWriter, r *http.Request)
 		httpErr(w, 500, "derive user covenant: %v", err)
 		return
 	}
-	verifierCov, err := elements.VerifierCovenant(verifierCMR, issuerCMR)
+	verifierCov, err := elements.VerifierCovenant(verifierCMRs, issuerCMR)
 	if err != nil {
 		httpErr(w, 500, "derive verifier covenant: %v", err)
 		return
@@ -842,7 +900,10 @@ func (s *Server) handleDampIssueComplete(w http.ResponseWriter, r *http.Request)
 			// policy-update path.
 			Whitelist: damp.KeyEntries(p.Whitelist),
 			Tree:      damp.TreeDMTv1,
-			UserCMR:   req.UserCMR, VerifierCMR: req.VerifierCMR, IssuerCMR: hex.EncodeToString(issuerCMR[:]),
+			UserCMR: req.UserCMR,
+			VerifierCMR:  cmrHexList(verifierCMRs)[0],
+			VerifierCMRs: cmrHexList(verifierCMRs),
+			IssuerCMR:    hex.EncodeToString(issuerCMR[:]),
 			UserCovenantSPK: hex.EncodeToString(userCov.ScriptPubKey()), UserCovenantAddr: userAddr,
 			VerifierSPK: verifierSpkHex, VerifierAddr: verifierAddr,
 		},

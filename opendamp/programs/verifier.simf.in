@@ -1,33 +1,62 @@
-/* OpenDAMP verifier primary program P(pi).
+/* OpenDAMP verifier primary program P(pi).  TEMPLATE -- see src/programs.rs.
+ *
+ * This file is not compiled directly. `programs::render_verifier` substitutes
+ * the tokens below to produce one program per SHAPE: a pair (N_max_inputs,
+ * N_max_outputs) sized for a class of transfer. Every shape is a leaf of the
+ * same C_V(pi) taptree, so the address does not depend on which one a spender
+ * uses, and each asserts its own bounds, so a narrow leaf cannot be used for a
+ * wide transaction.
+ *
+ * Why shapes rather than one program. Simplicity's cost bound is STATIC: it
+ * covers the whole program DAG and does not shrink when a slot goes unused. A
+ * single program sized for the largest transfer anyone might make charges
+ * every ordinary transfer for slots it does not touch. The canonical transfer
+ * -- verifier, one regulated input, one fee input; verifier, payment, change,
+ * fee -- costs a third of what the widest shape costs, and picking the leaf
+ * that fits is free.
  *
  * Spent at input 0 of every ordinary transfer of the regulated asset A.
  * Confinement induction: every A output must pay a user covenant C_U(Y), and
  * every A input independently requires (via the U program committed in it)
- * that input 0 carries the verifier asset, which - as long as the issuer keeps
- * V inside C_V outputs - means this program runs on every transfer of A.
+ * that input 0 carries the verifier asset AND that the verifier is recreated,
+ * which is exactly what check 2 below enforces.
  *
  * Checks (design doc section 2.2 + 2.3):
  *   1. current input index == 0, carrying explicit asset V in amount exactly Q
  *   2. output 0 recreates the verifier: asset V, amount Q, same script as the
- *      current input (script-hash equality)
- *   3. at least one input among 1..8 carries explicit asset A (that input is a
- *      C_U by the confinement induction, so a holder authorised the spend)
- *   3b. num_inputs <= N_max_inputs (= 4); for every input 1..3 carrying A:
- *      - the input's script must equal C_U(X_i) for a witness-supplied X_i
- *      - X_i must be a member of the committed whitelist (this is the FREEZE:
- *        removing a key stops that holder spending, not merely receiving)
- *      - the input's outpoint must NOT be in the committed blacklist, proven by
- *        exhibiting the interval leaf that strictly contains its policy key
- *   4. num_outputs <= N_max_outputs (= 6); for every output 1..5 that exists:
- *      - its asset id must be explicit (design doc 2.4; a fee output is
- *        explicit by definition, so this subsumes the fee carve-out)
- *      - if it carries A it must pay C_U(Y_i) for the witness-supplied
- *        recipient key Y_i, rebuilt with the taproot-construction jets. A fee
- *        output has an empty script pubkey which can never hash-equal a P2TR
- *        script, so "a fee output must not carry A" is enforced by the same
- *        script equality, not by a separate check.
- *      - the recipient key Y_i must be a member of the committed whitelist
- *        (dmt-v1 sorted dense Merkle tree, depth 16, root WL_ROOT)
+ *      current input
+ *   3. the SENDER is proven once: a witness-supplied key, its committed height
+ *      windows and one dmt-v1 membership proof against WL_ROOT. Removing that
+ *      key from the whitelist is the FREEZE, and the lockup bound binds here.
+ *   4. num_inputs <= N_max_inputs; every input carrying A must
+ *      - carry an EXPLICIT asset id,
+ *      - have script pubkey exactly C_U(sender) -- which is what makes "all
+ *        regulated inputs share one owner" structural rather than checked,
+ *      - and not be blacklisted, proven by exhibiting the dmt-v1 interval leaf
+ *        that strictly contains SHA256(txid || BE32(vout)).
+ *      At least one input must carry A, so only a holder advances the verifier.
+ *   5. num_outputs <= N_max_outputs; every output that exists must carry an
+ *      explicit asset id, and every output carrying A must either
+ *      - pay C_U(sender), in which case it is CHANGE: it needs no proof, no
+ *        receive window and no explicit value, because the sender's standing
+ *        was already established in check 3 and retaining your own coins is
+ *        not an acquisition; or
+ *      - pay C_U(Y) for a witness-supplied recipient key Y, which must carry a
+ *        whitelist membership proof, must have an open receive window, and
+ *        must expose an explicit value that counts against the transfer limit.
+ *      A fee output has an empty script pubkey, whose hash can never equal a
+ *      P2TR script's, so "a fee output must not carry A" needs no separate
+ *      check. Fee outputs in other assets pass, which the any-asset fee market
+ *      requires.
+ *   6. the sum of payments to owners other than the sender is at most LIMIT.
+ *
+ * There is no budget padding. Under Sequentia's Simplicity budget rule a
+ * witness byte buys four weight units of execution
+ * (SIMPLICITY_BUDGET_PER_WITNESS_BYTE, src/script/script.h in the node), which
+ * every shape's functional witness covers with room to spare. On a chain still
+ * running the one-to-one rule these programs are unspendable, which is the
+ * correct failure: they would otherwise need tens of kilobytes of inert bytes
+ * in every transfer.
  *
  * Compile-time parameters:
  *   ASSET_A  - u256 asset id of A (internal byte order)
@@ -38,10 +67,13 @@
  *   BL_ROOT  - u256 dmt-v1 root of the outpoint blacklist, over INTERVAL leaves
  *   LIMIT    - u64 maximum total payable to OTHER owners in one transfer;
  *              0xffffffffffffffff means no limit
- *
- * Witness: for each output index i in 1..7 a slot W<i>, present (Some) iff
- * output i carries asset A: the recipient key and its 16-level membership
- * proof, bottom-up, each level (sibling_hash, current_node_is_right_child).
+ *   PI       - u256 policy commitment. Inert: the covenant enforces the roots
+ *              and the limit directly, and pi is a hash of them together with
+ *              the policy SEQUENCE NUMBER. Committing it makes the statement
+ *              the design document actually makes -- that C_V(pi) commits to
+ *              one policy VERSION -- true, rather than only committing to one
+ *              rule set, under which a rollback to an earlier snapshot with
+ *              identical rules would reuse the same address.
  */
 
 fn tap_data_hash(x: u256) -> u256 {
@@ -73,7 +105,11 @@ fn cu_spk_hash(owner: Pubkey) -> u256 {
  * single membership fold that proves a key approved also proves which windows
  * bind it. A witness cannot claim a bound the issuer never committed to, and the
  * windows cost no extra Merkle work at all - only the two extra words hashed
- * here and one lock jet at the point of use. */
+ * here and one lock jet at the point of use.
+ *
+ * Domain 0x00 is for real keys only. The tree's structural guards hash under
+ * 0x03 (SPEC-dmt-v1.md section 3), so no guard slot can ever be exhibited here
+ * as an approved key. */
 fn wl_leaf(key: Pubkey, send_after: u32, recv_after: u32) -> u256 {
     let ctx: Ctx8 = jet::sha_256_ctx_8_init();
     let ctx: Ctx8 = jet::sha_256_ctx_8_add_1(ctx, 0x00);
@@ -102,8 +138,8 @@ fn wl_step(elt: (u256, bool), node: u256) -> u256 {
     jet::sha_256_ctx_8_finalize(ctx)
 }
 
-fn require_wl_member(key: Pubkey, send_after: u32, recv_after: u32, proof: [(u256, bool); 16]) {
-    let root: u256 = array_fold::<wl_step, 16>(proof, wl_leaf(key, send_after, recv_after));
+fn require_wl_member(key: Pubkey, send_after: u32, recv_after: u32, proof: [(u256, bool); %%DEPTH%%]) {
+    let root: u256 = array_fold::<wl_step, %%DEPTH%%>(proof, wl_leaf(key, send_after, recv_after));
     assert!(jet::eq_256(root, param::WL_ROOT));
 }
 
@@ -137,46 +173,34 @@ fn require_explicit_amount_eq(v: Amount1, expected: u64) {
     }
 }
 
-/* The first owner among the scanned input slots, if any. */
-fn first_owner(a: Option<Pubkey>, b: Option<Pubkey>) -> Option<Pubkey> {
+/* A payment to another owner must expose its value, or the limit could be
+ * evaded by hiding the amount behind a commitment. Change is never routed
+ * here, so blinded change stays permitted. */
+fn explicit_value(v: Amount1) -> u64 {
+    match v {
+        Left(conf: (u1, u256)) => panic!(),
+        Right(x: u64) => x,
+    }
+}
+
+fn either(a: bool, b: bool) -> bool {
     match a {
-        Some(k: Pubkey) => Some(k),
-        None => b,
+        true => true,
+        false => b,
     }
 }
 
-/* Every regulated input must belong to the SAME owner.
+/* Scan one output slot. Returns what it contributes to the transfer limit.
  *
- * This is what makes "the sender" well defined, and the transfer limit needs it
- * twice over: a limit is per sender, and change is identified by the recipient
- * key equalling the sender's - not by output position, which a spender chooses.
- * The cost is that two holders cannot co-spend into one transfer; that is a
- * stated v1 restriction, not an oversight. */
-fn require_same_owner(o: Option<Pubkey>, sender: Pubkey) {
-    match o {
-        None => {},
-        Some(k: Pubkey) => assert!(jet::eq_256(k, sender)),
-    }
-}
-
-/* The amount an output contributes to the transfer limit.
- *
- * Change - an output paying the sender back - does not count and may keep a
- * blinded value. A payment to anyone else must expose an explicit value, or the
- * limit could be evaded by hiding the amount behind a commitment. */
-fn limited_amount(v: Amount1, y: Pubkey, sender: Pubkey) -> u64 {
-    match jet::eq_256(y, sender) {
-        true => 0, // change: not a payment to another owner
-        false => match v {
-            Left(conf: (u1, u256)) => panic!(), // a payment must expose its value
-            Right(x: u64) => x,
-        },
-    }
-}
-
-/* Scan one output slot in 1..N_max_outputs. Returns what it contributes to the
- * transfer limit. */
-fn check_output(i: u32, sender: Pubkey, w: Option<(Pubkey, u32, u32, [(u256, bool); 16])>) -> u64 {
+ * `cu_sender` is SHA256 of the sender's own C_U script pubkey, already computed
+ * once for the input scan. An A output paying it is CHANGE, and change is
+ * exempt from three things it used to be subjected to: the membership fold (the
+ * sender's standing was proven in check 3 and is the same fact), the receive
+ * window (a receive window restricts ACQUISITION; applying it to your own change
+ * turns it into a spend prohibition, so a holder inside a Reg S window could not
+ * transact at all unless a UTXO happened to equal the payment exactly), and the
+ * explicit-value requirement (blinded change is deliberately permitted). */
+fn check_output(i: u32, cu_sender: u256, w: Option<(Pubkey, u32, u32, [(u256, bool); %%DEPTH%%])>) -> u64 {
     match jet::output_amount(i) {
         None => 0, // beyond num_outputs; nothing to check
         Some(av: (Asset1, Amount1)) => {
@@ -186,13 +210,19 @@ fn check_output(i: u32, sender: Pubkey, w: Option<(Pubkey, u32, u32, [(u256, boo
                 Right(id: ExplicitAsset) => match jet::eq_256(id, param::ASSET_A) {
                     false => 0,
                     true => {
-                        let (y, send_after, recv_after, proof): (Pubkey, u32, u32, [(u256, bool); 16]) = unwrap(w);
-                        assert!(jet::eq_256(cu_spk_hash(y), unwrap(jet::output_script_hash(i))));
-                        require_wl_member(y, send_after, recv_after, proof);
-                        // The RECEIVE window (the Reg S pattern): this holder
-                        // cannot be paid before their committed height.
-                        require_height_bound(recv_after);
-                        limited_amount(v, y, sender)
+                        let spk: u256 = unwrap(jet::output_script_hash(i));
+                        match jet::eq_256(spk, cu_sender) {
+                            true => 0, // change
+                            false => {
+                                let (y, send_after, recv_after, proof): (Pubkey, u32, u32, [(u256, bool); %%DEPTH%%]) = unwrap(w);
+                                assert!(jet::eq_256(cu_spk_hash(y), spk));
+                                require_wl_member(y, send_after, recv_after, proof);
+                                // The RECEIVE window (the Reg S pattern): this
+                                // holder cannot be paid before their height.
+                                require_height_bound(recv_after);
+                                explicit_value(v)
+                            },
+                        }
                     },
                 },
             }
@@ -286,29 +316,28 @@ fn outpoint_key(i: u32) -> u256 {
 }
 
 /* Require that input i's outpoint is NOT blacklisted. */
-fn require_bl_nonmember(i: u32, lo: u256, hi: u256, proof: [(u256, bool); 16]) {
+fn require_bl_nonmember(i: u32, lo: u256, hi: u256, proof: [(u256, bool); %%DEPTH%%]) {
     let k: u256 = outpoint_key(i);
     assert!(lt_256(lo, k));
     assert!(lt_256(k, hi));
-    let root: u256 = array_fold::<wl_step, 16>(proof, bl_interval_leaf(lo, hi));
+    let root: u256 = array_fold::<wl_step, %%DEPTH%%>(proof, bl_interval_leaf(lo, hi));
     assert!(jet::eq_256(root, param::BL_ROOT));
 }
 
-/* Scan one input slot in 1..N_max_inputs.
+/* Scan one input slot. Returns whether the input carried asset A, which also
+ * serves the "at least one regulated input" check.
  *
- * Returns whether the input carried asset A, which also serves check 3 (at
- * least one regulated input), so the old separate `input_carries_a` sweep is
- * subsumed here rather than paid for twice.
- *
- * The owner key is recoverable exactly the way U recovers its own: an A input
- * is a C_U(X) output, so the witness supplies X and the covenant recomputes
- * C_U(X) and requires it to equal the input's actual script. That binds X to
- * the input, and the membership proof then binds X to the whitelist. Together
- * they make removing a key stop that holder SPENDING, not merely receiving.
- */
-fn check_input(i: u32, w: Option<(Pubkey, u32, u32, [(u256, bool); 16], u256, u256, [(u256, bool); 16])>) -> Option<Pubkey> {
+ * The owner is not re-derived per input. All regulated inputs of a transfer
+ * belong to one sender -- the transfer limit needs that twice over, since a
+ * limit is per sender and change is identified relative to one -- so the
+ * covenant proves the sender ONCE and then requires each A input's script to be
+ * exactly C_U(sender). That is the same binding the per-input construction gave
+ * (a script equality against a proven key), it makes the single-sender rule
+ * structural instead of a separate assertion, and it removes a 16-level Merkle
+ * fold and a taproot reconstruction from every input slot after the first. */
+fn check_input(i: u32, cu_sender: u256, w: Option<(u256, u256, [(u256, bool); %%DEPTH%%])>) -> bool {
     match jet::input_asset(i) {
-        None => None, // beyond num_inputs; nothing to check
+        None => false, // beyond num_inputs; nothing to check
         Some(a: Asset1) => match a {
             // Asset ids must be explicit on every scanned input, not only on
             // outputs. Skipping a blinded input would leave a hole exactly the
@@ -318,51 +347,26 @@ fn check_input(i: u32, w: Option<(Pubkey, u32, u32, [(u256, bool); 16], u256, u2
             // depend on an argument rather than on a check.
             Left(conf: (u1, u256)) => panic!(),
             Right(id: ExplicitAsset) => match jet::eq_256(id, param::ASSET_A) {
-                false => None,
+                false => false,
                 true => {
-                    let (x, send_after, recv_after, owner_proof, bl_lo, bl_hi, bl_proof): (Pubkey, u32, u32, [(u256, bool); 16], u256, u256, [(u256, bool); 16]) = unwrap(w);
-                    // The owner is who this input's script says it is...
-                    assert!(jet::eq_256(cu_spk_hash(x), unwrap(jet::input_script_hash(i))));
-                    // ...that owner is whitelisted (the freeze)...
-                    require_wl_member(x, send_after, recv_after, owner_proof);
-                    // ...the LOCKUP has expired for them...
-                    require_height_bound(send_after);
+                    let (bl_lo, bl_hi, bl_proof): (u256, u256, [(u256, bool); %%DEPTH%%]) = unwrap(w);
+                    // This input belongs to the sender proven in check 3...
+                    assert!(jet::eq_256(cu_sender, unwrap(jet::input_script_hash(i))));
                     // ...and this particular outpoint is not frozen individually.
                     require_bl_nonmember(i, bl_lo, bl_hi, bl_proof);
-                    Some(x)
+                    true
                 },
             },
         },
     }
 }
 
-/* Read a pad word without giving it meaning: eq_256(x, x) is always true. */
-fn absorb(x: u256, acc: bool) -> bool {
-    jet::eq_256(x, x)
-}
-
 fn main() {
-    // Budget padding. Simplicity buys execution budget with witness bytes
-    // (budget = serialized witness-stack size + 50 weight units) while the
-    // cost side is a STATIC bound over the whole program DAG: it does not
-    // shrink when a branch goes untaken. This program's functional witness is
-    // far too small to pay for its own output scan, so the covenant reserves
-    // inert padding.
-    //
-    // The pad has to be READ, not merely declared. Consensus rejects a redeem
-    // program containing FAIL nodes, so the program must be pruned; pruning
-    // drops witness leaves that execution never reads, which would delete an
-    // unused pad along with the budget it exists to buy. `absorb` therefore
-    // touches every word with eq_256(x, x) - always true, no semantics - at
-    // about 6 milli-WU per byte against the 1000 milli-WU per byte the same
-    // byte buys.
-    //
-    // The size is fixed at compile time and is part of the CMR, which is what
-    // the template registry pins. Padding through the taproot annex (what
-    // rust-simplicity's Cost::get_padding produces) is NOT usable here: the
-    // annex is non-standard on this network and would not relay.
-    let budget_pad: [u256; 704] = witness::BUDGET_PAD;
-    assert!(array_fold::<absorb, 704>(budget_pad, true));
+    // 0. pi enters the program DAG, and therefore the CMR and the address, so
+    // that a policy version is distinguishable on chain from a different
+    // version with identical rules. eq_256(x, x) is always true; the point is
+    // the commitment, not the comparison.
+    assert!(jet::eq_256(param::PI, param::PI));
 
     // 1. own position and identity
     assert!(jet::eq_32(jet::current_index(), 0));
@@ -370,43 +374,34 @@ fn main() {
     require_explicit_asset_eq(ca, param::ASSET_V);
     require_explicit_amount_eq(cv, param::AMOUNT_Q);
 
-    // 2. output 0 recreates the verifier under the same script
+    // 2. output 0 recreates the verifier under the same script. U checks this
+    // same equality, which is what stops a stray q of V standing in for a
+    // verifier covenant.
     let (a0, v0): (Asset1, Amount1) = unwrap(jet::output_amount(0));
     require_explicit_asset_eq(a0, param::ASSET_V);
     require_explicit_amount_eq(v0, param::AMOUNT_Q);
     assert!(jet::eq_256(unwrap(jet::output_script_hash(0)), jet::current_script_hash()));
 
-    // 3. bounded OWNER scan over inputs 1..3 (N_max_inputs = 4). Every input
-    // carrying A must belong to a whitelisted owner. The bound is asserted, not
-    // assumed: without `num_inputs <= N_max_inputs` an eighth regulated input
-    // would sit past the scan and spend unchecked.
-    //
-    // This is the freeze. A holder removed from the whitelist can no longer
-    // satisfy the covenant for their own inputs, so their balance stops moving.
-    assert!(jet::lt_32(jet::num_inputs(), 5));
-    let o1: Option<Pubkey> = check_input(1, witness::I1);
-    let o2: Option<Pubkey> = check_input(2, witness::I2);
-    let o3: Option<Pubkey> = check_input(3, witness::I3);
+    // 3. the sender, proven once. This is the freeze: a holder removed from the
+    // whitelist can no longer satisfy the covenant for their own inputs, so
+    // their balance stops moving.
+    let (sender, s_send_after, s_recv_after, s_proof): (Pubkey, u32, u32, [(u256, bool); %%DEPTH%%]) = witness::SENDER;
+    require_wl_member(sender, s_send_after, s_recv_after, s_proof);
+    require_height_bound(s_send_after);
+    let cu_sender: u256 = cu_spk_hash(sender);
+
+    // 4. bounded OWNER scan. The bound is asserted, not assumed: without it an
+    // extra regulated input would sit past the scan and spend unchecked.
+    assert!(jet::lt_32(jet::num_inputs(), %%NUM_INPUTS_LT%%));
+%%INPUT_SCAN%%
     // At least one regulated input: it is a C_U, which independently required
     // its owner's signature, so only holders can advance the verifier output.
-    // `unwrap` of None is a failure, which is exactly that requirement.
-    let sender: Pubkey = unwrap(first_owner(o1, first_owner(o2, o3)));
-    require_same_owner(o1, sender);
-    require_same_owner(o2, sender);
-    require_same_owner(o3, sender);
+    assert!(%%INPUT_ANY%%);
 
-    // 4. bounded confinement scan over outputs 1..5 (N_max_outputs = 6).
-    // Six outputs cover the shape a transfer actually needs: the verifier
-    // recreation, up to two payments, sender change, fee-asset change and the
-    // fee output. The bound is asserted, not assumed.
-    assert!(jet::lt_32(jet::num_outputs(), 7));
-    let paid: u64 = check_output(1, sender, witness::W1);
-    let paid: u64 = add_payment(paid, check_output(2, sender, witness::W2));
-    let paid: u64 = add_payment(paid, check_output(3, sender, witness::W3));
-    let paid: u64 = add_payment(paid, check_output(4, sender, witness::W4));
-    let paid: u64 = add_payment(paid, check_output(5, sender, witness::W5));
-
-    // 5. transfer limit (design doc 3.4): what leaves the sender's hands in this
+    // 5. bounded confinement scan. The bound is asserted, not assumed.
+    assert!(jet::lt_32(jet::num_outputs(), %%NUM_OUTPUTS_LT%%));
+%%OUTPUT_SCAN%%
+    // 6. transfer limit (design doc 3.4): what leaves the sender's hands in this
     // transaction, to owners other than the sender, must not exceed the
     // committed limit. LIMIT is the u64 maximum when the issuer sets no limit,
     // which no sum of asset amounts can exceed.

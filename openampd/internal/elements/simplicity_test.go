@@ -20,8 +20,15 @@ type dampVectors struct {
 	Programs              struct {
 		UCMR         string `json:"u_cmr"`
 		UTapleafHash string `json:"u_tapleaf_hash"`
-		PCMR         string `json:"p_cmr"`
-		PTapleafHash string `json:"p_tapleaf_hash"`
+		PCMR         string `json:"p_cmr_canonical"`
+		PTapleafHash string `json:"p_tapleaf_hash_canonical"`
+		Shapes       []struct {
+			Shape        string `json:"shape"`
+			CMR          string `json:"cmr"`
+			Tapleaf      string `json:"tapleaf"`
+			ControlBlock string `json:"control_block"`
+			Canonical    bool   `json:"canonical"`
+		} `json:"verifier_shapes"`
 		GCMR         string `json:"g_cmr"`
 		GTapleafHash string `json:"g_tapleaf_hash"`
 	} `json:"programs"`
@@ -73,7 +80,7 @@ func TestSimplicityLeafHashesMatchVectors(t *testing.T) {
 	v := loadDampVectors(t)
 	for _, c := range []struct{ name, cmr, want string }{
 		{"user", v.Programs.UCMR, v.Programs.UTapleafHash},
-		{"verifier-primary", v.Programs.PCMR, v.Programs.PTapleafHash},
+		{"verifier-primary-canonical", v.Programs.PCMR, v.Programs.PTapleafHash},
 		{"issuer", v.Programs.GCMR, v.Programs.GTapleafHash},
 	} {
 		got := SimplicityLeafHash(MustHex32(c.cmr))
@@ -118,7 +125,7 @@ func TestUserCovenantMatchesVectors(t *testing.T) {
 
 func TestVerifierCovenantMatchesVectors(t *testing.T) {
 	v := loadDampVectors(t)
-	out, err := VerifierCovenant(MustHex32(v.Programs.PCMR), MustHex32(v.Programs.GCMR))
+	out, err := VerifierCovenant(shapeMenu(v), MustHex32(v.Programs.GCMR))
 	if err != nil {
 		t.Fatalf("VerifierCovenant: %v", err)
 	}
@@ -134,11 +141,40 @@ func TestVerifierCovenantMatchesVectors(t *testing.T) {
 	if got := hex.EncodeToString(out.ControlBlock); got != v.VerifierCovenant.ControlBlockPrimary {
 		t.Fatalf("primary control block = %s, want %s", got, v.VerifierCovenant.ControlBlockPrimary)
 	}
-	issuerCB, err := IssuerPathControlBlock(MustHex32(v.Programs.PCMR), MustHex32(v.Programs.GCMR))
+	issuerCB, err := IssuerPathControlBlock(shapeMenu(v), MustHex32(v.Programs.GCMR))
 	if err != nil {
 		t.Fatalf("IssuerPathControlBlock: %v", err)
 	}
 	if got := hex.EncodeToString(issuerCB); got != v.VerifierCovenant.ControlBlockIssuer {
 		t.Fatalf("issuer control block = %s, want %s", got, v.VerifierCovenant.ControlBlockIssuer)
+	}
+}
+
+// shapeMenu is the ordered list of primary-program CMRs the verifier taptree is
+// built from: one per transaction shape, canonical first.
+func shapeMenu(v *dampVectors) [][32]byte {
+	out := make([][32]byte, 0, len(v.Programs.Shapes))
+	for _, sh := range v.Programs.Shapes {
+		out = append(out, MustHex32(sh.CMR))
+	}
+	return out
+}
+
+// Every shape must open against the same output key, which is the whole point
+// of putting them in one taptree: one address, several programs.
+func TestEveryShapeControlBlockMatchesVectors(t *testing.T) {
+	v := loadDampVectors(t)
+	menu := shapeMenu(v)
+	if len(menu) < 2 {
+		t.Fatalf("expected a menu of shapes, got %d", len(menu))
+	}
+	for i, sh := range v.Programs.Shapes {
+		cb, err := ShapePathControlBlock(menu, MustHex32(v.Programs.GCMR), i)
+		if err != nil {
+			t.Fatalf("ShapePathControlBlock(%s): %v", sh.Shape, err)
+		}
+		if got := hex.EncodeToString(cb); got != sh.ControlBlock {
+			t.Errorf("%s control block = %s, want %s", sh.Shape, got, sh.ControlBlock)
+		}
 	}
 }

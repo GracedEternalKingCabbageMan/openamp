@@ -76,27 +76,146 @@ func UserCovenant(cmr, owner [32]byte) (*CovenantOutput, error) {
 	return finishCovenant(leaf, data, root)
 }
 
-// VerifierCovenant derives C_V(pi) = P2TR(NUMS, TapBranch(TapLeaf_0xbe(primary),
-// TapLeaf_0xbe(issuer))): the policy-parameterized primary path and the issuer
-// update path. The primary leaf is the one a holder transfer spends through.
-func VerifierCovenant(primaryCMR, issuerCMR [32]byte) (*CovenantOutput, error) {
-	primary := SimplicityLeafHash(primaryCMR)
-	issuer := SimplicityLeafHash(issuerCMR)
-	root := TapBranchHash(primary, issuer)
-	return finishCovenant(primary, issuer, root)
+// VerifierCovenant derives C_V(pi) from the MENU of primary programs plus the
+// issuer update path.
+//
+// There is one primary program per transaction SHAPE -- how many input and
+// output slots it scans -- because Simplicity's cost bound is static over the
+// whole program, so a single program sized for the widest transfer charges
+// every ordinary transfer for slots it never touches. Every shape commits to
+// the same policy, and each asserts its own bounds, so they all live in one
+// address and a narrow leaf cannot be used for a wide transaction.
+//
+// The tree mirrors opendamp/src/tapscript.rs exactly, and has to: a different
+// arrangement of the same leaves is a different address.
+//
+//	root = TapBranch( L(shapes[0]),  perfect_tree(L(shapes[1..]), L(issuer)) )
+//
+// The canonical shape sits alone at depth 1 so the leaf a wallet reaches for
+// most often carries the shortest control block.
+//
+// `shapeCMRs` must be in the crate's SHAPES order, canonical first.
+func VerifierCovenant(shapeCMRs [][32]byte, issuerCMR [32]byte) (*CovenantOutput, error) {
+	root, paths, err := verifierTapTree(shapeCMRs, issuerCMR)
+	if err != nil {
+		return nil, err
+	}
+	out, parity, err := TweakPubKey(NUMS, root[:])
+	if err != nil {
+		return nil, fmt.Errorf("tweak covenant key: %w", err)
+	}
+	canonical := SimplicityLeafHash(shapeCMRs[0])
+	return &CovenantOutput{
+		Root: root, OutputKey: out, Parity: parity, LeafHash: canonical,
+		ControlBlock: controlBlockForPath(parity, paths[0]),
+	}, nil
 }
 
 // IssuerPathControlBlock is the control block for spending a verifier output
-// through the issuer update path instead of the primary path.
-func IssuerPathControlBlock(primaryCMR, issuerCMR [32]byte) ([]byte, error) {
-	primary := SimplicityLeafHash(primaryCMR)
-	issuer := SimplicityLeafHash(issuerCMR)
-	root := TapBranchHash(primary, issuer)
+// through the issuer update path instead of a primary path.
+func IssuerPathControlBlock(shapeCMRs [][32]byte, issuerCMR [32]byte) ([]byte, error) {
+	root, paths, err := verifierTapTree(shapeCMRs, issuerCMR)
+	if err != nil {
+		return nil, err
+	}
 	_, parity, err := TweakPubKey(NUMS, root[:])
 	if err != nil {
 		return nil, err
 	}
-	return controlBlockFor(parity, primary[:]), nil
+	return controlBlockForPath(parity, paths[len(paths)-1]), nil
+}
+
+// ShapePathControlBlock is the control block for spending through the primary
+// leaf at index `i` of the menu.
+func ShapePathControlBlock(shapeCMRs [][32]byte, issuerCMR [32]byte, i int) ([]byte, error) {
+	if i < 0 || i >= len(shapeCMRs) {
+		return nil, fmt.Errorf("shape index %d out of range for a menu of %d", i, len(shapeCMRs))
+	}
+	root, paths, err := verifierTapTree(shapeCMRs, issuerCMR)
+	if err != nil {
+		return nil, err
+	}
+	_, parity, err := TweakPubKey(NUMS, root[:])
+	if err != nil {
+		return nil, err
+	}
+	return controlBlockForPath(parity, paths[i]), nil
+}
+
+// verifierTapTree returns the merkle root and, for each leaf in menu order
+// (shapes then the issuer leaf), its merkle path bottom-up.
+func verifierTapTree(shapeCMRs [][32]byte, issuerCMR [32]byte) ([32]byte, [][][32]byte, error) {
+	var zero [32]byte
+	if len(shapeCMRs) == 0 {
+		return zero, nil, fmt.Errorf("the verifier taptree needs at least one primary leaf")
+	}
+	leaves := make([][32]byte, 0, len(shapeCMRs)+1)
+	for _, c := range shapeCMRs {
+		leaves = append(leaves, SimplicityLeafHash(c))
+	}
+	leaves = append(leaves, SimplicityLeafHash(issuerCMR))
+
+	// Everything except the canonical leaf forms a perfect binary tree, which
+	// is what makes the uniform depth assignment a valid taptree.
+	rest := leaves[1:]
+	if len(rest)&(len(rest)-1) != 0 {
+		return zero, nil, fmt.Errorf(
+			"the verifier menu leaves %d non-canonical leaves, which is not a power of two; "+
+				"the taptree depths would not sum to one", len(rest))
+	}
+	restRoot, restPaths := perfectTree(rest)
+
+	root := TapBranchHash(leaves[0], restRoot)
+	paths := make([][][32]byte, len(leaves))
+	paths[0] = [][32]byte{restRoot}
+	for i, p := range restPaths {
+		paths[i+1] = append(append([][32]byte{}, p...), leaves[0])
+	}
+	return root, paths, nil
+}
+
+// perfectTree folds a power-of-two number of leaves into a balanced tree and
+// returns the root plus each leaf's bottom-up sibling path.
+func perfectTree(leaves [][32]byte) ([32]byte, [][][32]byte) {
+	paths := make([][][32]byte, len(leaves))
+	level := append([][32]byte{}, leaves...)
+	// index -> which leaves sit under it
+	groups := make([][]int, len(leaves))
+	for i := range leaves {
+		groups[i] = []int{i}
+	}
+	for len(level) > 1 {
+		next := make([][32]byte, 0, len(level)/2)
+		nextGroups := make([][]int, 0, len(level)/2)
+		for i := 0; i < len(level); i += 2 {
+			for _, li := range groups[i] {
+				paths[li] = append(paths[li], level[i+1])
+			}
+			for _, li := range groups[i+1] {
+				paths[li] = append(paths[li], level[i])
+			}
+			next = append(next, TapBranchHash(level[i], level[i+1]))
+			nextGroups = append(nextGroups, append(append([]int{}, groups[i]...), groups[i+1]...))
+		}
+		level, groups = next, nextGroups
+	}
+	return level[0], paths
+}
+
+// controlBlockForPath builds (leaf_version | parity) || NUMS || path..., where
+// the path is bottom-up. A Simplicity spend carries leaf version 0xbe.
+func controlBlockForPath(parity bool, path [][32]byte) []byte {
+	cb := make([]byte, 0, 1+32+32*len(path))
+	v := byte(LeafVersionSimplicity)
+	if parity {
+		v |= 1
+	}
+	cb = append(cb, v)
+	cb = append(cb, NUMS[:]...)
+	for _, n := range path {
+		cb = append(cb, n[:]...)
+	}
+	return cb
 }
 
 func finishCovenant(execLeaf, sibling, root [32]byte) (*CovenantOutput, error) {

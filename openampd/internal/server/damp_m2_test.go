@@ -168,13 +168,27 @@ const m2Token = "m2-test-token"
 // blacklist entries, chained onto prevPi (nil for seq 0).
 func m2Snapshot(t *testing.T, priv *btcec.PrivateKey, assetHex string, seq uint64, prevPi *string, blacklist ...[32]byte) *damp.Snapshot {
 	t.Helper()
-	tree := damp.NewSMT()
+	// dmt-v1 is the only format any covenant verifies against, so a snapshot the
+	// service will accept has to carry BOTH roots: the whitelist the covenant
+	// checks every owner and recipient against, and the blacklist it proves
+	// non-membership in on every regulated input.
+	keys := make([][32]byte, 0, len(blacklist))
 	entries := make([]string, 0, len(blacklist))
 	for _, k := range blacklist {
-		tree.Insert(k)
+		keys = append(keys, k)
 		entries = append(entries, hex.EncodeToString(k[:]))
 	}
-	root := tree.Root()
+	blRoot, err := damp.BlacklistRoot(keys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	holder := strings.Repeat("11", 32)
+	var hk [32]byte
+	copy(hk[:], mustHexBytes(holder))
+	wlRoot, err := damp.WhitelistRoot([][32]byte{hk})
+	if err != nil {
+		t.Fatal(err)
+	}
 	s := &damp.Snapshot{
 		V:             1,
 		Asset:         assetHex,
@@ -182,9 +196,10 @@ func m2Snapshot(t *testing.T, priv *btcec.PrivateKey, assetHex string, seq uint6
 		Q:             1000,
 		Seq:           seq,
 		PrevPi:        prevPi,
-		Tree:          damp.TreeSMTv1,
+		Tree:          damp.TreeDMTv1,
 		Predicates: damp.Predicates{
-			Blacklist: damp.PredicateList{Root: hex.EncodeToString(root[:]), Entries: damp.KeyEntries(entries)},
+			Whitelist: damp.PredicateList{Root: hex.EncodeToString(wlRoot[:]), Entries: damp.KeyEntries([]string{holder})},
+			Blacklist: damp.PredicateList{Root: hex.EncodeToString(blRoot[:]), Entries: damp.KeyEntries(entries)},
 		},
 	}
 	pi, err := s.ComputePi()

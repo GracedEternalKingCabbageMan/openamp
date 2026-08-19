@@ -138,7 +138,8 @@ type dampPolicyCompleteRequest struct {
 	// VerifierCMR is the CMR of P(pi_{n+1}) from `opendamp derive`. It must differ
 	// from the current one: an unchanged CMR means the derivation ran against the
 	// old policy, and the respend would recreate the OLD C_V.
-	VerifierCMR string `json:"verifier_cmr"`
+	VerifierCMRs []string `json:"verifier_cmrs"`
+	VerifierCMR  string   `json:"verifier_cmr,omitempty"`
 	// VerifierSPK is optional; when present it must equal the scriptPubKey this
 	// server derives from VerifierCMR.
 	VerifierSPK string `json:"verifier_spk,omitempty"`
@@ -251,6 +252,7 @@ func (s *Server) handleDampPolicyPrepare(w http.ResponseWriter, r *http.Request)
 		VerifierAsset: asset.Damp.VerifierAsset, VerifierAmount: asset.Damp.VerifierAmount,
 		VerifierTxid: outTxid, VerifierVout: outVout,
 		VerifierSPKPrev: asset.Damp.VerifierSPK, VerifierCMRPrev: asset.Damp.VerifierCMR,
+		VerifierCMRsPrev: asset.Damp.VerifierCMRs,
 		IssuerUpdateKey: asset.Damp.IssuerUpdateKey,
 		Snapshot:        canonical, SnapshotHash: hex.EncodeToString(snapHash[:]),
 		SnapshotSigMsg: hex.EncodeToString(sigMsg[:]), Created: time.Now(),
@@ -292,7 +294,8 @@ func (s *Server) handleDampPolicyPrepare(w http.ResponseWriter, r *http.Request)
 		"verifier_outpoint":    map[string]any{"txid": outTxid, "vout": outVout},
 		"verifier_asset":       asset.Damp.VerifierAsset,
 		"verifier_amount":      asset.Damp.VerifierAmount,
-		"verifier_cmr_current": asset.Damp.VerifierCMR,
+		"verifier_cmr_current":  asset.Damp.VerifierCMR,
+		"verifier_cmrs_current": asset.Damp.VerifierCMRs,
 		"verifier_spk_current": asset.Damp.VerifierSPK,
 		"verifier_cmr_next_hint": "the verifier program is parameterized by the policy commitment, so pi_next needs a NEW verifier_cmr. " +
 			"Run `opendamp derive` against derive_snapshot and post its p_cmr; a verifier_cmr equal to verifier_cmr_current is refused, " +
@@ -333,7 +336,7 @@ func (s *Server) handleDampPolicyComplete(w http.ResponseWriter, r *http.Request
 	if asset == nil {
 		return
 	}
-	if strings.TrimSpace(req.VerifierCMR) == "" || strings.TrimSpace(req.SignedTx) == "" {
+	if len(req.VerifierCMRs) == 0 || strings.TrimSpace(req.SignedTx) == "" {
 		httpErr(w, 409, "%s", dampPolicyParamsMissing)
 		return
 	}
@@ -380,12 +383,12 @@ func (s *Server) handleDampPolicyComplete(w http.ResponseWriter, r *http.Request
 	// accepted only alongside checks it can make: that it is not the CURRENT one
 	// (which would recreate the old policy), and that the scriptPubKey the issuer
 	// says it derives is the one this server derives from it.
-	verifierCMR, err := parseCMR("verifier_cmr", req.VerifierCMR)
+	verifierCMRs, err := parseCMRMenu(req.VerifierCMRs, req.VerifierCMR)
 	if err != nil {
 		httpErr(w, 400, "%v", err)
 		return
 	}
-	if strings.EqualFold(req.VerifierCMR, p.VerifierCMRPrev) {
+	if sameCMRMenu(req.VerifierCMRs, p.VerifierCMRsPrev) {
 		logRefusal("damp-policy", s.st, map[string]any{
 			"reason": "verifier cmr unchanged", "phase": "complete", "policy_id": id,
 			"asset": p.AssetID, "seq": p.Seq,
@@ -398,7 +401,7 @@ func (s *Server) handleDampPolicyComplete(w http.ResponseWriter, r *http.Request
 		httpErr(w, 500, "the asset's recorded issuer program is corrupt: %v", err)
 		return
 	}
-	verifierCov, err := elements.VerifierCovenant(verifierCMR, issuerCMR)
+	verifierCov, err := elements.VerifierCovenant(verifierCMRs, issuerCMR)
 	if err != nil {
 		httpErr(w, 500, "derive verifier covenant: %v", err)
 		return
@@ -482,7 +485,8 @@ func (s *Server) handleDampPolicyComplete(w http.ResponseWriter, r *http.Request
 		// and the supply figure scan, so a stale copy would report a removed holder's
 		// coins forever and miss a newly admitted one entirely.
 		a.Damp.Whitelist = p.Whitelist
-		a.Damp.VerifierCMR = strings.ToLower(req.VerifierCMR)
+		a.Damp.VerifierCMRs = cmrHexList(verifierCMRs)
+		a.Damp.VerifierCMR = a.Damp.VerifierCMRs[0]
 		a.Damp.VerifierSPK = verifierSpkHex
 		a.Damp.VerifierAddr = s.addressOfSPK(verifierCov.ScriptPubKey())
 		return nil
